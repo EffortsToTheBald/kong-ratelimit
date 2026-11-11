@@ -24,8 +24,8 @@ method 维度必须（MUST）以请求的 HTTP 方法作为取值参与 key 计�
 header 维度必须（MUST）以 `header_name` 指定头的取值作为维度值；该头缺失的请求必须（MUST）共用同一缺失哨兵桶，不与任何具名值桶共享。
 
 #### Scenario: 不同头值分桶、缺失值共用哨兵
-- **WHEN** 配置 limit_by=[header]、header_name=X-Tenant、limit=1，携带 X-Tenant: a 与 X-Tenant: b 各 1 次，再各发 1 次，最后发 1 次不带该头
-- **THEN** a、b 首次均放行；a、b 各自第二次与"无头"请求均返回 429，且无头请求不占用 a/b 的桶
+- **WHEN** 配置 limit_by=[header]、header_name=X-Tenant、limit=1，携带 X-Tenant: a 与 X-Tenant: b 各 1 次，再各发 1 次，最后连发 2 次不带该头
+- **THEN** a、b 首次均放行、各自第二次返回 429；首个"无头"请求放行（独立哨兵桶）、第二个"无头"请求返回 429；无头请求不占用 a/b 的桶
 
 ### Requirement: consumer 维度按认证身份分桶
 consumer 维度必须（MUST）以认证插件解析出的 consumer 身份作为取值；未认证请求共用 anon 哨兵桶。

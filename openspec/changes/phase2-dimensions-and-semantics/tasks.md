@@ -23,9 +23,9 @@
 
 ## 4. 多维验证脚本（D6/D7，bench/dims.sh）
 
-- [ ] 4.1 编写 `bench/dims.sh`：7 场景（[ip,path] 独立 / [method] 分桶 / [header] 双租户+哨兵 / [route] / [service] / [consumer] 双 consumer+anon / 指纹顺序断言），每场景独立 namespace + FLUSHDB，PASS/FAIL 断言；consumer 场景自带 key-auth + alice/bob 声明式配置（/echo-auth 路由）
-- [ ] 4.2 执行 `bench/dims.sh` 全绿；验证：7 场景全部 PASS（预期外 FAIL 即停下排查，禁止改验收标准凑绿）
-- [ ] 4.3 consumer 场景优先级复核：确认 key-auth（1250）先于本插件（1002）执行、日志无 "attempt to call" 类异常；验证：dims.sh consumer 场景输出 + kong 日志无 error
+- [x] 4.1 编写 `bench/dims.sh`：7 场景（[ip,path] 独立 / [method] 分桶 / [header] 双租户+哨兵 / [route] / [service] / [consumer] 双 consumer+anon / 指纹顺序断言），每场景独立 namespace + FLUSHDB，PASS/FAIL 断言；consumer 场景自带 key-auth + alice/bob 声明式配置（/echo-auth 路由）
+- [x] 4.2 执行 `bench/dims.sh` 全绿；验证：7 场景全部 PASS（预期外 FAIL 即停下排查，禁止改验收标准凑绿）
+- [x] 4.3 consumer 场景优先级复核：确认 key-auth（1250）先于本插件（1002）执行、日志无 "attempt to call" 类异常；验证：dims.sh consumer 场景输出 + kong 日志无 error
 
 ## 5. 文档同步（D8/D9）
 

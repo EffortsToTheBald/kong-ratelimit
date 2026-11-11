@@ -34,19 +34,21 @@ assert_prerequisites() {
 }
 
 # 生成 Kong DB-less 声明式配置（JSON）
-# 用法：kong_config_json <limit> <window> <batch> <with_plugin> [namespace]
+# 用法：kong_config_json <limit> <window> <batch> <with_plugin> [namespace] [limit_by_json]
 #   第 5 参 namespace：每轮/每用例独立（quota.sh、matrix.sh 传入），杜绝跨轮次共享桶（P0-6）
+#   第 6 参 limit_by_json：原始 JSON 数组，默认 ["ip"]；dims.sh 传 ["ip","path"] 等
 #   fault_tolerant 显式 false：与 fail-closed 默认对齐；故障注入场景显式下发 true
 kong_config_json() {
     local limit="$1" window="$2" batch="$3" with_plugin="${4:-true}"
     local ns="${5:-rl}"
+    local limit_by="${6:-[\"ip\"]}"
     local plugins=""
 
     if [ "$with_plugin" = "true" ]; then
         plugins=$(cat <<EOF
 [{"name":"rate-limit-advanced","config":{
   "limit":${limit},"window":${window},"batch":${batch},
-  "limit_by":["ip"],"namespace":"${ns}","fault_tolerant":false,
+  "limit_by":${limit_by},"namespace":"${ns}","fault_tolerant":false,
   "redis":{"host":"redis","port":6379,"database":0,"timeout":1000}}}]
 EOF
 )
