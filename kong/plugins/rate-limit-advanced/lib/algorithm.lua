@@ -18,8 +18,10 @@ local function dim_value(dim, conf)
     return consumer and consumer.id or "anon"
 
   elseif dim == "ip" then
-    -- forwarded_ip 优先，尊重 X-Forwarded-For（网关通常部署在 LB 之后）
-    return kong.client.get_forwarded_ip() or kong.client.get_remote_ip() or "unknown"
+    -- get_forwarded_ip() = realip 处理后的客户端地址：仅当 Kong 配置了 trusted_ips
+    -- 时才采信上游转发头；默认（trust none）即为直接对端 IP，伪造 XFF 无效。
+    -- 回退必须是 PDK 真实存在的 get_ip()（直连对端，不可伪造）。
+    return kong.client.get_forwarded_ip() or kong.client.get_ip() or "unknown"
 
   elseif dim == "path" then
     return kong.request.get_path() or "/"
@@ -105,34 +107,41 @@ function _M.check(conf, key)
   local ttl_ms   = ttl_s * 1000
   local reset_at = math.floor(now + conf.window)
 
-  -- 1) fast path：本地库存直接扣减，零网络 IO
-  local ok, remaining = store.take(key)
-  if ok then
-    kong.log.notice(
-    "[RL-DEBUG] local_hit key=", key,
-    " remaining=", remaining
-    )
-    return {
-      allowed   = true,
-      remaining = math.max(0, remaining),
-      reset     = reset_at,
-    }
+  -- batch 先解析：batch=1 = 严格全局一致模式，完全绕开本地库存（D4）
+  local batch = _M.resolve_batch(conf)
+
+  -- 1) fast path：本地库存直接扣减，零网络 IO（batch>1 才有库存语义）
+  if batch > 1 then
+    local ok, remaining = store.take(key)
+    if ok then
+      kong.log.notice(
+      "[RL-DEBUG] local_hit key=", key,
+      " remaining=", remaining
+      )
+      return {
+        allowed   = true,
+        remaining = math.max(0, remaining),
+        reset     = reset_at,
+      }
+    end
   end
 
-  -- 2) slow path：向全局桶领一批
-  local batch = _M.resolve_batch(conf)
+  -- 2) slow path：向全局桶领一批（batch=1 时每请求必经此路径）
   local rate, burst = _M.rate_and_burst(conf)
 
   local granted, err = redis_mod.grant(conf, key, batch, ttl_ms, rate, burst)
+  if not granted then
+    -- rule.md §9.1 问题A：必须先判 nil 再解引用 granted.*，
+    -- 否则 Redis 失败时这里直接抛 Lua 异常（500），fault_tolerant 分支永远走不到。
+    kong.log.err("rate-limit-advanced: redis grant failed: ", tostring(err))
+    return nil, err
+  end
   kong.log.notice(
   "[RL-DEBUG] redis_grant key=", key,
   " granted=", granted.granted,
   " tokens=", granted.tokens,
   " wait=", granted.wait
   )
-  if not granted then
-    return nil, err
-  end
 
   if granted.granted <= 0 then
     local wait = granted.wait
@@ -146,12 +155,12 @@ function _M.check(conf, key)
       retry_after = wait,
     }
   end
-  kong.log.notice(
-  "[RL-DEBUG] local_fill key=", key,
-  " fill=", math.max(0, granted.granted - 1)
-  )
-  -- 本次消耗 1 个，其余放进本地库存
-  if granted.granted > 1 then
+  -- 本次消耗 1 个，其余放进本地库存（batch=1 恒 granted=1，不产生库存）
+  if batch > 1 and granted.granted > 1 then
+    kong.log.notice(
+    "[RL-DEBUG] local_fill key=", key,
+    " fill=", math.max(0, granted.granted - 1)
+    )
     store.fill(key, granted.granted - 1, ttl_s)
   end
 

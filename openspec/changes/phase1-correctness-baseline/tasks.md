@@ -17,9 +17,9 @@
 
 ## 3. 决策主流程修复（design D3/D4/D6）
 
-- [ ] 3.1 `algorithm.lua:check()` 将 `grant` 的 nil 判定前移到任何 `granted.*` 解引用之前，失败走 `kong.log.err` + `return nil, err`；验证：停止 Redis 发一次请求（当前默认 fault_tolerant=true），日志出现"failing open"且**无 Lua traceback、无 500**（对应 spec"Redis 故障不得产生 HTTP 500"场景）
-- [ ] 3.2 实现 batch=1 短路：`resolve_batch` 前置，`batch==1` 时跳过 `store.take`/`store.fill`；验证：batch=1 压一轮后日志中 `local_hit`/`local_fill` 计数为 0（对应 spec"batch=1 不产生本地库存"场景）
-- [ ] 3.3 修正 IP 回退：`kong.client.get_remote_ip` 改为 PDK 真实存在的 `kong.client.get_ip()`；验证：单节点 `curl -i :8030/echo` 正常 200 且带 `X-RateLimit-*` 头（行为不变，仅消除潜在 nil 调用）
+- [x] 3.1 `algorithm.lua:check()` 将 `grant` 的 nil 判定前移到任何 `granted.*` 解引用之前，失败走 `kong.log.err` + `return nil, err`；验证：停止 Redis 发一次请求（当前默认 fault_tolerant=true），日志出现"failing open"且**无 Lua traceback、无 500**（对应 spec"Redis 故障不得产生 HTTP 500"场景）
+- [x] 3.2 实现 batch=1 短路：`resolve_batch` 前置，`batch==1` 时跳过 `store.take`/`store.fill`；验证：batch=1 压一轮后日志中 `local_hit`/`local_fill` 计数为 0（对应 spec"batch=1 不产生本地库存"场景）
+- [x] 3.3 修正 IP 回退：`kong.client.get_remote_ip` 改为 PDK 真实存在的 `kong.client.get_ip()`；验证：单节点 `curl -i :8030/echo` 正常 200 且带 `X-RateLimit-*` 头（行为不变，仅消除潜在 nil 调用）
 
 ## 4. 策略指纹进 Key（P0-1，design D1）
 
