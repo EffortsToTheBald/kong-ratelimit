@@ -37,9 +37,15 @@ end
 
 tokens = tokens - granted
 
+-- D1：wait 统一为"距下一个令牌可用的秒数"。
+-- tokens >= 1 时 (1-tokens) <= 0，钳到 0（下一令牌已可用）；
+-- tokens < 1 时为补足一个整令牌所需等待。
 local wait = 0
-if tokens < 1 and rate > 0 then
+if rate > 0 then
   wait = (1 - tokens) / rate
+  if wait < 0 then
+    wait = 0
+  end
 end
 
 redis.call('HSET', key, 'tokens', tostring(tokens), 'ts', tostring(ts))

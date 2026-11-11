@@ -10,9 +10,9 @@
 
 ## 2. 响应头语义（D1/D2/D8，redis.lua + handler.lua）
 
-- [ ] 2.1 `redis.lua`：脚本 wait 公式统一为 `wait = max(0, (1 - tokens) / rate)`（tokens≥1 时为 0）；同步 `redis/token_bucket.lua`；验证：`diff` 两份脚本主体为空；resty 喂 tokens=2.3/0.7 两样例断言 wait=0/正值
-- [ ] 2.2 `handler.lua`：slow path `reset = now + wait`、fast path 按 remaining 分支（>0 → now；=0 → now+⌈1/rate⌉）、`retry_after = min(max(1, ceil(wait)), floor(window))`、429 分支加 notice 日志（key/limit/batch）；验证：limit=100 batch=1 手动耗尽后 429 响应中 `Reset − now ≈ Retry-After`（±1s）；limit=1/window=3600 触发 429 时 `Retry-After ≤ 3600`
-- [ ] 2.3 `algorithm.lua`：remaining 口径注释（两路径均为本节点视角）与 reset 传值微调；验证：curl 观察快/慢路径响应头格式一致（均为 Unix 秒）
+- [x] 2.1 `redis.lua`：脚本 wait 公式统一为 `wait = max(0, (1 - tokens) / rate)`（tokens≥1 时为 0）；同步 `redis/token_bucket.lua`；验证：`diff` 两份脚本主体为空；resty 喂 tokens=2.3/0.7 两样例断言 wait=0/正值
+- [x] 2.2 `handler.lua`：slow path `reset = now + wait`、fast path 按 remaining 分支（>0 → now；=0 → now+⌈1/rate⌉）、`retry_after = min(max(1, ceil(wait)), floor(window))`、429 分支加 notice 日志（key/limit/batch）；验证：limit=100 batch=1 手动耗尽后 429 响应中 `Reset − now ≈ Retry-After`（±1s）；limit=1/window=3600 触发 429 时 `Retry-After ≤ 3600`
+- [x] 2.3 `algorithm.lua`：remaining 口径注释（两路径均为本节点视角）与 reset 传值微调；验证：curl 观察快/慢路径响应头格式一致（均为 Unix 秒）
 
 ## 3. 校验与防御（D3/D4/D5）
 

@@ -146,12 +146,18 @@ function _M.rate_and_burst(conf)
 end
 
 --- 核心决策。
+-- remaining 口径（快/慢路径一致）：均为"本节点视角"的剩余——
+-- fast path 是本地库存余量；slow path 的 granted-1 恰好等于 fill 后的本地库存。
+-- Reset 口径（D1）："下一令牌可用的 Unix 秒"；429 路径由 handler 用封顶后的
+-- Retry-After 推导（同口径），此处不回 reset。
 -- @return table {allowed, remaining, reset, retry_after} 或 nil, err
 function _M.check(conf, key)
   local now      = ngx.now()
   local ttl_s    = math.max(1, math.floor(conf.window * 2))
   local ttl_ms   = ttl_s * 1000
-  local reset_at = math.floor(now + conf.window)
+  local rate, burst = _M.rate_and_burst(conf)
+  -- fast path 本地无库存时，只能近似"下一令牌时刻"：一个补充周期 window/limit 秒
+  local next_tick = math.ceil(1 / rate)
 
   -- batch 先解析：batch=1 = 严格全局一致模式，完全绕开本地库存（D4）
   local batch = _M.resolve_batch(conf)
@@ -164,16 +170,21 @@ function _M.check(conf, key)
       "[RL-DEBUG] local_hit key=", key,
       " remaining=", remaining
       )
+      local reset
+      if remaining > 0 then
+        reset = math.floor(now)          -- 下一令牌已可用
+      else
+        reset = math.floor(now + next_tick) -- 刚取走最后一个，保守近似
+      end
       return {
         allowed   = true,
         remaining = math.max(0, remaining),
-        reset     = reset_at,
+        reset     = reset,
       }
     end
   end
 
   -- 2) slow path：向全局桶领一批（batch=1 时每请求必经此路径）
-  local rate, burst = _M.rate_and_burst(conf)
 
   local granted, err = redis_mod.grant(conf, key, batch, ttl_ms, rate, burst)
   if not granted then
@@ -194,10 +205,10 @@ function _M.check(conf, key)
     if not wait or wait <= 0 then
       wait = 1
     end
+    -- 429 的 Reset 由 handler 用封顶后的 Retry-After 推导（同口径），此处不回 reset
     return {
       allowed     = false,
       remaining   = 0,
-      reset       = reset_at,
       retry_after = wait,
     }
   end
@@ -210,10 +221,11 @@ function _M.check(conf, key)
     store.fill(key, granted.granted - 1, ttl_s)
   end
 
+  -- slow path allowed：wait=0 ⇒ 下一令牌已可用；wait>0 ⇒ 部分授予后桶内 tokens<1
   return {
     allowed   = true,
     remaining = granted.granted - 1,
-    reset     = reset_at,
+    reset     = math.floor(now + (granted.wait or 0)),
   }
 end
 
