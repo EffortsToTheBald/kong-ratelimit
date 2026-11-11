@@ -16,10 +16,10 @@
 
 ## 3. 校验与防御（D3/D4/D5）
 
-- [ ] 3.1 `schema.lua` 增加 `entity_checks`（conditional + contains，或 1.2 选定方案）；验证：下发 `limit_by=[header]` 无 header_name → 400；下发合法 header 配置 → 成功；既有无 header 配置下发不受影响
-- [ ] 3.2 `redis.lua` 抽出纯函数 `parse_grant_response(res, want)` 并在 grant() 中接入（畸形 → close + nil,err）；验证：resty 单测喂 5 类畸形样例（非 table/长度≠3/granted 非数/granted>want/tokens 非数）全部返回 nil+err，合法样例通过
-- [ ] 3.3 `handler.lua` 增加 `_M:init_worker()`（backend 非 shared_dict → log.warn）；验证：移除 KONG_NGINX_HTTP_LUA_SHARED_DICT 临时启动一次（docker compose 环境变量覆盖），启动日志出现降级 warning；恢复正常配置后告警消失
-- [ ] 3.4 畸形返回的故障分支验证（结合 3.2）：代码路径确认畸形 → nil,err → handler fail 分支；验证：日志与分支单测证明（E2E 注入不可行，报告中如实记录测试方式）
+- [x] 3.1 `schema.lua` 增加 `entity_checks`（conditional + contains，或 1.2 选定方案）；验证：下发 `limit_by=[header]` 无 header_name → 400；下发合法 header 配置 → 成功；既有无 header 配置下发不受影响
+- [x] 3.2 `redis.lua` 抽出纯函数 `parse_grant_response(res, want)` 并在 grant() 中接入（畸形 → close + nil,err）；验证：resty 单测喂 5 类畸形样例（非 table/长度≠3/granted 非数/granted>want/tokens 非数）全部返回 nil+err，合法样例通过
+- [x] 3.3 `handler.lua` 增加 `_M:init_worker()`（backend 非 shared_dict → log.warn）；验证：移除 KONG_NGINX_HTTP_LUA_SHARED_DICT 临时启动一次（docker compose 环境变量覆盖），启动日志出现降级 warning；恢复正常配置后告警消失
+- [x] 3.4 畸形返回的故障分支验证（结合 3.2）：代码路径确认畸形 → nil,err → handler fail 分支；验证：日志与分支单测证明（E2E 注入不可行，报告中如实记录测试方式）
 
 ## 4. 多维验证脚本（D6/D7，bench/dims.sh）
 

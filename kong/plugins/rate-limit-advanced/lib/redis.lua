@@ -78,6 +78,41 @@ return { granted, tostring(tokens), tostring(wait) }
 
 _M.script = TOKEN_BUCKET
 
+--- D3：防御性校验 EVAL 返回值（纯函数，不依赖 cosocket，可被 resty 单测直接调用）。
+-- 合法形态：{ granted(整数, 0..want), tokens(数值), wait(数值, >=0) }。
+-- 任一不满足 → nil, 原因；调用方（grant）将其视为 Redis 异常并进入故障分支。
+-- @return table|nil, string|nil
+local function parse_grant_response(res, want)
+  if type(res) ~= "table" or #res ~= 3 then
+    return nil, "malformed eval response: expected 3-element array"
+  end
+
+  local granted = tonumber(res[1])
+  if granted == nil
+     or granted ~= math.floor(granted)
+     or granted < 0
+     or granted > want then
+    return nil, "malformed eval response: granted out of range"
+  end
+
+  local tokens = tonumber(res[2])
+  if tokens == nil then
+    return nil, "malformed eval response: tokens not a number"
+  end
+
+  local wait = tonumber(res[3])
+  if wait == nil or wait < 0 then
+    return nil, "malformed eval response: wait not a number"
+  end
+
+  return {
+    granted = granted,
+    tokens  = tokens,
+    wait    = wait,
+  }
+end
+_M.parse_grant_response = parse_grant_response
+
 --- 领取 want 个令牌。
 -- rate/burst 由调用方从 limit/window 推导后传入，保持本模块只负责 IO。
 -- @return table {granted, tokens, wait} 或 nil, err
@@ -125,14 +160,17 @@ function _M.grant(conf, key, want, ttl_ms, rate, burst)
     return nil, "eval: " .. tostring(eerr)
   end
 
+  -- D3：畸形返回按 Redis 异常处理（close 而非 keepalive，进故障分支）
+  local parsed, perr = parse_grant_response(res, want)
+  if not parsed then
+    r:close()
+    return nil, perr
+  end
+
   -- 放回连接池：不 keepalive 的话，高并发下会迅速耗尽本地端口
   r:set_keepalive(10000, 100)
 
-  return {
-    granted = tonumber(res[1]) or 0,
-    tokens  = tonumber(res[2]) or 0,
-    wait    = tonumber(res[3]) or 0,
-  }
+  return parsed
 end
 
 return _M
