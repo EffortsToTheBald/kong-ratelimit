@@ -11,6 +11,16 @@ local DIMENSIONS = {
 
 return {
   name = "rate-limit-advanced",
+  -- P1-4：配置前置校验（设计 D4，已核实 Kong 3.6 支持 entity_checks + conditional + contains）
+  -- limit_by 含 "header" ⇒ header_name 必填；坏配置在 Admin API 下发时即被 400 拒绝。
+  entity_checks = {
+    { conditional = {
+        if_field = "config.limit_by",
+        if_match = { contains = "header" },
+        then_field = "config.header_name",
+        then_match = { required = true },
+    } },
+  },
   fields = {
     { protocols = typedefs.protocols_http },
     {

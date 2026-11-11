@@ -4,9 +4,9 @@
 
 ## 1. 基线与前置事实核查
 
-- [ ] 1.1 `git add -A && git commit` 打本 change 基线 commit；验证：`git log --oneline` 出现基线提交
-- [ ] 1.2 实测 D4 主方案可行性：向 Admin API 下发带 `entity_checks`（conditional+contains）的 schema 修改后，提交 `limit_by=[header]` 无 header_name 的配置，确认返回 400 且 `contains` 对数组生效；验证：curl 实测 400；若不生效则切换 design D4 的 `custom_entity_check` fallback 并记录
-- [ ] 1.3 环境自检（沿用 Phase 1 前奏）：三节点 healthy、FLUSHDB 可用；验证：`docker compose ps` 全部 running
+- [x] 1.1 `git add -A && git commit` 打本 change 基线 commit；验证：`git log --oneline` 出现基线提交
+- [x] 1.2 实测 D4 主方案可行性：向 Admin API 下发带 `entity_checks`（conditional+contains）的 schema 修改后，提交 `limit_by=[header]` 无 header_name 的配置，确认返回 400 且 `contains` 对数组生效；验证：curl 实测 400；若不生效则切换 design D4 的 `custom_entity_check` fallback 并记录
+- [x] 1.3 环境自检（沿用 Phase 1 前奏）：三节点 healthy、FLUSHDB 可用；验证：`docker compose ps` 全部 running
 
 ## 2. 响应头语义（D1/D2/D8，redis.lua + handler.lua）
 
