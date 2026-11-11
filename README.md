@@ -130,6 +130,18 @@ done | sort | uniq -c
 
 其中 N = 副本数。误差上界推导见 `docs/design.md` 第 4 节。
 
+### 响应头语义
+
+| 头 | 含义 | 注意 |
+|---|---|---|
+| `X-RateLimit-Limit` | 配置的 `limit` | |
+| `X-RateLimit-Remaining` | **本节点视角**的剩余 | 两路径口径一致（都是本地库存）；`batch=1` 时恒为 0（每次授予的 1 个令牌被立即消耗），勿当作全局剩余 |
+| `X-RateLimit-Reset` | **下一个令牌可用的 Unix 秒** | 令牌桶没有"窗口重置"概念；有库存时即"现在"；本节点视角（快路径为近似） |
+| `Retry-After` | 仅 429；距下一令牌可用的秒数 | 封顶为 `window` 秒；与 `Reset − now` 同口径（±1s） |
+| `X-RateLimit-Status: degraded` | 仅 Redis 故障显式容错放行时 | 默认故障策略是 503（fail-closed） |
+
+429 是**确定性限流拒绝**，每次都会打一条 notice 日志（含限流 key/limit/batch），可与 Redis 故障日志（error/warn）区分。
+
 ## 6. 跑性能矩阵
 
 ```bash

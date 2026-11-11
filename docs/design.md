@@ -270,16 +270,21 @@ plugins:
 **响应头**
 
 ```
-X-RateLimit-Limit: 1000         # 窗口配额
-X-RateLimit-Remaining: 986      # 本地视角的剩余（近似值，见下）
-X-RateLimit-Reset: 1762...      # 本窗口结束的 unix 时间
-Retry-After: 3                  # 仅 429，秒
-X-RateLimit-Status: degraded    # 仅 Redis 故障放行时
+X-RateLimit-Limit: 1000         # 配置的 limit
+X-RateLimit-Remaining: 986      # 本节点视角的剩余（近似值，见下）
+X-RateLimit-Reset: 1762...      # 下一个令牌可用的 Unix 秒（本节点视角，快路径为近似）
+Retry-After: 3                  # 仅 429，秒；≤ window，与 Reset−now 同口径
+X-RateLimit-Status: degraded    # 仅 Redis 故障显式容错放行时
 ```
 
-**`Remaining` 是近似的**：它只反映本节点库存，不含其他节点未用完的令牌。
+**`Remaining` 是本节点视角的**：快/慢路径口径一致（慢路径 `granted−1` 恰好等于回填后的本地库存）。
 对外承诺"剩余量"会误导客户端，所以文档里明确写它是 `local_remaining`。
 ⟨TODO：如果想给全局视角，可以在 slow path 时顺便带回 Redis 的剩余值，但会引入抖动⟩
+
+**`Reset` 是"下一个令牌可用时刻"**，不是窗口重置——令牌桶没有窗口概念：
+Redis 路径精确（服务端返回等待时长），本地路径近似（有库存 ⇒ 现在；刚取走最后一个 ⇒ 一个补充周期 `window/limit`）。
+`Retry-After` 封顶为 `window` 秒（一个窗口内必补 ≥1 个令牌），且 429 时 `Reset−now ≈ Retry-After`。
+429 是确定性拒绝，每次都打 notice 日志（key/limit/batch），可与 Redis 故障区分。
 
 **故障矩阵**
 
@@ -334,8 +339,12 @@ X-RateLimit-Status: degraded    # 仅 Redis 故障放行时
 | 配额位置 | Redis 单主 | Redis Cluster / Raft | 复杂度与收益不匹配，限流可容忍短时失效 |
 | 一致性 | 单主原子 + 明确误差上界 | 宣称强一致 | 强一致需要 Raft，且换不来业务收益 |
 | 延迟优化 | 本地库存 + 批量领取 | 每请求精确扣减 | Redis 负载 ÷k，代价是可控的少发 |
-| 剩余量语义 | 本地近似 | 全局精确 | 全局值需要额外一次 RTT，且本身有抖动 |
+| 剩余量语义 | 本节点视角（快慢路径一致） | 全局精确 | 全局值需要额外一次 RTT，且本身有抖动 |
+| Reset 口径 | 下一令牌可用时刻（Unix 秒） | 窗口重置 / 桶回满时间 | 令牌桶无窗口概念；回满在 burst 大时数值巨大且无 retry 价值 |
+| Retry-After | 封顶 window 秒 | 无上界 | 一个窗口必补 ≥1 令牌，更长的等待建议无意义 |
 | 故障策略 | 默认 fail-closed（503） | 默认 fail-open | 配额正确性优先；可用性可通过 `fault_tolerant=true` 显式换取 |
+| 畸形 Redis 返回 | 防御校验 → 故障分支 | 视为 429 / 静默兜底 | 数据异常不应触发确定性拒绝，也不应静默放行 |
+| header_name 缺失 | 下发即 400（entity_checks） | 运行时 500 | fail fast；坏配置不应进入运行时 |
 | 配置生效 | 声明式整体下发 | 细粒度热更新 | Kong DB-less 的原生方式，够用 |
 | 多维 key | 直接拼字符串 | 归一化 / 脱敏 | 归一化规则是业务语义，属于上层 |
 

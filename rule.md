@@ -250,7 +250,7 @@ else:
 采用：
 
 ```text
-kong:rl:{rl:ip=10.0.0.7:path=/echo}
+kong:rl:{rl:p=25c15179:ip=10.0.0.7:path=/echo}
 ```
 
 结构：
@@ -259,6 +259,7 @@ kong:rl:{rl:ip=10.0.0.7:path=/echo}
 kong:rl:
     {
         rl:
+        p=25c15179:
         ip=10.0.0.7:
         path=/echo
     }
@@ -269,8 +270,15 @@ kong:rl:
 - `kong:rl:` 是 Redis Key Prefix。
 - `{}` 是 Redis Cluster Hash Tag。
 - `rl:` 是限流规则命名空间。
+- `p=25c15179` 是策略指纹（8 位 hex，FNV-1a 32bit，输入 = limit、window、解析后 burst、limit_by 顺序、header_name(仅 header 维度)）。
 - `ip=...` 是 IP 维度。
 - `path=...` 是 Path 维度。
+
+**策略指纹的语义（Phase 2 补充）**：
+
+- 策略参数一变即得新键 ⇒ 新桶，旧桶与旧本地库存随 TTL 自然淘汰（实测修复前 116 > 100 的超发即源于此）。
+- 指纹**不含 batch**：batch 是运输参数，不构成桶身份；调 batch 不清空配额。
+- 代价：改 limit/window/burst/limit_by 瞬间配额"重新满血"；需要"改 limit 但继承余量"时用 `namespace` 显式控制（namespace 不变则桶不变）。
 
 ## 3.2 为什么使用 Hash Tag
 
@@ -287,9 +295,9 @@ prefix:{hash-tag}:suffix
 例如：
 
 ```text
-kong:rl:{rl:ip=10.0.0.7:path=/echo}
-kong:rl:{rl:ip=10.0.0.7:path=/echo}:metadata
-kong:rl:{rl:ip=10.0.0.7:path=/echo}:stats
+kong:rl:{rl:p=25c15179:ip=10.0.0.7:path=/echo}
+kong:rl:{rl:p=25c15179:ip=10.0.0.7:path=/echo}:metadata
+kong:rl:{rl:p=25c15179:ip=10.0.0.7:path=/echo}:stats
 ```
 
 这几个 Key 会落在同一个 Slot。
@@ -337,7 +345,7 @@ IP = 10.0.0.7
 生成：
 
 ```text
-kong:rl:{rl:ip=10.0.0.7:path=/echo}
+kong:rl:{rl:p=25c15179:ip=10.0.0.7:path=/echo}
 ```
 
 如果只配置：
@@ -351,23 +359,21 @@ kong:rl:{rl:ip=10.0.0.7:path=/echo}
 生成：
 
 ```text
-kong:rl:{rl:ip=10.0.0.7}
+kong:rl:{rl:p=<同策略指纹>:ip=10.0.0.7}
 ```
 
 ## 3.4 Key 设计需要优化的地方
 
-后续需要重点检查：
+检查状态（Phase 2 更新）：
 
-- 维度顺序是否固定。
-- Header 是否需要限制长度。
-- 特殊字符是否需要转义。
-- 是否存在不同维度拼接后产生歧义的可能。
-- 是否需要规则 ID 作为独立标识。
-- namespace 是否可以区分不同限流策略。
+- [已解决] 策略身份隔离：键已含 `p=` 策略指纹（limit/window/解析后 burst/limit_by 顺序/header_name），配置变更即新桶；维度顺序参与指纹（[ip,path] ≠ [path,ip]，实测指纹不同）。
+- [已解决] Header 长度限制：截断 256。
+- [已解决] 前置校验：limit_by 含 header 而 header_name 缺失 ⇒ 下发即 400（entity_checks）。
+- [待做] 特殊字符转义与拼接歧义：当前以 `dim=val` 顺序拼接，`val` 未转义（理论上可构造歧义值）。
+- [待做] 规则 ID 独立标识 / namespace 区分多策略：namespace 可区分（逃生门），规则级 ID 未做。
+- [待做] 路径归一化（基数治理）。
 
-不要在第一阶段随意修改 Key 格式。
-
-先编写单元测试，确认现有规则生成结果，再决定是否优化。
+注意：指纹已随 Phase 1/2 落地并有单元测试锁定（指纹性质断言 + dims 场景 7）。
 
 ---
 
@@ -379,7 +385,7 @@ Redis 保存全局状态：
 
 ```text
 Key:
-kong:rl:{rl:ip=10.0.0.7:path=/echo}
+kong:rl:{rl:p=25c15179:ip=10.0.0.7:path=/echo}
 
 Hash:
 tokens
@@ -1439,10 +1445,10 @@ service
 必须保留：
 
 ```text
-kong:rl:{rl:ip=10.0.0.7:path=/echo}
+kong:rl:{rl:p=<8位策略指纹>:<维度>=<值>:...}
 ```
 
-作为基础格式。
+作为基础格式（`p=` 指纹为 Phase 2 确认：策略参数参与键计算，详见 3.1）。
 
 输出：
 

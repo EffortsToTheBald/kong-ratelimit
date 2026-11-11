@@ -29,10 +29,10 @@
 
 ## 5. 文档同步（D8/D9）
 
-- [ ] 5.1 `README.md`：响应头语义段（Reset=下一令牌可用 Unix 秒、Retry-After≤window、remaining=本节点视角、429 日志）；验证：与实测响应头一致
-- [ ] 5.2 `docs/design.md`：§7 响应头语义更新、§9 取舍表补"reset 口径/防御校验"行；验证：grep 无旧语义残留（"窗口重置/now+window"）
-- [ ] 5.3 `rule.md` §3.2/§3.3/§3.4：key 格式示例与说明补 `p=` 指纹（输入、"策略变更即新桶"、namespace 逃生门）；验证：grep `kong:rl:{rl:ip=` 旧示例已全部更新
-- [ ] 5.4 `docs/review-phase-0.md` 不改（历史记录）；验证：确认未误改
+- [x] 5.1 `README.md`：响应头语义段（Reset=下一令牌可用 Unix 秒、Retry-After≤window、remaining=本节点视角、429 日志）；验证：与实测响应头一致
+- [x] 5.2 `docs/design.md`：§7 响应头语义更新、§9 取舍表补"reset 口径/防御校验"行；验证：grep 无旧语义残留（"窗口重置/now+window"）
+- [x] 5.3 `rule.md` §3.2/§3.3/§3.4：key 格式示例与说明补 `p=` 指纹（输入、"策略变更即新桶"、namespace 逃生门）；验证：grep `kong:rl:{rl:ip=` 旧示例已全部更新
+- [x] 5.4 `docs/review-phase-0.md` 不改（历史记录）；验证：确认未误改
 
 ## 6. 集成验收与报告
 
