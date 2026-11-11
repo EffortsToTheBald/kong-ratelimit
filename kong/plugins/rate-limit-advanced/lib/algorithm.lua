@@ -5,12 +5,55 @@
 -- 这个模块是"唯一一条代码路径"：batch=1 就是严格全局一致，
 -- batch=N 就是每 N 个请求一次 Redis。没有第二套实现。
 -- ============================================================
+local bit = require "bit"
+
 local store = require "kong.plugins.rate-limit-advanced.lib.store"
 local redis_mod = require "kong.plugins.rate-limit-advanced.lib.redis"
 
 local _M = {}
 
 local MAX_DIM_VALUE_LEN = 256
+
+-- FNV-1a 32-bit：h = (h ^ byte) * 16777619 mod 2^32（P0-1/D1）。
+-- Lua number 是 double，h * 16777619 会超 53 位精度，按 16 位拆乘保证精确。
+local function fnv1a32(s)
+  local h = 2166136261 -- 0x811c9dc5
+  for i = 1, #s do
+    h = bit.bxor(h, string.byte(s, i))
+    local lo = bit.band(h, 0xffff)
+    local hi = bit.rshift(h, 16)
+    h = bit.band(lo * 16777619 + bit.band(hi * 16777619, 0xffff) * 0x10000, 0xffffffff)
+  end
+  -- LuaJIT 的 bit.band 返回带符号 32 位结果；归一化成无符号，
+  -- 否则 %08x 会符号扩展成 16 位（如 ffffffff8039753e）。
+  return h % 0x100000000
+end
+
+--- 策略指纹输入串（D1）：limit、window、解析后 burst、limit_by 顺序、
+-- header_name（仅 limit_by 含 header 时参与）。不含 batch：batch 是运输参数，
+-- 不改变桶的身份，算进指纹会让调 batch 就清空整个桶。
+local function fingerprint_input(conf)
+  local _, burst = _M.rate_and_burst(conf)
+  local segs = {
+    "limit=" .. tostring(conf.limit),
+    "window=" .. tostring(conf.window),
+    "burst=" .. tostring(burst),
+    "limit_by=" .. table.concat(conf.limit_by, ","),
+  }
+  for i = 1, #conf.limit_by do
+    if conf.limit_by[i] == "header" then
+      segs[#segs + 1] = "header_name=" .. tostring(conf.header_name or "")
+      break
+    end
+  end
+  return table.concat(segs, ";")
+end
+
+--- 策略指纹（P0-1，D1）。纯函数：不依赖 kong.*，可在 resty 下直接单测。
+-- @return 8 位小写 hex 字符串
+function _M.policy_fingerprint(conf)
+  return string.format("%08x", fnv1a32(fingerprint_input(conf)))
+end
 
 local function dim_value(dim, conf)
   if dim == "consumer" then
@@ -52,8 +95,9 @@ local function dim_value(dim, conf)
 end
 
 --- 构建 Redis key。
--- 形如：kong:rl:{rl:ip=10.0.0.7:path=/echo}
--- 花括号是 Redis Cluster 的 hash tag，保证同一逻辑 key 落在同一 slot。
+-- 形如：kong:rl:{rl:p=1a2b3c4d:ip=10.0.0.7:path=/echo}
+-- 花括号是 Redis Cluster 的 hash tag，保证同一逻辑 key 落在同一 slot；
+-- p= 策略指纹（P0-1）：限流参数一变即得新 key/新桶，旧桶与旧本地库存随 TTL 自然淘汰。
 function _M.build_key(conf)
   local parts = {}
 
@@ -67,7 +111,9 @@ function _M.build_key(conf)
     parts[i] = dim .. "=" .. dim_value(dim, conf)
   end
 
-  local tag = conf.namespace .. ":" .. table.concat(parts, ":")
+  local tag = conf.namespace
+    .. ":p=" .. _M.policy_fingerprint(conf)
+    .. ":" .. table.concat(parts, ":")
   return conf.redis.key_prefix .. ":{" .. tag .. "}"
 end
 

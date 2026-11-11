@@ -23,9 +23,9 @@
 
 ## 4. 策略指纹进 Key（P0-1，design D1）
 
-- [ ] 4.1 在 `algorithm.lua` 新增纯函数 `policy_fingerprint(conf)`（FNV-1a 32-bit → 8 位小写 hex；输入 limit、window、解析后 burst、limit_by 顺序、header_name(仅 header 维度时)；不依赖 kong.*），`build_key` 输出 `kong:rl:{rl:p=<hex>:dim=val:...}`；验证：`resty -e`（Kong 镜像内或本机 lua5.1）直接调用该函数打印指纹
-- [ ] 4.2 指纹性质验证（脚本化）：改 limit/window/burst/limit_by 顺序/含 header 的 header_name 任一项 ⇒ 指纹变；`burst=0` 与 `burst=limit` ⇒ 同值；只改 batch ⇒ 指纹不变；验证：验证脚本的断言全部通过并记入报告
-- [ ] 4.3 跨配置隔离实测（spec"配置变更不继承旧配额"场景）：先以 limit=1000 放行若干请求，切 limit=100 后立即超额请求，全局放行 ≤ 100；验证：三节点下发新配置后 quota 流程实测（不再出现 review 实测的 116 > 100）
+- [x] 4.1 在 `algorithm.lua` 新增纯函数 `policy_fingerprint(conf)`（FNV-1a 32-bit → 8 位小写 hex；输入 limit、window、解析后 burst、limit_by 顺序、header_name(仅 header 维度时)；不依赖 kong.*），`build_key` 输出 `kong:rl:{rl:p=<hex>:dim=val:...}`；验证：`resty -e`（Kong 镜像内或本机 lua5.1）直接调用该函数打印指纹
+- [x] 4.2 指纹性质验证（脚本化）：改 limit/window/burst/limit_by 顺序/含 header 的 header_name 任一项 ⇒ 指纹变；`burst=0` 与 `burst=limit` ⇒ 同值；只改 batch ⇒ 指纹不变；验证：验证脚本的断言全部通过并记入报告
+- [x] 4.3 跨配置隔离实测（spec"配置变更不继承旧配额"场景）：先以 limit=1000 放行若干请求，切 limit=100 后立即超额请求，全局放行 ≤ 100；验证：三节点下发新配置后 quota 流程实测（不再出现 review 实测的 116 > 100）
 
 ## 5. Fail-Closed 默认（P0-2，design D2）
 
