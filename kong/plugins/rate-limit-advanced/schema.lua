@@ -40,8 +40,8 @@ return {
           { namespace = { type = "string", default = "rl" } },
           -- 不回 X-RateLimit-* 头（网关内部限流时用）
           { hide_client_headers = { type = "boolean", default = false } },
-          -- Redis 故障时：true = 放行并标记 degraded；false = 503
-          { fault_tolerant = { type = "boolean", default = true } },
+          -- Redis 故障时：false（默认）= Fail-Closed 返回 503；true = 显式选择放行并标记 degraded
+          { fault_tolerant = { type = "boolean", default = false } },
           {
             redis = {
               type = "record",

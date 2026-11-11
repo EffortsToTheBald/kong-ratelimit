@@ -29,9 +29,9 @@
 
 ## 5. Fail-Closed 默认（P0-2，design D2）
 
-- [ ] 5.1 `schema.lua` `fault_tolerant` 默认改为 false，`kong/kong.yml` 显式 `fault_tolerant: false`；验证：`docker compose restart kong*` 后未显式配置 fault_tolerant 的实例，停 Redis 请求返回 503（spec"停止 Redis 后默认返回 503"场景）
-- [ ] 5.2 文档同步：README §7 验收清单 degraded 行、§5 batch 表注、`docs/design.md` §4.6/§7 故障模式、§9 取舍表、§12 key 设计（含 `p=` 指纹与"策略变更即满血新桶"代价）；验证：grep 全仓 `fault_tolerant`/key 格式表述一致，无残留 fail-open 默认描述
-- [ ] 5.3 容错模式保留验证：显式 `fault_tolerant=true` 时停 Redis 放行且带 `X-RateLimit-Status: degraded`，恢复后正常；验证：手动配置下发 + `docker compose stop/start redis` 实测（spec"容错模式降级放行"场景，rule.md 测试 C 的显式容错分支）
+- [x] 5.1 `schema.lua` `fault_tolerant` 默认改为 false，`kong/kong.yml` 显式 `fault_tolerant: false`；验证：`docker compose restart kong*` 后未显式配置 fault_tolerant 的实例，停 Redis 请求返回 503（spec"停止 Redis 后默认返回 503"场景）
+- [x] 5.2 文档同步：README §7 验收清单 degraded 行、§5 batch 表注、`docs/design.md` §4.6/§7 故障模式、§9 取舍表、§12 key 设计（含 `p=` 指纹与"策略变更即满血新桶"代价）；验证：grep 全仓 `fault_tolerant`/key 格式表述一致，无残留 fail-open 默认描述
+- [x] 5.3 容错模式保留验证：显式 `fault_tolerant=true` 时停 Redis 放行且带 `X-RateLimit-Status: degraded`，恢复后正常；验证：手动配置下发 + `docker compose stop/start redis` 实测（spec"容错模式降级放行"场景，rule.md 测试 C 的显式容错分支）
 
 ## 6. 压测脚本收敛（P0-6 + P0-5 断言，design D7）
 

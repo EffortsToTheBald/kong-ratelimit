@@ -148,14 +148,14 @@ done | sort | uniq -c
 - [ ] 三节点：同上但 `batch=20`，总通过数落在 **[40, 100]**（少发，不超发）
 - [ ] 多维：`limit_by: [ip, path]`，不同 path 独立计数
 - [ ] 动态配置：`POST /config` 改 limit，10s 内生效且不重启
-- [ ] Redis 挂掉：`docker compose stop redis` → 请求仍放行并带 `X-RateLimit-Status: degraded`
+- [ ] Redis 挂掉：`docker compose stop redis` → 默认返回 503（fail-closed）；显式 `fault_tolerant: true` 时放行并带 `X-RateLimit-Status: degraded`
 - [ ] 性能：`batch=20` 的 p99 与无插件基线差 < 1ms
 
 ## 8. 已知限制 / 生产化差距
 
 见 `docs/design.md` 第 8、9 节。要点：Redis 主从切换窗口内可能重复发放；单 key 热点；
 `limit_by=path` 的高基数风险；shared dict 需要改 `kong.conf`（本项目用 `KONG_NGINX_HTTP_LUA_SHARED_DICT`）；
-默认 fail-open 是可用的取舍，但金融场景要改成 fail-closed。
+默认已是 fail-closed（503）；可用性敏感的场景可显式设 `fault_tolerant: true`，换取 degraded 放行。
 
 ## 9. 常见故障
 
@@ -177,6 +177,6 @@ done | sort | uniq -c
 | 分布式 | `policy: redis` 每请求一次 Redis | 本地库存 + 批量领取，Redis 负载 ÷batch |
 | 精度语义 | 未明示误差 | 明确给出「只少发不超发」的上界 |
 | 多维 | consumer/ip/header/path/service/route | 同左 + 组合 |
-| 故障模式 | 无显式降级声明 | `fault_tolerant` + `X-RateLimit-Status: degraded` |
+| 故障模式 | 无显式降级声明 | 默认 fail-closed（503）；`fault_tolerant=true` 显式降级放行 + 响应头标记 |
 
 详见 `docs/design.md` 第 10 节。

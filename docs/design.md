@@ -184,9 +184,9 @@ burst_max = B + N · k
 
 | 场景 | 行为 | 缓解 |
 |---|---|---|
-| Redis 不可达 | 默认 fail-open（放行 + `X-RateLimit-Status: degraded`） | 可配 `fault_tolerant=false` 改为 503 |
+| Redis 不可达 | 默认 fail-closed（503，配额安全优先） | 可显式 `fault_tolerant=true` 换取放行 + `X-RateLimit-Status: degraded` |
 | 主从异步复制 | 主节点已扣减但未同步即宕机 → 切换后令牌"复活" → 短时超发 | 接受并记录；或用 AOF `appendfsync always`（延迟代价） |
-| 主从切换期间 | 连接报错 → 触发 fail-open | 连接池 + 超时（1s）保证快速失败 |
+| 主从切换期间 | 连接报错 → 触发故障分支（默认 503 / 显式 degraded 放行） | 连接池 + 超时（1s）保证快速失败 |
 
 **这里不写"强一致"**。准确说法是：单主下原子，切换窗口内可能重复发放，
 超发量上界 ≈ 切换前一个复制周期内的发放量。诚实划边界比宣称强一致更经得起追问。
@@ -202,7 +202,8 @@ burst_max = B + N · k
 | 实现复杂度 | 一个 Lua 脚本 | 成员管理、快照、日志压缩、脑裂处理 |
 | 配额回收 | TTL 自动 | 需要自己设计回收协议 |
 
-结论：限流是**可容忍短暂失效**的场景（fail-open 几秒的危害远小于把网关拖死），
+结论：限流是**可容忍短暂失效**的场景（短暂拒绝或降级几秒的危害远小于把网关拖死；
+Redis 故障时默认 503 还是 degraded 放行，由 `fault_tolerant` 显式选择），
 用 Raft 换来的强一致在这里是过度设计。**知道什么时候不用重方案，比会用重方案更重要。**
 
 ---
@@ -242,7 +243,7 @@ plugins:
       limit_by: [ip]       # 维度组合
       header_name: X-Api-Key   # limit_by 含 header 时必填
       namespace: rl
-      fault_tolerant: true
+      fault_tolerant: false    # 默认；true = 显式选择 Redis 故障时 degraded 放行
       redis:
         host: redis
         port: 6379
@@ -252,11 +253,13 @@ plugins:
 
 **语义定义（容易被忽略但必须写清）**：
 
-- 运行中修改 `limit`：令牌桶的 `burst` 立即变为新的 limit，`rate` 立即生效；
-  已发放到本地库存的令牌**不会被回收**，所以缩配额时的效果是"逐步收紧"，不是"立刻生效"。
-  这是有意的取舍——回收需要反向通知，复杂度和收益不成正比。
+- 运行中修改 `limit`（或 `window`/`burst`/`limit_by`）：key 中的**策略指纹**随之变化 = 直接换新桶。
+  新桶从满血开始，旧桶与旧本地库存随 TTL 淘汰，**不会被新策略继承**
+  （这修复了"缩配额后旧库存继续放行导致超发"的问题：修复前实测 116 > 100）。
+  代价是配置变更瞬间配额"重置"；需要"改 limit 但继承余量"的语义时，用 `namespace` 显式控制——
+  namespace 不变、其他参数不变的组合才会命中同一个桶。
 - 修改 `limit_by`：key 的组成变了，等价于换了一个桶，旧桶按 TTL 自然过期。
-- `window` 与 `limit` 同时改：`rate = limit/window` 重新计算，桶内现有令牌保留。
+- 只改 `batch`：指纹不含 batch（运输参数，不构成桶身份），桶与现有库存**保留**。
 
 ⟨TODO：贴一段 `POST /config` 改 limit 前后的 curl 对比，证明 10s 内生效⟩
 
@@ -282,7 +285,7 @@ X-RateLimit-Status: degraded    # 仅 Redis 故障放行时
 
 | 故障 | 检测 | 行为 |
 |---|---|---|
-| Redis 超时 | `resty.redis` 1s 超时 | fail-open + 日志 + 头标记 |
+| Redis 超时/不可达 | `resty.redis` 1s 超时 / 连接失败 | 默认 fail-closed（503）+ error 日志；`fault_tolerant=true` 时放行 + degraded 头 |
 | shared dict 未配置 | `ngx.shared.kong_rl == nil` | 降级为 worker 内存表（精度下降，功能不中断） |
 | 配置缺 `header_name` | access 时校验 | 500 + 明确错误信息（而不是静默放行） |
 
@@ -332,7 +335,7 @@ X-RateLimit-Status: degraded    # 仅 Redis 故障放行时
 | 一致性 | 单主原子 + 明确误差上界 | 宣称强一致 | 强一致需要 Raft，且换不来业务收益 |
 | 延迟优化 | 本地库存 + 批量领取 | 每请求精确扣减 | Redis 负载 ÷k，代价是可控的少发 |
 | 剩余量语义 | 本地近似 | 全局精确 | 全局值需要额外一次 RTT，且本身有抖动 |
-| 故障策略 | 默认 fail-open | fail-closed | 限流失效的危害 < 网关整体不可用 |
+| 故障策略 | 默认 fail-closed（503） | 默认 fail-open | 配额正确性优先；可用性可通过 `fault_tolerant=true` 显式换取 |
 | 配置生效 | 声明式整体下发 | 细粒度热更新 | Kong DB-less 的原生方式，够用 |
 | 多维 key | 直接拼字符串 | 归一化 / 脱敏 | 归一化规则是业务语义，属于上层 |
 
@@ -347,7 +350,7 @@ X-RateLimit-Status: degraded    # 仅 Redis 故障放行时
 | Redis 调用 | 每请求 1 次（`policy: redis`） | 每 k 次请求 1 次 |
 | 多副本精度 | 依赖 Redis `INCR`，精确但每请求 RTT | 精确（k=1）或有界误差（k>1），可调 |
 | 突发控制 | 由窗口大小隐式决定 | `burst` 显式可配 |
-| 故障降级 | 无显式声明 | `fault_tolerant` + 响应头标记 |
+| 故障降级 | 无显式声明 | 默认 fail-closed（503）；`fault_tolerant=true` 显式降级 + 响应头标记 |
 | 误差说明 | 未给出 | 文档给出上界公式与实验验证 |
 
 **不是"重复造轮子"**：官方实现解决的是"有没有"，本方案解决的是"每请求一次 Redis 的
@@ -376,12 +379,20 @@ X-RateLimit-Status: degraded    # 仅 Redis 故障放行时
 ## 12. 附：key 设计
 
 ```
-kong:rl:{<namespace>:<dim1>=<v1>:<dim2>=<v2>}
+kong:rl:{<namespace>:p=<policy-fingerprint>:<dim1>=<v1>:<dim2>=<v2>}
 ```
 
 - 用 `{}` 包住 hash tag，保证 Redis Cluster 下同一逻辑 key 落在同一 slot（虽然当前是单实例，
   但这是零成本的向前兼容）。
+- **`p=<8位hex>` 是策略指纹**（FNV-1a-32，输入 = limit、window、解析后 burst、limit_by 顺序、
+  header_name(仅 header 维度)）：限流参数一变即为新桶，旧桶与旧本地库存不再被新策略继承
+  （修复前实测：改 limit 后放行 116 > 100，多出的 16 个全部来自旧配置的桶与库存）。
+  指纹不含 `batch`——batch 是运输参数，不构成桶的身份。
 - 维度值做长度截断（256 字符），防止超长 header 撑爆 key。
-- 示例：`kong:rl:{rl:ip=10.0.0.7:path=/echo}`
+- 示例（实测 `redis-cli KEYS` 输出）：
 
-⟨TODO：把这里换成你实际抓到的 redis-cli KEYS 输出⟩
+```
+kong:rl:{rl:p=8039753e:ip=172.20.0.1}   # limit=1000 / window=3600 / limit_by=ip
+kong:rl:{rl:p=50780f62:ip=172.20.0.1}   # limit=100  / window=3600 / limit_by=ip
+                                        # 同一维度值、不同策略 → 两个独立桶
+```
