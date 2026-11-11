@@ -1,0 +1,22 @@
+# 国内网络专用 override：把镜像换成镜像站路径。
+#
+#   docker compose -f docker-compose.yml -f docker-compose.mirror.yml up -d
+#
+# 如果你已经用 scripts/pull-images.sh retag 过，就不需要这个文件。
+# 镜像站失效时，把 docker.m.daocloud.io 换成其他站即可（见 docs/docker-mirror.md）。
+
+services:
+  redis:
+    image: docker.m.daocloud.io/library/redis:7-alpine
+
+  echo:
+    image: docker.m.daocloud.io/hashicorp/http-echo:1.0
+
+  kong1:
+    image: docker.m.daocloud.io/library/kong:3.6
+
+  kong2:
+    image: docker.m.daocloud.io/library/kong:3.6
+
+  kong3:
+    image: docker.m.daocloud.io/library/kong:3.6

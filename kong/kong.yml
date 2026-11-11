@@ -1,0 +1,25 @@
+_format_version: "3.0"
+
+services:
+  - name: echo
+    url: http://echo:5678
+    routes:
+      - name: echo-route
+        paths:
+          - /echo
+        strip_path: false
+        plugins:
+          - name: rate-limit-advanced
+            config:
+              limit: 1000
+              window: 60
+              batch: 0            # 0 = auto → clamp(limit/50, 1, 50) = 20
+              limit_by:
+                - ip
+              namespace: rl
+              fault_tolerant: true
+              redis:
+                host: redis
+                port: 6379
+                database: 0
+                timeout: 1000

@@ -1,0 +1,5 @@
+# 压测产物（每轮重生成，不进版本库）
+bench/out/
+
+# OpenCode agent 本地数据
+.opencode/
