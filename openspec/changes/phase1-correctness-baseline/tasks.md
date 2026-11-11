@@ -35,8 +35,8 @@
 
 ## 6. 压测脚本收敛（P0-6 + P0-5 断言，design D7）
 
-- [ ] 6.1 `bench/common.sh` 的 `kong_config_json` 增加 namespace 参数并显式写 `fault_tolerant:false`；`quota.sh`/`matrix.sh` 每轮生成独立 namespace；验证：连续两轮 `redis-cli KEYS 'kong:rl:*'` 前缀/namespace 段不同，无跨轮残留
-- [ ] 6.2 `bench/quota.sh` 增加每节点断言：k6 summary 的 `requests_kong1/2/3` 逐一严格等于 PER_NODE，否则脚本失败退出；验证：正常轮通过；人为传入非整除 VUS 组合时脚本失败（fail loudly）
+- [x] 6.1 `bench/common.sh` 的 `kong_config_json` 增加 namespace 参数并显式写 `fault_tolerant:false`；`quota.sh`/`matrix.sh` 每轮生成独立 namespace；验证：连续两轮 `redis-cli KEYS 'kong:rl:*'` 前缀/namespace 段不同，无跨轮残留
+- [x] 6.2 `bench/quota.sh` 增加每节点断言：k6 summary 的 `requests_kong1/2/3` 逐一严格等于 PER_NODE，否则脚本失败退出；验证：正常轮通过；人为传入非整除 VUS 组合时脚本失败（fail loudly）
 
 ## 7. IP 维度回归测试（P0-3 收尾，design D6）
 

@@ -34,16 +34,19 @@ assert_prerequisites() {
 }
 
 # 生成 Kong DB-less 声明式配置（JSON）
-# 用法：kong_config_json <limit> <window> <batch> <with_plugin>
+# 用法：kong_config_json <limit> <window> <batch> <with_plugin> [namespace]
+#   第 5 参 namespace：每轮/每用例独立（quota.sh、matrix.sh 传入），杜绝跨轮次共享桶（P0-6）
+#   fault_tolerant 显式 false：与 fail-closed 默认对齐；故障注入场景显式下发 true
 kong_config_json() {
     local limit="$1" window="$2" batch="$3" with_plugin="${4:-true}"
+    local ns="${5:-rl}"
     local plugins=""
 
     if [ "$with_plugin" = "true" ]; then
         plugins=$(cat <<EOF
 [{"name":"rate-limit-advanced","config":{
   "limit":${limit},"window":${window},"batch":${batch},
-  "limit_by":["ip"],"namespace":"rl","fault_tolerant":true,
+  "limit_by":["ip"],"namespace":"${ns}","fault_tolerant":false,
   "redis":{"host":"redis","port":6379,"database":0,"timeout":1000}}}]
 EOF
 )
@@ -87,6 +90,20 @@ except Exception:
 m = d.get("metrics", {}).get(sys.argv[2], {}).get("values", {})
 print(m.get(sys.argv[3], 0))
 PY
+}
+
+# P0-5 运行时断言：summary 里每个节点的请求数必须严格等于期望值。
+# 节点分配一旦失控（VU 绑定假设失效），本轮结果就不能作为全局配额证据，必须失败退出。
+# 用法：assert_per_node_counts <k6_summary.json> <expected_per_node>
+assert_per_node_counts() {
+    local out="$1" expected="$2" i v
+    for i in 1 2 3; do
+        v=$(json_num "$out" "requests_kong${i}" count); v=${v%.*}
+        if [ "$v" -ne "$expected" ]; then
+            die "每节点请求数断言失败：kong${i} 实际 ${v} 次 ≠ 期望 ${expected} 次（节点分配失控，本轮结果不可作为全局配额证据）"
+        fi
+    done
+    ok "每节点请求数断言通过：kong1/2/3 各 ${expected} 次"
 }
 
 # 跑 k6，成功则把产物路径打到 stdout（k6 自身输出走 stderr）

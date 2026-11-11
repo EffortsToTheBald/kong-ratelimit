@@ -44,8 +44,10 @@ assert_prerequisites
 NODE_COUNT=${#PROXY_NODES[@]}
 TOTAL=$(( PER_NODE * NODE_COUNT ))
 
-log "下发配置：limit=$LIMIT window=$WINDOW batch=$BATCH"
-apply_config "$(kong_config_json "$LIMIT" "$WINDOW" "$BATCH" true)"
+# P0-6：每轮独立 namespace，杜绝上一轮残留状态污染本轮结果
+NS="rl-$(date +%s)-$$"
+log "下发配置：limit=$LIMIT window=$WINDOW batch=$BATCH namespace=$NS"
+apply_config "$(kong_config_json "$LIMIT" "$WINDOW" "$BATCH" true "$NS")"
 sleep 2
 
 log "打流量：${NODE_COUNT} 节点 × ${PER_NODE} = ${TOTAL} 次"
@@ -56,6 +58,9 @@ OUT=$(run_k6 k6/quota.js "quota-b${BATCH}.json" \
 ALLOWED=$(json_num "$OUT" rl_allowed count); ALLOWED=${ALLOWED%.*}
 LIMITED=$(json_num "$OUT" rl_limited count); LIMITED=${LIMITED%.*}
 OTHER=$(json_num "$OUT" rl_other count);     OTHER=${OTHER%.*}
+
+# P0-5 运行时断言：每节点请求数必须严格等于 PER_NODE
+assert_per_node_counts "$OUT" "$PER_NODE"
 
 echo
 echo "结果：allowed=$ALLOWED  limited=$LIMITED  other=$OTHER  total=$TOTAL"

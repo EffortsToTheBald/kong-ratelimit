@@ -60,10 +60,12 @@ run_case() {
     local label="$1" batch="$2" rate="$3"
 
     local json summary out
+    # 每个用例独立 namespace：桶状态不跨用例残留，Redis ops 统计才可比（P0-6）
+    local ns="rl-$(date +%s%N | cut -b1-16)-b${batch}"
     if [ "$label" = "M0 基线" ]; then
-        json=$(kong_config_json "$LIMIT" "$WINDOW" 0 false)
+        json=$(kong_config_json "$LIMIT" "$WINDOW" 0 false "$ns")
     else
-        json=$(kong_config_json "$LIMIT" "$WINDOW" "$batch" true)
+        json=$(kong_config_json "$LIMIT" "$WINDOW" "$batch" true "$ns")
     fi
 
     apply_config "$json"
