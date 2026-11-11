@@ -11,9 +11,9 @@
 
 ## 2. Redis Lua 时间戳单调（P0-4，design D5）
 
-- [ ] 2.1 修改 `lib/redis.lua` 内嵌脚本：补充与 `ts = now` 收进 `if now > ts` 分支，`HSET` 回写分支内 ts 而非裸 `now`；验证：`redis-cli --eval redis/token_bucket.lua` 对预置"未来 ts"的 key 执行，返回不补充且 hash 中 ts 未回退
-- [ ] 2.2 同步修改 `redis/token_bucket.lua` 使两份脚本逐字一致；验证：两段脚本 diff 为空（P2-3 双源问题记录在案、不合并）
-- [ ] 2.3 正常路径回归：耗尽桶后短等待再请求，令牌按 `elapsed × rate` 补充且封顶 burst；验证：时序 curl 实测数据记入报告（对应 spec"补充量符合速率公式"场景，rule.md 测试 D 的数据采集前置）
+- [x] 2.1 修改 `lib/redis.lua` 内嵌脚本：补充与 `ts = now` 收进 `if now > ts` 分支，`HSET` 回写分支内 ts 而非裸 `now`；验证：`redis-cli --eval redis/token_bucket.lua` 对预置"未来 ts"的 key 执行，返回不补充且 hash 中 ts 未回退
+- [x] 2.2 同步修改 `redis/token_bucket.lua` 使两份脚本逐字一致；验证：两段脚本 diff 为空（P2-3 双源问题记录在案、不合并）
+- [x] 2.3 正常路径回归：耗尽桶后短等待再请求，令牌按 `elapsed × rate` 补充且封顶 burst；验证：时序 curl 实测数据记入报告（对应 spec"补充量符合速率公式"场景，rule.md 测试 D 的数据采集前置）
 
 ## 3. 决策主流程修复（design D3/D4/D6）
 
