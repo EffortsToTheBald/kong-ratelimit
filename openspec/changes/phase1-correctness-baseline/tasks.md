@@ -44,11 +44,11 @@
 
 ## 8. Phase 1 集成验收（rule.md 测试 A–D + 报告）
 
-- [ ] 8.1 测试 A+B（batch=1 严格基线）：3 节点 × 150 并发，期望 allowed=100 / limited=350 / other=0，且每节点断言通过、本地库存命中 0；验证：`./bench/quota.sh -l 100 -b 1 -p 150` 全绿（spec"batch=1 全局恰好放行 limit 个"场景）
-- [ ] 8.2 测试 B 变体（batch=20 不超发与下界）：期望 allowed ∈ [40, 100] 且多次轮次观察波动并记录（不做 Phase 4 的 10 次重复矩阵）；验证：`./bench/quota.sh -l 100 -b 20 -p 150` 输出落在区间（spec"batch=20 放行数不超过 limit"与"batch=20 均匀流量下放行数达到下界"场景）
-- [ ] 8.3 测试 C（故障策略双路径）：默认配置 → 503 不打上游；显式 fault_tolerant=true → degraded 放行；验证：两分支实测数据齐全（与 5.1/5.3 同源，此处做全流程复核）
-- [ ] 8.4 测试 D（令牌补充）：以 2.3 采集的数据核对 `tokens += elapsed × rate`、封顶 burst、回拨场景不重复计费；验证：报告含实测时序表
-- [ ] 8.5 汇总 `reports/phase-1-correctness.md`：严格按 rule.md §13 十二节格式（含环境说明：WSL mirrored、端口 8030/6380、代理拉镜像），未执行项标 NOT RUN；验证：报告覆盖 8 个测试组且与原始日志/summary 文件对应；人工验收通过后提交组 8 的 commit（回滚锚点由各任务组的组级 commit 共同构成）
+- [x] 8.1 测试 A+B（batch=1 严格基线）：3 节点 × 150 并发，期望 allowed=100 / limited=350 / other=0，且每节点断言通过、本地库存命中 0；验证：`./bench/quota.sh -l 100 -b 1 -p 150` 全绿（spec"batch=1 全局恰好放行 limit 个"场景）
+- [x] 8.2 测试 B 变体（batch=20 不超发与下界）：期望 allowed ∈ [40, 100] 且多次轮次观察波动并记录（不做 Phase 4 的 10 次重复矩阵）；验证：`./bench/quota.sh -l 100 -b 20 -p 150` 输出落在区间（spec"batch=20 放行数不超过 limit"与"batch=20 均匀流量下放行数达到下界"场景）
+- [x] 8.3 测试 C（故障策略双路径）：默认配置 → 503 不打上游；显式 fault_tolerant=true → degraded 放行；验证：两分支实测数据齐全（与 5.1/5.3 同源，此处做全流程复核）
+- [x] 8.4 测试 D（令牌补充）：以 2.3 采集的数据核对 `tokens += elapsed × rate`、封顶 burst、回拨场景不重复计费；验证：报告含实测时序表
+- [x] 8.5 汇总 `reports/phase-1-correctness.md`：严格按 rule.md §13 十二节格式（含环境说明：WSL mirrored、端口 8030/6380、代理拉镜像），未执行项标 NOT RUN；验证：报告覆盖 8 个测试组且与原始日志/summary 文件对应；人工验收通过后提交组 8 的 commit（回滚锚点由各任务组的组级 commit 共同构成）
 
 ## Workflow follow-up
 
