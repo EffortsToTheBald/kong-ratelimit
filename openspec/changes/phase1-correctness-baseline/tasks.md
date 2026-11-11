@@ -40,7 +40,7 @@
 
 ## 7. IP 维度回归测试（P0-3 收尾，design D6）
 
-- [ ] 7.1 新增伪造 XFF 场景（如 `bench/xff.sh` 或 quota.sh 变体）：同源 IP、limit=1、batch=1，携带不同伪造 `X-Forwarded-For` 反复请求；验证：仅首个请求 200，其余全部 429（spec"伪造 XFF 不产生新桶"场景）
+- [x] 7.1 新增伪造 XFF 场景（如 `bench/xff.sh` 或 quota.sh 变体）：同源 IP、limit=1、batch=1，携带不同伪造 `X-Forwarded-For` 反复请求；验证：仅首个请求 200，其余全部 429（spec"伪造 XFF 不产生新桶"场景）
 
 ## 8. Phase 1 集成验收（rule.md 测试 A–D + 报告）
 
