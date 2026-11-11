@@ -36,9 +36,9 @@
 
 ## 6. 集成验收与报告
 
-- [ ] 6.1 回归：Phase 1 关键 case 复跑（batch=1 基线 100/350/0、故障双路径、指纹隔离）；验证：与 Phase 1 结果一致（`test/first-commit.md` 锚点表）
-- [ ] 6.2 新语义全量验证：dims.sh + reset/Retry-After/429 日志/400 下发/降级告警逐项留档；验证：覆盖 spec 全部 11 条 ADDED 需求的 scenario
-- [ ] 6.3 汇总 `reports/phase-2-dimensions-and-semantics.md`（rule.md §13 十二节格式；未执行项标 NOT RUN）；验证：报告与原始输出/summary 对应；人工验收通过后提交组 6 commit
+- [x] 6.1 回归：Phase 1 关键 case 复跑（batch=1 基线 100/350/0、故障双路径、指纹隔离）；验证：与 Phase 1 结果一致（`test/first-commit.md` 锚点表）
+- [x] 6.2 新语义全量验证：dims.sh + reset/Retry-After/429 日志/400 下发/降级告警逐项留档；验证：覆盖 spec 全部 11 条 ADDED 需求的 scenario
+- [x] 6.3 汇总 `reports/phase-2-dimensions-and-semantics.md`（rule.md §13 十二节格式；未执行项标 NOT RUN）；验证：报告与原始输出/summary 对应；人工验收通过后提交组 6 commit
 
 ## Workflow follow-up
 
