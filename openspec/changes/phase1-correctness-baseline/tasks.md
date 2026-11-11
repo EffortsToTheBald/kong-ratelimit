@@ -6,8 +6,8 @@
 
 ## 1. 回滚基线与环境自检
 
-- [ ] 1.1 补 `.gitignore`（`bench/out/` 等测试产物），`git add -A && git commit` 打基线 commit；验证：`git log --oneline` 出现基线提交、`git status` 干净（design D8）
-- [ ] 1.2 环境自检：`docker compose up -d`、三节点管理面 `/status` 可达、`redis-cli ping` 正常；验证：`docker compose ps` 全部运行中且 `curl -s http://localhost:8031/status` 返回 200；环境不可用时在报告中记录并暂停后续任务
+- [x] 1.1 补 `.gitignore`（`bench/out/` 等测试产物），`git add -A && git commit` 打基线 commit；验证：`git log --oneline` 出现基线提交、`git status` 干净（design D8）
+- [x] 1.2 环境自检：`docker compose up -d`、三节点管理面 `/status` 可达、`redis-cli ping` 正常；验证：`docker compose ps` 全部运行中且 `curl -s http://localhost:8031/status` 返回 200；环境不可用时在报告中记录并暂停后续任务
 
 ## 2. Redis Lua 时间戳单调（P0-4，design D5）
 
