@@ -380,7 +380,17 @@ function _M.grant_multi(conf, keys, rates, bursts, ttls_ms)
     return nil, cerr
   end
 
-  local res, eerr = r:eval(GRANT_MULTI, n, unpack(keys), unpack(argv))
+  -- eval 参数必须显式拼平：unpack 处在参数列表中间会被 Lua 截成 1 个值
+  -- （KEYS 会丢、numkeys 错位），只有末尾的 unpack 才完整展开。
+  local args = { n }
+  for i = 1, n do
+    args[#args + 1] = keys[i]
+  end
+  for i = 1, #argv do
+    args[#args + 1] = argv[i]
+  end
+
+  local res, eerr = r:eval(GRANT_MULTI, unpack(args))
   if not res then
     r:close()
     return nil, "eval: " .. tostring(eerr)

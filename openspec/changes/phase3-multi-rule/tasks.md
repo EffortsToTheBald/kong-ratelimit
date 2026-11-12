@@ -21,9 +21,9 @@
 
 ## 4. 决策与响应语义（D1/D5，algorithm.lua + handler.lua）
 
-- [ ] 4.1 `algorithm.lua` 多规则分支：conf.rules 非空 → 组键构造（组指纹 + r<i> 段 + 各规则维度值）→ grant_multi → 组装 decision（remaining=min、reset=瓶颈桶 now+wait、rule 拒绝信息）；验证：resty 或 curl 观察组键形状（KEYS 含组指纹与 r1/r2 段）
-- [ ] 4.2 `handler.lua` 多规则响应：放行头（Remaining=min/Reset=瓶颈）、429 体含 `rule` 字段、Retry-After=max(wait) 封顶 max(window)、判定日志含拒绝规则；验证：实测 429 响应体与头（预置一空一有）
-- [ ] 4.3 运行时兜底校验（rules 模式 batch>1 或超 8 条 → 500 misconfigured 双保险）；验证：绕过 schema 直接注入 conf 的单测路径（resty）
+- [x] 4.1 `algorithm.lua` 多规则分支：conf.rules 非空 → 组键构造（组指纹 + r<i> 段 + 各规则维度值）→ grant_multi → 组装 decision（remaining=min、reset=瓶颈桶 now+wait、rule 拒绝信息）；验证：resty 或 curl 观察组键形状（KEYS 含组指纹与 r1/r2 段）
+- [x] 4.2 `handler.lua` 多规则响应：放行头（Remaining=min/Reset=瓶颈）、429 体含 `rule` 字段、Retry-After=max(wait) 封顶 max(window)、判定日志含拒绝规则；验证：实测 429 响应体与头（预置一空一有）
+- [x] 4.3 运行时兜底校验（rules 模式 batch>1 或超 8 条 → 500 misconfigured 双保险）；验证：绕过 schema 直接注入 conf 的单测路径（resty）
 
 ## 5. 多维验证脚本（D6，bench/rules.sh）
 

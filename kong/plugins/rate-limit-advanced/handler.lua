@@ -48,15 +48,20 @@ function _M:access(conf)
     })
   end
 
+  -- D5：多规则模式的 limit 口径 = 瓶颈/拒绝规则的 limit（单规则路径保持 conf.limit）
+  local shown_limit = decision.multi_limit or conf.limit
+
   if not decision.allowed then
     -- 429：确定性限流拒绝，打判定日志（notice 级在 KONG_LOG_LEVEL=notice 下可见），
     -- 使"确定性拒绝"可与 Redis 故障（fail 分支日志）区分。
     kong.log.notice("rate-limit-advanced: 429 key=", key,
-                    " limit=", conf.limit, " batch=", algorithm.resolve_batch(conf))
+                    " limit=", shown_limit,
+                    " batch=", algorithm.resolve_batch(conf),
+                    decision.reject_rules and (" reject=" .. decision.reject_rules) or "")
 
-    -- D2：Retry-After 封顶为 window（一个窗口内必补 >= 1 个令牌）
+    -- D2：Retry-After 封顶（单规则 = window；多规则 = 不足规则 window 最大值，同口径）
     local retry_after = math.max(1, math.ceil(decision.retry_after or 1))
-    local window_cap = math.floor(conf.window)
+    local window_cap = decision.reject_cap or math.floor(conf.window)
     if window_cap < 1 then
       window_cap = 1
     end
@@ -73,21 +78,27 @@ function _M:access(conf)
       ["Retry-After"]  = tostring(retry_after),
     }
     if not conf.hide_client_headers then
-      headers["X-RateLimit-Limit"]     = tostring(conf.limit)
+      headers["X-RateLimit-Limit"]     = tostring(shown_limit)
       headers["X-RateLimit-Remaining"] = "0"
       headers["X-RateLimit-Reset"]     = tostring(reset)
     end
 
-    return kong.response.exit(429, {
+    -- D5：多规则模式下响应体 rule 字段标明拒绝来源（人读标识，非内部裸序号）
+    local body = {
       message     = "API rate limit exceeded",
-      limit       = conf.limit,
-      window      = conf.window,
+      limit       = shown_limit,
+      window      = decision.reject_cap and conf.rules[decision.reject_primary].window or conf.window,
       retry_after = retry_after,
-    }, headers)
+    }
+    if decision.reject_rules then
+      body.rule = decision.reject_rules
+    end
+
+    return kong.response.exit(429, body, headers)
   end
 
   if not conf.hide_client_headers then
-    kong.response.set_header("X-RateLimit-Limit", tostring(conf.limit))
+    kong.response.set_header("X-RateLimit-Limit", tostring(shown_limit))
     kong.response.set_header("X-RateLimit-Remaining", tostring(decision.remaining))
     kong.response.set_header("X-RateLimit-Reset", tostring(decision.reset))
   end

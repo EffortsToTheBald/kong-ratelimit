@@ -106,6 +106,12 @@ function _M.build_key(conf)
     if rerr then
       return nil, rerr
     end
+    -- 多规则模式：返回 r1 的组键（日志主键）；组键全量由 check_multi 构造
+    local keys, gerr = _M.build_group_keys(conf)
+    if not keys then
+      return nil, gerr
+    end
+    return keys[1]
   end
 
   local parts = {}
@@ -176,6 +182,143 @@ function _M.rate_and_burst(conf)
   return rate, burst
 end
 
+--- 单条 rule 的令牌桶参数（D3：桶结构沿用 tokens/ts，refill 公式与单桶同构）
+function _M.rule_rate_and_burst(rule)
+  local rate = rule.limit / rule.window
+  local burst = rule.burst
+  if not burst or burst <= 0 then
+    burst = rule.limit
+  end
+  return rate, burst
+end
+
+-- D3：组指纹输入串——全部规则参数按序拼接。
+-- 任一规则的 limit/window/burst/limit_by/header_name 变化 ⇒ 组指纹变 ⇒ 整组换新桶
+--（代价：改一条规则 = 整组配额重置；header_name 仅在对应规则用到 header 维度时参与，
+--  与单规则指纹约定一致，避免无关字段变更引起重置）。
+local function group_fingerprint_input(conf)
+  local segs = {}
+  for i = 1, #conf.rules do
+    local rule = conf.rules[i]
+    local _, burst = _M.rule_rate_and_burst(rule)
+    local s = "limit=" .. tostring(rule.limit)
+      .. ";window=" .. tostring(rule.window)
+      .. ";burst=" .. tostring(burst)
+      .. ";limit_by=" .. table.concat(rule.limit_by, ",")
+    for j = 1, #rule.limit_by do
+      if rule.limit_by[j] == "header" then
+        s = s .. ";header_name=" .. tostring(rule.header_name or "")
+        break
+      end
+    end
+    segs[#segs + 1] = "r" .. i .. "{" .. s .. "}"
+  end
+  return table.concat(segs, ";")
+end
+
+--- D3：组键构造。
+-- 形如 kong:rl:{<ns>:g=<组指纹>:r<i>:<dim>=<val>:…}
+-- 组内全部桶同 hash tag ⇒ 同 Redis Cluster slot（多键 EVAL 的 Cluster 硬前提）。
+-- @return keys, rates, bursts, ttls_ms, rule_descs
+--         或 nil, err（某规则 limit_by 含 header 但缺 header_name）
+function _M.build_group_keys(conf)
+  local fp = string.format("%08x", fnv1a32(group_fingerprint_input(conf)))
+  local keys, rates, bursts, ttls, descs = {}, {}, {}, {}, {}
+  for i = 1, #conf.rules do
+    local rule = conf.rules[i]
+    local parts = {}
+    for j = 1, #rule.limit_by do
+      local dim = rule.limit_by[j]
+      if dim == "header" and (rule.header_name == nil or rule.header_name == "") then
+        return nil, "rules[" .. i .. "] limit_by contains 'header' but header_name is not set"
+      end
+      parts[j] = dim .. "=" .. dim_value(dim, rule)
+    end
+    local rate, burst = _M.rule_rate_and_burst(rule)
+    local tag = conf.namespace
+      .. ":g=" .. fp
+      .. ":r" .. i
+      .. ":" .. table.concat(parts, ":")
+    keys[i] = conf.redis.key_prefix .. ":{" .. tag .. "}"
+    rates[i] = rate
+    bursts[i] = burst
+    ttls[i] = math.max(1, math.floor(rule.window * 2)) * 1000
+    descs[i] = "rules[" .. i .. "]:" .. table.concat(rule.limit_by, "+")
+  end
+  return keys, rates, bursts, ttls, descs
+end
+
+--- D1：多规则 α 强一致决策（每请求一次多键原子 Lua，无本地库存）。
+-- 全或无语义在 Redis 服务端单脚本内完成（D4）；此处只组装 decision。
+-- 响应口径（D5）：
+--   放行：remaining = min(各桶剩余)（瓶颈规则）、reset = 瓶颈桶的下一令牌时刻
+--   429：retry_after = max(不足桶 wait)、封顶 = 不足桶 window 的最大值、
+--        reject_rules = 不足规则的人读标识、reject_primary = 决定 Retry-After 的规则下标
+-- @return decision table 或 nil, err
+function _M.check_multi(conf)
+  local now = ngx.now()
+  local keys, rates, bursts, ttls, descs = _M.build_group_keys(conf)
+  if not keys then
+    return nil, rates
+  end
+
+  local parsed, err = redis_mod.grant_multi(conf, keys, rates, bursts, ttls)
+  if not parsed then
+    kong.log.err("rate-limit-advanced: redis grant_multi failed: ", tostring(err))
+    return nil, err
+  end
+
+  if parsed.ok == 1 then
+    -- 瓶颈规则 = 扣减后剩余最少的桶；Reset = 瓶颈桶的下一令牌时刻（wait=0 即 now）
+    local min_tokens, min_i = math.huge, 1
+    for i = 1, #parsed.buckets do
+      local b = parsed.buckets[i]
+      if b.tokens < min_tokens then
+        min_tokens, min_i = b.tokens, i
+      end
+    end
+    kong.log.notice(
+      "[RL-DEBUG] multi_grant keys=", table.concat(keys, " | "),
+      " remaining=", min_tokens, " bottleneck=r", min_i
+    )
+    return {
+      allowed            = true,
+      remaining          = math.max(0, math.floor(min_tokens)),
+      reset              = math.floor(now + (parsed.buckets[min_i].wait or 0)),
+      bottleneck         = min_i,
+      multi_limit        = conf.rules[min_i].limit,
+    }
+  end
+
+  -- ok=0：全不扣。Retry-After 取 max(wait)（封顶 = 不足规则 window 最大值），
+  -- reject_primary = 该 max 所在规则（其 limit/window 决定 429 头口径）。
+  local max_wait, primary, cap = -1, 1, 1
+  local rule_descs = {}
+  for _, rj in ipairs(parsed.rejects) do
+    if rj.wait > max_wait then
+      max_wait, primary = rj.wait, rj.rule
+    end
+    local w = conf.rules[rj.rule].window
+    if w > cap then
+      cap = w
+    end
+    rule_descs[#rule_descs + 1] = descs[rj.rule]
+  end
+  kong.log.notice(
+    "[RL-DEBUG] multi_reject keys=", table.concat(keys, " | "),
+    " reject=", table.concat(rule_descs, ","), " wait=", max_wait
+  )
+  return {
+    allowed       = false,
+    remaining     = 0,
+    retry_after   = max_wait,
+    reject_rules  = table.concat(rule_descs, ","),
+    reject_primary = primary,
+    reject_cap    = cap,
+    multi_limit   = conf.rules[primary].limit,
+  }
+end
+
 --- 核心决策。
 -- remaining 口径（快/慢路径一致）：均为"本节点视角"的剩余——
 -- fast path 是本地库存余量；slow path 的 granted-1 恰好等于 fill 后的本地库存。
@@ -183,6 +326,11 @@ end
 -- Retry-After 推导（同口径），此处不回 reset。
 -- @return table {allowed, remaining, reset, retry_after} 或 nil, err
 function _M.check(conf, key)
+  -- D1：多规则模式走 α 强一致分支（无本地库存，每请求一次多键原子 Lua）
+  if conf.rules and #conf.rules > 0 then
+    return _M.check_multi(conf)
+  end
+
   local now      = ngx.now()
   local ttl_s    = math.max(1, math.floor(conf.window * 2))
   local ttl_ms   = ttl_s * 1000
