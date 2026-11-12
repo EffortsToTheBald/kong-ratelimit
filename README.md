@@ -142,6 +142,41 @@ done | sort | uniq -c
 
 429 是**确定性限流拒绝**，每次都会打一条 notice 日志（含限流 key/limit/batch），可与 Redis 故障日志（error/warn）区分。
 
+### 多规则联合判定（`rules` 模式）
+
+一条规则 = 一个桶（`limit_by` 复合键）；多条规则 = **一个请求同时受全部规则约束，全部桶有令牌才放行**。
+这是"consumer 全局 100/时 + consumer×path 10/时"这类联合配额的表达方式：
+
+```json
+{
+  "namespace": "api",
+  "batch": 0,
+  "rules": [
+    { "limit": 100, "window": 3600 },
+    { "limit": 10,  "window": 3600, "limit_by": ["consumer", "path"] }
+  ]
+}
+```
+
+约束（违反即下发 400）：`rules` 与 `limit_by` 互斥；`batch` 只能 0/1（强一致模式无本地租约）；规则数 ≤ 8。
+每条规则可独立配 limit/window/burst/limit_by/header_name。
+
+**α 强一致语义**：多规则模式没有本地库存、没有快路径——每请求一次 Redis 多键原子 Lua
+（组内所有桶同 hash tag ⇒ 同 slot）：全部桶够 1 ⇒ 各扣 1 放行；任一桶不足 ⇒ **全部桶都不扣**，
+返回不足规则列表。检查与扣减在 Redis 单线程脚本内完成，无中间态。
+
+多规则下的响应口径（**瓶颈规则视角**）：
+
+| 项 | 含义 |
+|---|---|
+| `X-RateLimit-Remaining` | 各桶剩余的**最小值**（瓶颈规则） |
+| `X-RateLimit-Reset` | 瓶颈规则的下一令牌可用时刻 |
+| `X-RateLimit-Limit` | 瓶颈规则的 limit |
+| 429 体 `rule` 字段 | 拒绝来源，如 `"rules[2]:consumer+path"`；`Retry-After` = 不足规则等待的最大值（封顶 = 相应 window 最大值） |
+
+代价要知情：改任何一条规则参数 ⇒ 组指纹变化 ⇒ **整组配额重置**（旧桶 TTL 淘汰）；
+每请求 1 RTT（无 batch 摊销）。验证脚本：`./bench/rules.sh`（5 场景 14 断言）。
+
 ## 6. 跑性能矩阵
 
 ```bash
@@ -159,6 +194,7 @@ done | sort | uniq -c
 - [ ] 三节点：`limit=100/window=3600`，总通过数 **恰好 100**（`batch=1`）
 - [ ] 三节点：同上但 `batch=20`，总通过数落在 **[40, 100]**（少发，不超发）
 - [ ] 多维：`limit_by: [ip, path]`，不同 path 独立计数
+- [ ] 多规则：`./bench/rules.sh` 全绿——核心断言"R1 空 + R2 有 ⇒ 429 且两桶 tokens 均不变"（全或无原子）
 - [ ] 动态配置：`POST /config` 改 limit，10s 内生效且不重启
 - [ ] Redis 挂掉：`docker compose stop redis` → 默认返回 503（fail-closed）；显式 `fault_tolerant: true` 时放行并带 `X-RateLimit-Status: degraded`
 - [ ] 性能：`batch=20` 的 p99 与无插件基线差 < 1ms

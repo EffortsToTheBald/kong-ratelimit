@@ -32,9 +32,9 @@
 
 ## 6. 回归、文档与报告
 
-- [ ] 6.1 单规则回归：dims.sh 全绿 + quota.sh batch=1 基线（100/350/0）+ 故障双路径抽查；验证：与既有锚点一致
-- [ ] 6.2 文档同步：README（rules 配置示例与响应头）、docs/design.md（§2/§4 多规则原子性与组键）、docs/architecture.md（决策流程图多规则分支）、rule.md（键结构 §3 与 α 决策记录）；验证：grep 无遗漏/冲突表述
-- [ ] 6.3 汇总 `reports/phase-3-multi-rule.md`（§13 格式，无 NOT RUN 或如实标注）；验证：覆盖 spec 全部 scenario 与设计决策实测；人工验收通过后提交组 6 commit
+- [x] 6.1 单规则回归：dims.sh 全绿 + quota.sh batch=1 基线（100/350/0）+ 故障双路径抽查；验证：与既有锚点一致
+- [x] 6.2 文档同步：README（rules 配置示例与响应头）、docs/design.md（§2/§4 多规则原子性与组键）、docs/architecture.md（决策流程图多规则分支）、rule.md（键结构 §3 与 α 决策记录）；验证：grep 无遗漏/冲突表述
+- [x] 6.3 汇总 `reports/phase-3-multi-rule.md`（§13 格式，无 NOT RUN 或如实标注）；验证：覆盖 spec 全部 scenario 与设计决策实测；人工验收通过后提交组 6 commit
 
 ## Workflow follow-up
 

@@ -86,6 +86,30 @@ sequenceDiagram
 **关键不变量**：`本地库存 + 全局桶剩余 = 初始供给`。令牌只从全局桶流向本地库存，不可逆，
 所以任何时刻的累计发放量都不会超过全局供给。
 
+**多规则模式（α 强一致，Phase 3）没有这条链路**：`rules` 非空时不使用本地库存、无快路径，
+每请求一次 Redis 多键原子 Lua（`grant_multi`）：
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant K as Kong(access)
+    participant R as Redis
+
+    C->>K: GET /echo
+    K->>K: 组键构造（组指纹 g= + r1..rN 各规则桶）
+    K->>R: EVAL grant_multi（多键，组内同 slot）
+    alt 全部桶 refill 后 >= 1
+        R-->>K: ok=1, 各桶 tokens/wait（各扣 1）
+        K-->>C: 放行（Remaining=min 瓶颈、Reset=瓶颈下一令牌时刻）
+    else 任一桶不足
+        R-->>K: ok=0, 不足规则+wait（全部桶不扣）
+        K-->>C: 429（体含 rule 字段、Retry-After=max(wait) 封顶 max window）
+    end
+```
+
+"全或无"的检查与扣减在同一脚本内完成（Redis 单线程 ⇒ 无中间态可见），
+因此**不存在单规则 batch>1 模式下的任何少发误差**——代价是每请求 1 RTT 且无本地库存。
+
 ---
 
 ## 3. 算法选型
@@ -206,6 +230,41 @@ burst_max = B + N · k
 Redis 故障时默认 503 还是 degraded 放行，由 `fault_tolerant` 显式选择），
 用 Raft 换来的强一致在这里是过度设计。**知道什么时候不用重方案，比会用重方案更重要。**
 
+### 4.8 多规则联合判定（α 强一致模式）
+
+**需求**：一个请求同时受多条独立配额约束（如 consumer 全局 100/时 + consumer×path 10/时），
+**全部桶有令牌才放行；任一桶不足则所有桶都不扣**（all-or-nothing）。
+
+**为什么必须收敛到 Redis 服务端单脚本**（本设计最重要的取舍）：
+
+- 本地 shared dict 没有多键原子原语（只有单键 `incr`），"先检查 A、B 再扣"存在
+  TOCTOU 竞态：检查通过 ≠ 扣得到，两个并发请求可能都基于同一份过期快照放行。
+  扣-验-滚（失败回滚）只能得到最终一致 + 崩溃窗口泄漏（少发方向），不是强一致。
+- Redis 单线程 + 单 Lua 脚本 ⇒ 脚本内的"全检-全扣/全不扣"不可分割，
+  检查与扣减之间没有其他请求能插入——这是唯一能提供该原子性的层。
+
+**组键（组内同 slot）**：
+
+```
+kong:rl:{<ns>:g=<组指纹>:r<i>:<dim>=<val>:…}
+```
+
+- 组指纹 = FNV-1a(全部规则的 limit/window/burst/limit_by/header_name 按序拼接)。
+  任一规则参数变更 ⇒ 整组映射到新键（改一条规则 = 整组配额重置，旧桶 TTL 淘汰）。
+- 组内全部桶共享同一 hash tag ⇒ 同 Redis Cluster slot ⇒ 多键 EVAL 可行
+  （当初为单规则 hash tag 做的前向设计在这里兑现；多规则在 Cluster 部署的硬前提）。
+- 桶结构与单规则桶同构（`tokens`/`ts`），refill 公式复用（TIME 单调、burst 封顶）。
+
+**授予语义**：每桶各扣 1（batch 失义，schema 强制 batch∈{0,1}）；租约级"取 min"等
+增强（β：本地多池租约 + 扣-验-滚）明确留作后续 change，v1 是纯强一致。
+
+**响应口径**：放行 `Remaining = min(各桶剩余)`（瓶颈规则）、`Reset = 瓶颈桶下一令牌时刻`；
+429 体 `rule` 字段标注不足规则（人读标识 `rules[2]:consumer+path`）、
+`Retry-After = max(不足桶 wait)` 封顶 `max(不足桶 window)`。
+
+**代价声明**：多规则模式每请求 1 RTT（无快路径、无 batch 摊销）；改任一规则 = 整组配额重置。
+验证：`bench/rules.sh`（核心断言"R1 空 + R2 有 ⇒ 429 且两桶 tokens 均不变"）。
+
 ---
 
 ## 5. 请求路径与性能预算
@@ -244,6 +303,13 @@ plugins:
       header_name: X-Api-Key   # limit_by 含 header 时必填
       namespace: rl
       fault_tolerant: false    # 默认；true = 显式选择 Redis 故障时 degraded 放行
+      # 多规则联合判定（α 强一致模式，Phase 3）：与 limit_by 互斥、batch 只能 0/1、最多 8 条
+      # rules:                            # 全部桶全或无原子判定（见 §4.8）
+      #   - limit: 100
+      #     window: 3600
+      #   - limit: 10
+      #     window: 3600
+      #     limit_by: [consumer, path]
       redis:
         host: redis
         port: 6379

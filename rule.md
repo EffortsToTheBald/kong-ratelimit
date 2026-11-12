@@ -280,6 +280,25 @@ kong:rl:
 - 指纹**不含 batch**：batch 是运输参数，不构成桶身份；调 batch 不清空配额。
 - 代价：改 limit/window/burst/limit_by 瞬间配额"重新满血"；需要"改 limit 但继承余量"时用 `namespace` 显式控制（namespace 不变则桶不变）。
 
+**多规则组键（Phase 3 · α 决策）**：
+
+多规则模式（`rules` 数组）使用**组键**，全部规则桶共享同一 hash tag：
+
+```text
+kong:rl:{rl:g=3acf5710:r1:consumer=anon}
+kong:rl:{rl:g=3acf5710:r2:consumer=anon:path=/echo}
+```
+
+- `g=<8位组指纹>`：组指纹 = FNV-1a(全部规则按序拼接 limit/window/burst/limit_by/header_name)。
+  **任一规则参数变更 ⇒ 整组换新键**（改一条规则 = 整组配额重置，代价必须写进文档）。
+- `r<i>`：规则在 rules 数组中的序号段（1-based）。
+- 组内同 hash tag ⇒ 同 Redis Cluster slot ⇒ 多键 EVAL 可用（Cluster 部署硬前提，
+  也是当初单规则 hash tag 设计的前向兑现）。
+- α 强一致语义：`rules` 非空时**无本地库存、无 batch 租约**，每请求一次多键原子 Lua
+  ——全部桶够 1 ⇒ 各扣 1；任一桶不足 ⇒ 全部不扣并返回不足规则（强一致，
+  检查与扣减在 Redis 单线程脚本内不可分割，无本地回滚窗口）。
+- 配置约束（违反下发即 400）：`rules` 与 `limit_by` 互斥；`batch` ∈ {0,1}；规则数 ≤ 8。
+
 ## 3.2 为什么使用 Hash Tag
 
 Redis Cluster 根据 Key 计算 CRC16，然后映射到 16384 个 Hash Slot。
@@ -312,6 +331,7 @@ kong:rl:{rl:p=25c15179:ip=10.0.0.7:path=/echo}:stats
 4. 多维度必须共同参与 Key 的计算。
 5. 维度顺序必须稳定，避免相同逻辑规则生成不同 Key。
 6. 不要将不同维度拆成多个独立 Key，除非后续明确实现多规则联合判定。
+   （Phase 3 已实现：多规则采用组键——组内全部规则桶共享同一 hash tag，见 §3.1 末尾。）
 
 ## 3.3 支持的维度
 

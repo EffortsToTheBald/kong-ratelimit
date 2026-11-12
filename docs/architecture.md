@@ -84,16 +84,22 @@ flowchart TB
 ```mermaid
 flowchart TD
     REQ(["请求进入限流"]) --> KEY["构造限流键<br/>维度取值 + 策略指纹"]
-    KEY --> MODE{"batch 模式"}
-    MODE -->|"batch=1 严格模式<br/>每请求原子授予"| GRANT["向权威桶申请"]
-    MODE -->|"batch=N 租赁模式"| TAKE{"本地库存<br/>扣减 1"}
+    KEY --> MODE{"配置形态"}
+    MODE -->|"rules 多规则<br/>α 强一致模式"| MKEY["组键构造<br/>组指纹 g= + r1..rN 各规则桶"]
+    MKEY --> MEVAL["多键原子申请<br/>全检-全扣/全不扣<br/>（组内同 slot 单脚本）"]
+    MEVAL -->|"全部桶 ≥1"| MUSE["各桶扣 1<br/>瓶颈口径响应头"]
+    MUSE --> PASS
+    MEVAL -->|"任一桶不足"| MREJ(["429 · 体含 rule 字段<br/>Retry-After=max(wait) 封顶"])
+    MEVAL -->|"不可用 / 畸形"| FT{"故障策略"}
+    MODE -->|"单规则 batch=1<br/>每请求原子授予"| GRANT["向权威桶申请"]
+    MODE -->|"单规则 batch=N<br/>租赁模式"| TAKE{"本地库存<br/>扣减 1"}
     TAKE -->|"命中"| PASS(["放行 200<br/>附额度响应头"])
     TAKE -->|"未命中"| GRANT["向权威桶申请<br/>一次租 batch 个"]
     GRANT --> RES{"授予结果"}
     RES -->|"> 0"| USE["本次消耗 1<br/>余量入本地池"]
     USE --> PASS
     RES -->|"= 0"| REJ(["429 · Retry-After"])
-    RES -->|"不可用 / 畸形"| FT{"故障策略"}
+    RES -->|"不可用 / 畸形"| FT
     FT -->|"默认 fail-closed"| S503(["503 · 拒绝"])
     FT -->|"显式容错"| DEG(["放行 · 标记 degraded"])
 
@@ -104,10 +110,10 @@ flowchart TD
     classDef reject fill:#ffe0b2,stroke:#ef6c00,color:#e65100;
     classDef fail fill:#ffcdd2,stroke:#c62828,color:#b71c1c;
     class REQ start;
-    class KEY,GRANT,USE proc;
+    class KEY,GRANT,USE,MKEY,MEVAL,MUSE proc;
     class MODE,TAKE,RES,FT dec;
     class PASS,DEG allow;
-    class REJ reject;
+    class REJ,MREJ reject;
     class S503 fail;
 ```
 
@@ -117,7 +123,7 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    subgraph SOLVED["✅ 已解决（Phase 1 验证闭环）"]
+    subgraph SOLVED["✅ 已解决（Phase 1–3 验证闭环）"]
         direction TB
         s1["多副本共享配额<br/>450 请求恰好放行 100"]
         s2["并发原子性<br/>Lua 原子授予 + 本地原子扣减<br/>全链路守恒核算通过"]
@@ -127,14 +133,15 @@ flowchart LR
         s6["故障路径崩溃<br/>500 → 503/降级 · 无异常栈"]
         s7["测试不可控不可信<br/>每节点断言 · 每轮隔离"]
         s8["伪造转发头绕过疑虑<br/>信任语义钉死 + 回归测试"]
+        s9["多维限流（Phase 2）<br/>7 维实测 · dims.sh 8 断言全绿<br/>Reset=下一令牌时刻 · Retry-After 封顶<br/>坏配置下发即 400 · 防御校验 · 降级告警"]
+        s10["多规则全或无原子（Phase 3）<br/>组键同 slot · 多键单脚本<br/>一空一有 ⇒ 429 且双桶不变<br/>瓶颈口径响应头 · rules.sh 14 断言全绿"]
     end
 
     subgraph OPEN["⏳ 未解决"]
         direction TB
-        o1["🟡 进行中（Phase 2 已规划）<br/>多维限流验证 · Reset 语义<br/>Retry-After 上限 · 429 可观测<br/>配置前置校验 · 防御校验 · 降级告警"]
-        o2["🔵 远期（Phase 4）<br/>EVALSHA · batch×RPS 性能矩阵<br/>库存回收 / 租赁生命周期"]
-        o3["🔵 远期（Phase 5）<br/>Prometheus 指标 · 结构化日志"]
-        o4["⚪ 明确不做（有意取舍）<br/>多规则联合判定 · 路径归一化"]
+        o2["🔵 远期（Phase 4）<br/>EVALSHA · batch×RPS 性能矩阵<br/>库存回收 / 租赁生命周期 L2"]
+        o3["🔵 远期（Phase 5）<br/>Prometheus 指标 · 结构化日志<br/>租约对账自愈 L3"]
+        o4["⚪ 明确不做（有意取舍）<br/>路径归一化 · 跨插件实例联合判定"]
     end
 
     subgraph PROD["⚠️ 生产边界须知（长期存在 / 有意取舍）"]
@@ -144,14 +151,14 @@ flowchart LR
         p3["运维清库不同步<br/>只清 Redis 不重启副本<br/>旧租约仍然有效"]
         p4["path 维度高基数<br/>未归一化，URL 空间无上界"]
         p5["额度头是本节点视角<br/>batch=1 时 Remaining 恒为 0<br/>勿当作全局剩余"]
-        p6["单请求单桶<br/>不支持多规则联合判定"]
+        p6["多规则 = 单实例 α 强一致<br/>每请求 1 RTT · 改一条规则整组重置<br/>β 本地租约增强留后续"]
         p7["调试日志为临时态<br/>高拒绝率下日志量放大"]
     end
 
     classDef solved fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20;
     classDef open fill:#fff8e1,stroke:#f9a825,color:#6d4c41;
     classDef prod fill:#ffebee,stroke:#c62828,color:#b71c1c;
-    class s1,s2,s3,s4,s5,s6,s7,s8 solved;
+    class s1,s2,s3,s4,s5,s6,s7,s8,s9,s10 solved;
     class o1,o2,o3,o4 open;
     class p1,p2,p3,p4,p5,p6,p7 prod;
 ```
@@ -170,22 +177,23 @@ flowchart LR
 | 故障路径崩溃（500） | nil 判定前移 | 故障日志干净，traceback 计数 0 |
 | 测试不可控不可信 | 每节点请求数断言 + 每轮 namespace 隔离 + 双源脚本同步 | 断言 150×3 通过；VUS=2 破坏用例 exit 1；跨轮 namespace 段不同 |
 | 伪造 X-Forwarded-For 疑虑 | 信任语义文档化 + 语义钉死回归 | 20 个伪造 XFF → 1×200 + 19×429 同桶 |
+| 多维限流取值与键形（Phase 2） | 7 维实测进 dims.sh 回归 | route/service key 含 UUID；consumer 三身份独立；8 断言全绿 |
+| 伪窗口 Reset / 无界 Retry-After（Phase 2） | Reset=下一令牌 Unix 秒且与 Retry-After 同口径；Retry-After≤window | 429 时 Reset−now=36=Retry-After；极端配置封顶恰 3600 |
+| 坏配置运行时 500（Phase 2） | entity_checks 下发即 400 | header_name 缺失 → 400 带字段定位；合法配置 201 对照 |
+| Redis 畸形返回（Phase 2） | 纯函数防御校验 → 故障分支 | 10 类畸形全拒 + 2 合法样例 |
+| 多规则全或无原子（Phase 3） | α 强一致：组内同 slot 多键单脚本"全检-全扣/全不扣" | 一空一有 ⇒ 429 且双桶 tokens 均不变；全够 ⇒ 各扣 1 |
+| 组指纹换桶（Phase 3） | 组指纹=全部规则参数 FNV-1a | 仅改 r2.limit ⇒ g=3acf5710→4df638e4，旧桶不再命中 |
+| 多规则响应语义（Phase 3） | 瓶颈口径头 + 429 体 rule 字段 + 封顶 | Remaining=0/Reset≈+6（瓶颈 r2）；429 rule=rules[1]；封顶=3600 |
 
 ## 表 2 · 未解决的问题
 
 | 问题 | 现状 | 计划 |
 |---|---|---|
-| 多维限流未验证（仅 ip 维） | 7 维取值已编码，未实测 | Phase 2：`bench/dims.sh` 7 场景 + consumer 需认证场景 |
-| Reset 头是伪窗口语义 | `now + window`，对令牌桶无意义 | Phase 2：改为"下一令牌可用 Unix 秒" |
-| Retry-After 无上界 | 小 rate 可达数千秒 | Phase 2：≤ window 封顶 |
-| 429 无日志（与故障不可区分） | 429 路径静默 | Phase 2：notice 级判定日志（key/limit/batch） |
-| 坏配置运行时才报 500 | header_name 缺失下发成功、运行时 500 | Phase 2：entity_checks 下发即 400（已在 Kong 3.6 内核可行） |
-| Redis 畸形返回无防御 | tonumber 兜底，可能异常 | Phase 2：结构校验 → 故障分支 |
-| shared dict 降级静默 | 无任何告警（backend() 未被调用） | Phase 2：init_worker 告警 |
 | 每次全量上传脚本文本 | EVAL 而非 EVALSHA | Phase 4 |
-| 性能矩阵 / 长稳 / 非均匀流量 | 仅正确性基线 | Phase 4（产出 bench/results.md） |
+| 性能矩阵 / 长稳 / 非均匀流量 | 仅正确性基线（多规则模式尚未进矩阵） | Phase 4（产出 bench/results.md） |
 | 指标与结构化日志 | 无 Prometheus；RL-DEBUG 调试态 | Phase 5 |
-| 库存回收 / 租赁生命周期 | FLUSHDB 残留、节点退出损失 | Phase 4（防重复归还设计） |
+| 库存回收 / 租赁生命周期 | FLUSHDB 残留、节点退出损失（仅单规则 batch>1 受影响；多规则模式无本地租约不受影响） | Phase 4 L2 优雅归还 / Phase 5 L3 对账 |
+| 多规则本地租约（β 增强） | 多规则恒强一致，每请求 1 RTT | 后续独立 change |
 
 ## 表 3 · 生产边界须知（部署/运维前必读）
 
@@ -196,7 +204,7 @@ flowchart LR
 | 清库不同步 | 只清 Redis 不重启副本 → 旧租约继续放行（同策略下合法但绕过"重置配额"意图） | 运维"重置配额"必须重启副本或换 namespace |
 | path 维度基数 | `limit_by=[path]` 的 key 随 URL 空间无界增长 | 生产建议先归一化或避免 path 维度（当前明确不支持归一化） |
 | 额度头口径 | Remaining/Reset 均为本节点视角；batch=1 时 Remaining 恒 0 | 客户端勿将其当全局精确值；429 的 Retry-After 才是权威等待建议 |
-| 单请求单桶 | 不能表达"Consumer 全局 + Consumer×Path 同时满足才放行" | 需要多桶语义须新设计（Redis Cluster 跨 slot 限制） |
+| 多规则强一致代价 | 每请求 1 RTT 无快路径；改任一条规则 = 整组配额重置 | 低 rate 关键接口适用；容量规划时知晓 RTT 成本；改规则前评估重置影响 |
 | 配置下发非原子 | DB-less 逐节点 POST，秒级不一致窗口 | 变更窗口内行为短暂不一致；先全部下发再恢复流量 |
 | 错误配置的爆炸半径 | 指纹使策略变更=新桶满血 | 改配置前评估"配额重置"业务影响；需继承余量用 namespace |
 
