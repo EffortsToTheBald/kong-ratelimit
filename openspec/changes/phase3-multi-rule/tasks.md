@@ -10,8 +10,8 @@
 
 ## 2. 配置模型（D2，schema.lua）
 
-- [ ] 2.1 新增 `rules` 数组字段（元素：limit/window/burst/limit_by/header_name；len_max=8）+ 三条 entity_checks（互斥/batch∈{0,1}/上限）；运行时兜底校验同步；验证：四例实测——rules+limit_by 同现 400、rules+batch=20 400、9 条规则 400、合法 2 规则 201
-- [ ] 2.2 旧配置回归验证：仅 limit_by 的既有配置下发不受影响（201）；验证：Phase 1/2 的 dims 场景用例配置下发成功
+- [x] 2.1 新增 `rules` 数组字段（元素：limit/window/burst/limit_by/header_name；len_max=8）+ 三条 entity_checks（互斥/batch∈{0,1}/上限）；运行时兜底校验同步；验证：四例实测——rules+limit_by 同现 400、rules+batch=20 400、9 条规则 400、合法 2 规则 201
+- [x] 2.2 旧配置回归验证：仅 limit_by 的既有配置下发不受影响（201）；验证：Phase 1/2 的 dims 场景用例配置下发成功
 
 ## 3. 多键原子脚本（D3/D4，redis.lua + 独立脚本）
 

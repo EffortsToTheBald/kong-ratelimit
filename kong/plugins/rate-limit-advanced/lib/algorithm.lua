@@ -99,6 +99,15 @@ end
 -- 花括号是 Redis Cluster 的 hash tag，保证同一逻辑 key 落在同一 slot；
 -- p= 策略指纹（P0-1）：限流参数一变即得新 key/新桶，旧桶与旧本地库存随 TTL 自然淘汰。
 function _M.build_key(conf)
+  -- D2/4.3：rules 模式运行时兜底校验（与 schema entity_check 双保险——
+  -- 防绕过 Admin API 校验的配置注入：校验失败 → nil → handler 500 misconfigured）
+  if conf.rules and #conf.rules > 0 then
+    local rerr = _M.validate_rules(conf)
+    if rerr then
+      return nil, rerr
+    end
+  end
+
   local parts = {}
 
   for i = 1, #conf.limit_by do
@@ -115,6 +124,28 @@ function _M.build_key(conf)
     .. ":p=" .. _M.policy_fingerprint(conf)
     .. ":" .. table.concat(parts, ":")
   return conf.redis.key_prefix .. ":{" .. tag .. "}"
+end
+
+--- rules 模式运行时兜底校验（D2/4.3，纯函数，可 resty 单测）。
+-- schema 已前置拒绝（400），这里是绕过 schema 注入 conf 时的第二道闸。
+-- @return nil（合法）或 err string
+function _M.validate_rules(conf)
+  if #conf.rules > 8 then
+    return "rules exceeds max of 8 rules"
+  end
+  if (conf.batch or 0) > 1 then
+    return "batch must be 0 or 1 when rules is set (alpha strict mode has no local lease)"
+  end
+  for i = 1, #conf.rules do
+    local rule = conf.rules[i]
+    local dims = rule.limit_by or {}
+    for j = 1, #dims do
+      if dims[j] == "header" and (rule.header_name == nil or rule.header_name == "") then
+        return "rules[" .. i .. "] limit_by contains 'header' but header_name is not set"
+      end
+    end
+  end
+  return nil
 end
 
 --- batch 的实际取值。0 = auto。

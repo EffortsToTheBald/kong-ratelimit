@@ -28,15 +28,42 @@ end
 -- D2 互斥：rules 非空 ⇒ limit_by 不得显式设置（≠ ["ip"] 即拒）。
 -- 注意：init 期（声明式配置加载）entity 字段可能是 userdata 代理，非校验期纯 table——
 -- 只对真正的 table 做判定，其余形态放行（真正校验发生在 Admin API / kong validate）。
-local function check_rules_exclusivity(entity)
-  local rules = entity.config and entity.config.rules
+-- 同一 fn 内顺带完成 rules 的其余前置约束（batch∈{0,1}、每规则 header_name），
+-- 这些约束都依赖"rules 是纯 table"这一前提，合并成一次遍历。
+local function check_rules_config(entity)
+  local cfg = entity.config
+  local rules = cfg and cfg.rules
   if type(rules) ~= "table" or #rules == 0 then
     return true
   end
-  local limit_by = entity.config.limit_by
+
+  -- 互斥：rules 非空 ⇒ limit_by 未设置（≠ 默认值即拒，D2 近似语义）
+  local limit_by = cfg.limit_by
   if not same_array(limit_by or {}, DEFAULT_LIMIT_BY) then
     return nil, "config.limit_by 与 config.rules 互斥：rules 模式下不得设置 limit_by（省略即可）"
   end
+
+  -- α：rules 非空 ⇒ batch 必须 ∈ {0,1}（无租约语义，batch>1 fail fast）
+  local batch = cfg.batch or 0
+  if batch > 1 then
+    return nil, "config.batch: rules 模式下 batch 必须为 0 或 1（强一致模式无本地租约）"
+  end
+
+  -- 每条规则：limit_by 含 "header" ⇒ header_name 必填（与顶层 conditional 同语义）
+  for i = 1, #rules do
+    local rule = rules[i]
+    local dims = rule and rule.limit_by
+    if type(dims) == "table" then
+      for j = 1, #dims do
+        if dims[j] == "header"
+           and (rule.header_name == nil or rule.header_name == "") then
+          return nil, "config.rules[" .. i .. "].header_name: required field missing"
+              .. "（limit_by 含 header 的规则必须声明 header_name）"
+        end
+      end
+    end
+  end
+
   return true
 end
 
@@ -52,8 +79,8 @@ return {
         then_match = { required = true },
     } },
     { custom_entity_check = {
-        field_sources = { "config.rules", "config.limit_by" },
-        fn = check_rules_exclusivity,
+        field_sources = { "config.rules", "config.limit_by", "config.batch" },
+        fn = check_rules_config,
     } },
   },
   fields = {
