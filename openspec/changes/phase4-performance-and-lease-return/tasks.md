@@ -10,16 +10,16 @@
 
 ## Phase 1：EVAL 基线（`test: add phase4 eval performance baseline`）
 
-- [ ] 1.1 环境自检 + 基线 commit（树干净则 `--allow-empty` 锚点）；验证：`docker compose ps` 全部 running
-- [ ] 1.2 首日事实核查（阻塞项前置）：LuaJIT FFI `clock_gettime(CLOCK_MONOTONIC)` 可用性（ABI/返回值/错误处理/容器兼容）；`CLIENT PAUSE` 可用性；Worker 级模块 table 隔离实证；验证：resty 输出留档；**单调时钟核查不通过 ⇒ 停止 Phase 5 生命周期实现并报告**（不阻塞 Phase 1/2）
-- [ ] 1.3 `matrix.sh` 扩展第一组维度：batch 1/10/50/100、速率低/中/高、Worker 1/多、单/多规则、Redis CPU（INFO cpu 差值）、Kong CPU、commandstats 分类列；验证：单组 dry-run 通过
-- [ ] 1.4 执行 EVAL 基线 → `bench/results.md` 基线段（含原始数据保存）；验证：数据真实、同参数可在 Phase 2/7 复跑
+- [x] 1.1 环境自检 + 基线 commit（树干净则 `--allow-empty` 锚点）；验证：`docker compose ps` 全部 running
+- [x] 1.2 首日事实核查（阻塞项前置）：LuaJIT FFI `clock_gettime(CLOCK_MONOTONIC)` 可用性（ABI/返回值/错误处理/容器兼容）；`CLIENT PAUSE` 可用性；Worker 级模块 table 隔离实证；验证：resty 输出留档；**单调时钟核查不通过 ⇒ 停止 Phase 5 生命周期实现并报告**（不阻塞 Phase 1/2）
+- [x] 1.3 `matrix.sh` 扩展第一组维度：batch 1/10/50/100、速率低/中/高、Worker 1/多、单/多规则、Redis CPU（INFO cpu 差值）、Kong CPU、commandstats 分类列；验证：单组 dry-run 通过
+- [x] 1.4 执行 EVAL 基线 → `bench/results.md` 基线段（含原始数据保存）；验证：数据真实、同参数可在 Phase 2/7 复跑
 - [ ] 1.5 commit `test: add phase4 eval performance baseline`；验证：git log 出现该提交
 
 ## Phase 2：EVALSHA（`feat: add evalsha script management`）
 
-- [ ] 2.1 统一脚本注册（四脚本：TOKEN_BUCKET/GRANT_MULTI/GRANT_LEASE/RETURN_LEASE；src+SHA，名称唯一稳定、文本不重复维护）+ init_worker timer 延迟加载（失败 warn 一次）+ evalsha 包装（明确 NOSCRIPT ⇒ LOAD ⇒ 重试恰一次；超时不触发 LOAD；连续失败明确错误进故障分支）+ 错误类别透传；验证：resty 单测（四脚本各自 NOSCRIPT 注入重试计数=1、超时不触发 LOAD、LOAD 畸形、懒加载、初始化不受阻）
-- [ ] 2.2 E2E：SCRIPT FLUSH 后分别经 batch=1 路径与多规则路径验证自愈且不重复扣减（HGET 前后对照）；init 期停 Redis ⇒ 正常初始化、首请求按 conf 走 503/降级；commandstats eval=0/evalsha=N；验证：spec（EVALSHA）四场景
+- [x] 2.1 统一脚本注册（四脚本：TOKEN_BUCKET/GRANT_MULTI/GRANT_LEASE/RETURN_LEASE；src+SHA，名称唯一稳定、文本不重复维护）+ init_worker timer 延迟加载（失败 warn 一次）+ evalsha 包装（明确 NOSCRIPT ⇒ LOAD ⇒ 重试恰一次；超时不触发 LOAD；连续失败明确错误进故障分支）+ 错误类别透传；验证：resty 单测（四脚本各自 NOSCRIPT 注入重试计数=1、超时不触发 LOAD、LOAD 畸形、懒加载、初始化不受阻）
+- [x] 2.2 E2E：SCRIPT FLUSH 后分别经 batch=1 路径与多规则路径验证自愈且不重复扣减（HGET 前后对照）；init 期停 Redis ⇒ 正常初始化、首请求按 conf 走 503/降级；commandstats eval=0/evalsha=N；验证：spec（EVALSHA）四场景
 - [ ] 2.3 回归：quota.sh batch=1（100/350/0）+ dims.sh + rules.sh 全绿；验证：spec（EVALSHA·行为零回归）
 - [ ] 2.4 第二组性能测试（与第一组同参数，仅脚本调用方式不同）→ results.md EVALSHA 对比段；验证：不得混入其他逻辑变化
 - [ ] 2.5 commit `feat: add evalsha script management`；验证：git log

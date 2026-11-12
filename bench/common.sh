@@ -42,6 +42,8 @@ kong_config_json() {
     local limit="$1" window="$2" batch="$3" with_plugin="${4:-true}"
     local ns="${5:-rl}"
     local limit_by="${6:-[\"ip\"]}"
+    local rhost="${7:-redis}"   # Redis host（域名或 IP；默认 redis=容器 DNS）
+    local ehost="${8:-echo}"    # 上游 echo host（域名或 IP；默认 echo=容器 DNS）
     local plugins=""
 
     if [ "$with_plugin" = "true" ]; then
@@ -49,7 +51,7 @@ kong_config_json() {
 [{"name":"rate-limit-advanced","config":{
   "limit":${limit},"window":${window},"batch":${batch},
   "limit_by":${limit_by},"namespace":"${ns}","fault_tolerant":false,
-  "redis":{"host":"redis","port":6379,"database":0,"timeout":1000}}}]
+  "redis":{"host":"${rhost}","port":6379,"database":0,"timeout":1000}}}]
 EOF
 )
     else
@@ -57,7 +59,7 @@ EOF
     fi
 
     cat <<EOF
-{"_format_version":"3.0","services":[{"name":"echo","url":"http://echo:5678",
+{"_format_version":"3.0","services":[{"name":"echo","url":"http://${ehost}:5678",
  "routes":[{"name":"echo-route","paths":["/echo"],"strip_path":false,
  "plugins":${plugins}}]}]}
 EOF
@@ -121,8 +123,18 @@ run_k6() {
     local kv
     for kv in "$@"; do envargs+=(-e "$kv"); done
 
-    ( cd "$PROJECT_ROOT" && k6 run --quiet "${envargs[@]}" -e "OUT=$out" "$script" >&2 ) \
-        || die "k6 执行失败"
+    # k6 偶发在 summary 写盘后挂起不退出（Phase 1 排查记录）——timeout 兜底：
+    # 数据已写盘则取回继续，不视为失败（exit 124）
+    set +e
+    ( cd "$PROJECT_ROOT" && timeout 300 k6 run --quiet "${envargs[@]}" -e "OUT=$out" "$script" >&2 )
+    local k6rc=$?
+    set -e
+    if [ "$k6rc" -ne 0 ] && [ "$k6rc" -ne 124 ]; then
+        die "k6 执行失败（rc=$k6rc）"
+    fi
+    if [ "$k6rc" -eq 124 ]; then
+        warn "k6 在 summary 写盘后挂起（timeout 兜底终止），取回 $out 继续"
+    fi
 
     [ -f "$out" ] || die "k6 没有产出 $out"
     printf '%s\n' "$out"

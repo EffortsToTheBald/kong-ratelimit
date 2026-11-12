@@ -26,8 +26,9 @@ export const options = {
       rate: RPS,
       timeUnit: '1s',
       duration: DUR,
-      preAllocatedVUs: Math.max(50, Math.ceil(RPS / 5)),
-      maxVUs: Math.max(200, RPS * 2),
+      // VU 需求 = RPS × 平均延迟秒；尾延迟尖刺时 preAllocated 不够会压掉 RPS 使结果失真
+      preAllocatedVUs: Math.max(100, RPS),
+      maxVUs: Math.max(1000, RPS * 5),
     },
   },
   discardResponseBodies: true,
