@@ -4,9 +4,9 @@
 
 ## 1. 基线与前置核查
 
-- [ ] 1.1 `git commit` 打本 change 基线（树干净则 `--allow-empty` 锚点）；验证：`git log --oneline` 出现基线提交
-- [ ] 1.2 实测 D2 的 limit_by 区分语义：entity_check 中比较"rules 非空 + limit_by ≠ 默认值"是否按预期 400；验证：curl 三例（rules+默认 limit_by / rules+显式 limit_by / 仅 limit_by）；不精确则启用退化方案（rules 模式忽略 limit_by + init warn）并记录
-- [ ] 1.3 环境自检：三节点 healthy、FLUSHDB 可用；验证：`docker compose ps` 全部 running
+- [x] 1.1 `git commit` 打本 change 基线（树干净则 `--allow-empty` 锚点）；验证：`git log --oneline` 出现基线提交
+- [x] 1.2 实测 D2 的 limit_by 区分语义：entity_check 中比较"rules 非空 + limit_by ≠ 默认值"是否按预期 400；验证：curl 三例（rules+默认 limit_by / rules+显式 limit_by / 仅 limit_by）；不精确则启用退化方案（rules 模式忽略 limit_by + init warn）并记录
+- [x] 1.3 环境自检：三节点 healthy、FLUSHDB 可用；验证：`docker compose ps` 全部 running
 
 ## 2. 配置模型（D2，schema.lua）
 
