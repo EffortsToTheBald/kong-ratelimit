@@ -5,3 +5,5 @@ bench/out/
 .opencode/
 rl.json
 *.pdf
+# 考题原文（隐私，不入库）
+Kong 3-Take home assignment.pdf

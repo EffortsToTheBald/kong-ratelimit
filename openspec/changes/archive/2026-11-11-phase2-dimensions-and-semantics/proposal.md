@@ -2,7 +2,7 @@
 
 ## Why
 
-考题 MVP 硬要求"覆盖 Request Path / Client ID / IP 等多维控制粒度"，但 Phase 1 只实测过 `limit_by=[ip]`——多维语义是"代码支持、未证明"状态；同时 review-phase-0 的 P1 批中 5 项对外语义/可观测问题（reset 头语义误导、Retry-After 无上界、429 无日志、坏配置运行时才报 500、Redis 畸形返回无防御）直接影响交付文档的可信度。本 change 把这两类一次性闭环。
+MVP 需求硬性要求"覆盖 Request Path / Client ID / IP 等多维控制粒度"，但 Phase 1 只实测过 `limit_by=[ip]`——多维语义是"代码支持、未证明"状态；同时 review-phase-0 的 P1 批中 5 项对外语义/可观测问题（reset 头语义误导、Retry-After 无上界、429 无日志、坏配置运行时才报 500、Redis 畸形返回无防御）直接影响交付文档的可信度。本 change 把这两类一次性闭环。
 
 ## What Changes
 

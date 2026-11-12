@@ -1,4 +1,4 @@
-# Kong 分布式限流插件（Take-home 考题一）
+# rate-limit-advanced —— Kong 分布式限流插件
 
 一个 Kong 3.x 插件：在 N 个网关副本之间共享同一个配额池，支持多维限流、429 + `Retry-After`、动态配置，
 并通过一个 `batch` 参数在「精度 / 延迟 / Redis 负载」之间滑动。
