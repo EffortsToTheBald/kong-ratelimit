@@ -4,3 +4,4 @@ bench/out/
 # OpenCode agent 本地数据
 .opencode/
 rl.json
+*.pdf
