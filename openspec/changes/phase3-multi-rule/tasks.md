@@ -15,9 +15,9 @@
 
 ## 3. 多键原子脚本（D3/D4，redis.lua + 独立脚本）
 
-- [ ] 3.1 新增 `redis/multi_bucket.lua`（独立裸跑脚本）与内嵌 `GRANT_MULTI` 脚本：KEYS=各规则桶键，ARGV=[n, 各规则 rate/burst/ttl]；逻辑=逐桶 refill（TIME 单调/burst 封顶）→ 全检（各桶 ≥1）→ 全扣/全不扣 → 返回 {ok, 各桶 tokens/wait} 或 {ok=0, 不足规则, 各 wait}；验证：两份脚本 diff 为空
-- [ ] 3.2 redis-cli 裸跑核心场景：预置 R1 tokens=0、R2 tokens=5 → EVAL 后 R1/R2 均 0/5 不变且返回 ok=0+规则序号；预置双桶充足 → EVAL 后各减 1；验证：与 spec 场景一一对应
-- [ ] 3.3 `redis.lua` 新增 `grant_multi()` 与纯函数 `parse_multi_grant_response(n, res)`（结构/数值/范围防御校验）；验证：resty 单测——畸形样例（长度错/非数/越界/ok 非法）全拒 + 合法样例通过
+- [x] 3.1 新增 `redis/multi_bucket.lua`（独立裸跑脚本）与内嵌 `GRANT_MULTI` 脚本：KEYS=各规则桶键，ARGV=[n, 各规则 rate/burst/ttl]；逻辑=逐桶 refill（TIME 单调/burst 封顶）→ 全检（各桶 ≥1）→ 全扣/全不扣 → 返回 {ok, 各桶 tokens/wait} 或 {ok=0, 不足规则, 各 wait}；验证：两份脚本 diff 为空
+- [x] 3.2 redis-cli 裸跑核心场景：预置 R1 tokens=0、R2 tokens=5 → EVAL 后 R1/R2 均 0/5 不变且返回 ok=0+规则序号；预置双桶充足 → EVAL 后各减 1；验证：与 spec 场景一一对应
+- [x] 3.3 `redis.lua` 新增 `grant_multi()` 与纯函数 `parse_multi_grant_response(n, res)`（结构/数值/范围防御校验）；验证：resty 单测——畸形样例（长度错/非数/越界/ok 非法）全拒 + 合法样例通过
 
 ## 4. 决策与响应语义（D1/D5，algorithm.lua + handler.lua）
 
