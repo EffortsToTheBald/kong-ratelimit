@@ -27,8 +27,8 @@
 
 ## 5. 多维验证脚本（D6，bench/rules.sh）
 
-- [ ] 5.1 编写 `bench/rules.sh`：场景①全或无核心（redis-cli 预置一空一有 → 429 且双桶 tokens 不变）；②全够放行各扣 1；③组指纹换桶（改一条规则 → 组指纹段变化）；④响应语义（瓶颈头/429 rule 字段/Retry-After 封顶）；⑤坏配置三类 400；每场景独立 namespace；验证：脚本 PASS/FAIL 断言齐全
-- [ ] 5.2 执行 `bench/rules.sh` 全绿；验证：全部场景 PASS（FAIL 即停下排查，禁止凑绿）
+- [x] 5.1 编写 `bench/rules.sh`：场景①全或无核心（redis-cli 预置一空一有 → 429 且双桶 tokens 不变）；②全够放行各扣 1；③组指纹换桶（改一条规则 → 组指纹段变化）；④响应语义（瓶颈头/429 rule 字段/Retry-After 封顶）；⑤坏配置三类 400；每场景独立 namespace；验证：脚本 PASS/FAIL 断言齐全
+- [x] 5.2 执行 `bench/rules.sh` 全绿；验证：全部场景 PASS（FAIL 即停下排查，禁止凑绿）
 
 ## 6. 回归、文档与报告
 
