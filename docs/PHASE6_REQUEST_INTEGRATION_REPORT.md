@@ -10,7 +10,7 @@
 
 `rate-limit-advanced` 是 Kong 3.6 DB-less 插件，提供分布式令牌桶限流（Redis Lua 原子授权）。改造前（Phase 1–3 Legacy）batch>1 依赖 `ngx.shared.DICT` 聚合本地库存，存在跨 Worker 语义模糊、慢路径 Redis 压力与 shared-dict 依赖问题。
 
-本次改造（`phase4-performance-and-lease-return` 提案，Phase 4–6）：引入 **Worker Local Lease Manager**——单规则 batch>1 路径改为"Redis GRANT_LEASE 批量预授权 + Worker 本地 TAKE 消费"，每请求 Redis 压力降为 O(1/batch)，同时保持全局配额严格不超发、故障语义与 batch=1 时代完全一致。
+本次改造（`phase4-performance-and-lease-return` 提案，Phase 4–6）：引入 **Worker Local Lease Manager**——单规则 batch>1 路径改为"Redis GRANT_LEASE 批量预授权 + Worker 本地 TAKE 消费"，每请求 Redis 压力降为 O(1/batch)，保持全局配额不超发，并采用明确的 Fail-close 故障策略；batch>1 已确认的本地库存允许在 Redis 故障期间继续消费，而新 GRANT 失败时进入故障处理。
 
 ## 2. V1 功能范围与非目标
 
@@ -36,7 +36,7 @@
               ├─ NEED_GRANT → redis GRANT_LEASE（EVALSHA，桶扣减+建记录原子）
               │     ├─ granted≥1 → lease.grant 登记（同 worker VM 内追加）→ 再 TAKE 恰消费 1
               │     ├─ granted=0 → 429（Retry-After 透传）
-              │     ├─ explicit_error → nil,err（Fail-close，确定零写入）
+              │     ├─ explicit_error → nil,err（Fail-close；Lua 执行错误不保证回滚此前写入，可能造成库存损失，但不会将未确认授权的库存登记到本地）
               │     └─ uncertain（超时/断连/畸形）→ nil,err（不重试、不登记、允许损失）
               └─ 放行/429 → handler 设置 X-RateLimit-* 头（remaining=本地池余量）
 ```
@@ -131,7 +131,7 @@
 
 ## 12. 性能基线与当前性能证据边界
 
-**来源：docs/results.md（Phase 4 第一组性能基线——Legacy EVAL + Shared Inventory，k6 v0.54 三轮 matrix.sh，20 核共享宿主机，数据为真实运行）**。摘要（RPS=1000 档）：
+**来源：docs/results.md（Phase 1 Legacy 性能基线——EVAL + Shared Inventory，k6 v0.54 三轮 matrix.sh，20 核共享宿主机，数据为真实运行）**。摘要（RPS=1000 档）：
 
 | 模式 | p99 | Redis QPS | EVAL |
 |---|---:|---:|---:|
