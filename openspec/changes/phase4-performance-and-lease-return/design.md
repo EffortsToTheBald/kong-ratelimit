@@ -60,22 +60,33 @@ lease_obj = {
   granted,          -- Redis 实际授予量（GRANT 返回值）
   remaining,        -- 本地剩余（≥0，take 同步递减）
   consumed,         -- 本地累计消费（账目观测）
-  created_at,       -- 本地单调时钟
-  last_used_at,     -- 本地单调时钟
-  idle_threshold,       -- 创建时配置快照
-  max_lifetime,     -- 创建时配置快照
-  state,            -- "ACTIVE" | "CLOSING" | "CLOSED"
+  created_at,       -- 授予时刻（诊断用）
+  state,            -- V1: "ACTIVE" | "CLOSED"（无 CLOSING 归还态）
 }
+-- V1 删除（Phase 5 恢复时重新引入）：last_used_at / idle_threshold / max_lifetime
 ```
 
-- **TAKE（非 yield 同步片段）**：遍历该 pool 的 ACTIVE Lease，取首个 `remaining > 0` 者：`remaining −= 1; consumed += 1; last_used_at = now()`；无可用 ⇒ NEED_GRANT。检查与递减在同一 Lua 片段内，期间无 cosocket/ngx.sleep/timer 等待 ⇒ 协程调度不会插入（事实 6）——这是原子性的完整证明，不需要补偿路径。
+- **TAKE（非 yield 同步片段）**：遍历该 pool 的 ACTIVE Lease，取首个 `remaining > 0` 者：`remaining −= 1; consumed += 1`；无可用 ⇒ NEED_GRANT。（V1 无 last_used_at——无 idle 判定消费者。）检查与递减在同一 Lua 片段内，期间无 cosocket/ngx.sleep/timer 等待 ⇒ 协程调度不会插入（事实 6）——这是原子性的完整证明，不需要补偿路径。
 - **所有权**：Lease 对象只存在于创建 Worker 的 table 中；其他 Worker 结构性不可见（不变量 2、10）。
 - **与既有代码的冲突（先指出，调整建议见文件修改清单）**：`store.lua`（ngx.shared.DICT 聚合库存）是旧 batch>1 路径的唯一实现，新模型下**整体废弃删除**（不保留两套 L2、不做向后兼容）；`handler.lua` 的 shared-dict 降级告警（Phase 2 D5）随之删除；docker-compose 的 `KONG_NGINX_HTTP_LUA_SHARED_DICT` 注入不再被本插件使用（保留与否交由实现组确认——建议删除并同步 docs）。
-- **TAKE 顺序**：按 Lease 插入序取首个有存量者（语义与 LRU/FIFO 无正确性差异；最老 Lease 因持续消费不 idle，由 max_lifetime 强制轮换兜底）。
+- **TAKE 顺序**：按 Lease 插入序取首个有存量者（语义与 LRU/FIFO 无正确性差异；V1 无 max_lifetime 轮换，耗尽的 Lease CLOSED 后留在本地 table 中仅作诊断记录，不参与消费）。
+- **多 Lease 并存约束（V1）**：同一 pool_key 可同时存在多个 Lease（各自独立 lease_id）；GRANT 成功后在**不发生 yield 的本地代码段中**登记新 Lease（追加到 leases 列表，**不得覆盖已有 Lease**）；TAKE 遍历可消费 Lease、选有剩余者；检查与递减在同一无 yield 片段。Redis GRANT 已原子扣减全局桶 ⇒ 多 Lease 并存不会重复分配全局库存。
 
 **测试用例**：resty 协议级单测（直接驱动 lease.lua，注入时钟）：TAKE 递减/归零不可再取/多 Lease 并存/关闭后不可消费/CLOSED 不可复活/负库存不可能（结构断言）。
 
 ### D3. Lease 状态机与关闭流程（本地先行，Redis 后行）
+
+
+
+**V1 耗尽处理（本地先行，同一非 yield 片段）**：
+
+```
+1. remaining == 0（TAKE 已无法从该 Lease 取出）⇒ state = "CLOSED"、从 ACTIVE 集合摘除
+2. CLOSED 不可复活、不可重复消费；本地 table 中仅作诊断记录（不删除、不归还、不清理 Redis 记录）
+3. 后续请求 TAKE 不到 ⇒ NEED_GRANT ⇒ 申请新 Lease（新 lease_id）
+```
+
+**Deferred Reference（历史/延期设计，非 V1 实现依据）**——Phase 5 恢复自动归还时按以下完整流程实现：
 
 ```
 ACTIVE ──(空闲阈值 / max_lifetime 到期)──► CLOSING ──(RETURN 完成)──► CLOSED
@@ -110,6 +121,9 @@ KEYS[1] = 桶键      KEYS[2] = kong:rl:lease:{lease_id}
 -- 注：{lease_id} 为占位符语法而非 Redis Hash Tag——实际 Key = kong:rl:lease:<lease_id>（无大括号，
 --     裸跑矩阵与实现一致）。Cluster 部署时 Lease Key 与桶键的 Slot 一致性属 Deferred（见 Future Considerations 1）。
 ARGV = [batch, lease_ttl_ms, lease_id, pool_key]（其余 rate/burst 由桶现状+TIME 推导，同既有脚本）
+-- lease_ttl_ms 语义（V1 裁决）：调用方传**固定常量**（数值 Phase 4 实施时确定；仅用于 Lease 元数据过期清理，
+--     不代表库存自动归还，不影响 Bucket tokens/refill 与 Worker 本地 TAKE/消费，无隐式补偿/重新授权）。
+--     历史公式 max_lifetime+3×timeout+60s 属 Phase 5 延期设计（GRANT_LEASE Lua 原始实现保留不动）。
 
 阶段 0 参数校验（零写入）：batch 正整数；lease_ttl ≥ 1；lease_id/pool_key 非空
 阶段 1 状态只读校验：EXISTS(KEYS[2]) ⇒ 错误 LEASE_EXISTS（不覆盖）
@@ -173,7 +187,7 @@ ARGV = [batch, lease_ttl_ms, lease_id, pool_key]（其余 rate/burst 由桶现�
 ### D7. 配置变更与 pool_key（指纹复用；生命周期参数快照进 Lease）
 
 - `pool_key` = 既有桶键（含 `p=<策略指纹>` 配置版本成分 + 维度值）——指纹已覆盖 limit/window/burst/limit_by/header_name，即全部额度语义配置 ⇒ 配置变更 ⇒ 新 pool_key ⇒ 新 Lease，天然隔离（不变量：新配置不消费旧 Lease）。
-- `lease_return_idle` / `lease_max_lifetime` **不在指纹内**（生命周期运输参数）：它们的变更通过**Lease 创建时快照**实现隔离——每个 Lease 对象固化创建时的 idle/max（D2/D3），运行中修改只影响新 Lease，既有 Lease 按快照关闭。无需 first-writer-wins/冲突告警（所有权已按 Worker 隔离，同池多实例的配置差异只作用于各自 Worker 的 Lease，天然无冲突）。
+- `lease_return_idle` / `lease_max_lifetime` **不在指纹内且不进 V1 schema**（生命周期参数 V1 DEFERRED）：Phase 5 恢复时才引入，届时通过 Lease 创建时快照实现隔离（无需 first-writer-wins/冲突告警——所有权已按 Worker 隔离）。
 - batch 变更：batch 不在指纹内；batch 变更后的新 GRANT 以新 batch 授予，既有 Lease 按其 granted 消费/归还——账目不受影响。
 
 **测试用例**：配置变更 E2E（改 limit ⇒ 新 pool_key 新 Lease，旧 Lease 按快照关闭；改 idle/max ⇒ 既有 Lease 用旧阈值，新 Lease 用新值）。
@@ -181,7 +195,7 @@ ARGV = [batch, lease_ttl_ms, lease_id, pool_key]（其余 rate/burst 由桶现�
 ### D8. 指标与账目观测
 
 - **Worker 本地计数器 + 结构化日志**（notice）：lease_granted/consumed/return_requested/return_applied/return_discarded/return_failed/return_duplicate/active/closed/local_remaining 口径（§14.1 命名）；TAKE 热路径零 Redis 操作（计数为本地变量）。Prometheus 暴露留 Phase 5（Deferred）；本期以日志 + resty 可调用的 `lease.stats()` 供测试与报告取证。
-- **确定性账目**：按 Lease 集合核算 `granted = consumed + returned_applied + lost`（granted 取 Redis 记录/GRANT 返回；consumed 取 Worker 计数/日志；returned_applied 取 RETURN 返回值；lost = 差额，含封顶丢弃）；校验 `consumed + returned_applied ≤ granted`。桶当前 tokens 因 refill/封顶**不能**直接当总账——测试只对明确 Lease 集合统计。
+- **确定性账目（V1 口径）**：正常运行 `granted = consumed + outstanding`（outstanding = Σ本地 remaining）；Worker 崩溃后 `granted = consumed + lost`（lost = 无法继续消费的剩余授权库存）。`returned_applied` 非 V1 正常账目组成部分（RETURN Lua 已实现、V1 不接入；恢复自动归还时重新引入）。桶当前 tokens 因 refill/封顶**不能**直接当总账——测试只对明确 Lease 集合统计。
 
 **测试用例**：确定性序列账目闭合（grant 100/consume 80/return 20 ⇒ 恒等式）；封顶丢弃场景（discarded 计 lost）。
 
@@ -192,12 +206,12 @@ ARGV = [batch, lease_ttl_ms, lease_id, pool_key]（其余 rate/burst 由桶现�
 | 1 | 全局授予不超额 | GRANT Lua 单脚本原子扣桶（Redis 串行） |
 | 2 | Lease 唯一归属 | Worker 级 table 结构性隔离（每 Worker 独立 Lua VM） |
 | 3 | 本地库存不为负 | TAKE 非 yield 同步片段 + 无补偿路径（代码审查断言） |
-| 4 | 关闭后不可消费 | 关闭步骤 3–4（置 CLOSING+摘除）在 RETURN 的任何 yield 之前完成 |
+| 4 | 关闭后不可消费 | V1：耗尽即 CLOSED/摘除（本地先行）；（Phase 5 恢复时：CLOSING+摘除在 RETURN 的任何 yield 之前完成） |
 | 5 | 每 Lease 至多 RETURN 一次成功 | Redis OPEN→RETURNED 单脚本原子转换；重复 ⇒ ALREADY_RETURNED |
 | 6 | 0 ≤ requested ≤ granted | 关闭时 requested=remaining ∈ [0, granted]（remaining 单调非负、granted 为初值）；Redis 端校验拒绝越界 |
 | 7 | 结果不明确不制造新额度 | GRANT 不重试；RETURN 仅原 ID+原 requested 幂等重试 |
 | 8 | Worker 崩溃只损失库存 | 无跨 Worker 补偿路径（结构性不存在）；OPEN 记录 TTL 消亡 |
-| 9 | Lease 记录不提前过期 | lease_ttl 公式覆盖 max_lifetime + 重试窗口 + 余量（D6） |
+| 9 | Lease 记录不提前过期 | V1：固定 lease_ttl 常量（Phase 4 定值）；（Phase 5 恢复时：公式覆盖 max_lifetime+重试窗口+余量，D6） |
 | 10 | 不同 Lease 相互隔离 | 独立对象 + 独立 Redis Key；TAKE/关闭/RETURN 只触自身 |
 
 ## Risks / Trade-offs

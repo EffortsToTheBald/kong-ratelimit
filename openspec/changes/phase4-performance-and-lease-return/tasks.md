@@ -30,7 +30,7 @@
 - [x] 3.1 `redis/grant_lease.lua`（独立裸跑）与内嵌 GRANT_LEASE 双源：KEYS[1]=桶键、KEYS[2]=kong:rl:lease:{lease_id}、ARGV=[batch,lease_ttl_ms,lease_id,pool_key,rate,capacity,bucket_ttl_ms]（rate/capacity/bucket_ttl 与其他脚本统一 ARGV 方案）；三阶段（参数校验 ⇒ EXISTS ⇒ LEASE_EXISTS；桶类型/字段校验 ⇒ refill(elapsed=max(0,now−ts))/granted=min(batch,floor(tokens))/tokens<1 ⇒ granted=0 不建记录/扣桶 + HSET lease(status=OPEN,granted,pool_key,created_at=Redis TIME) + PEXPIRE）；验证：双源 diff 空 + resty 裸跑矩阵（满桶/部分授予/不足 granted=0 无记录/LEASE_EXISTS/参数与桶字段非法 ⇒ 零写入）
 - [x] 3.2 `redis/return_lease.lua`（独立裸跑）与内嵌 RETURN_LEASE 双源：**幂等提交点先行**——KEYS[1]=kong:rl:lease:{lease_id}、KEYS[2]=桶键、ARGV=[requested,pool_key,bucket_ttl_ms,rate,capacity]；校验（requested 非负整数<2^53 ⇒ INVALID_ARGUMENT；不存在 ⇒ LEASE_NOT_FOUND；RETURNED ⇒ 同 requested ALREADY_RETURNED/不同 RETURN_CONFLICT；非 OPEN/POOL_MISMATCH/requested>granted 拒绝；桶不存在 ⇒ BUCKET_NOT_FOUND；桶字段非法拒绝——均零写入）⇒ 提交点 HSET lease(status=RETURNED,return_requested) ⇒ requested>0 ⇒ refill→+requested→capacity 封顶 ⇒ 一次 HSET 完整桶状态 + TTL ⇒ 返回 {requested,applied,discarded}；验证：双源 diff 空 + resty 裸跑矩阵（§5.9 十二项全覆盖：正常/重复同参桶不增/异参 RETURN_CONFLICT/并发两 RETURN 桶只增一次/requested=0 转状态/requested=granted/requested>granted 拒/Lease 过期 LEASE_NOT_FOUND/Bucket 过期 BUCKET_NOT_FOUND 零写入/参数非法零写入）
 - [x] 3.3 标记后桶更新失败测试：注入 RETURNED 提交后、桶 HSET 前失败 ⇒ 重试 ALREADY_RETURNED 桶不增、差额计损失；验证：spec（幂等提交点场景）
-- [x] 3.4 Lease TTL：GRANT 侧公式 `lease_ttl = lease_max_lifetime + 3×redis_timeout_s + 60`（统一不缩短；RETURNED 不缩 TTL）；验证：PTTL 断言 == 公式值
+- [x] 3.4 Lease TTL：GRANT 侧公式 `lease_ttl = lease_max_lifetime + 3×redis_timeout_s + 60`（统一不缩短；RETURNED 不缩 TTL）；验证：PTTL 断言 == 公式值。**V1 注记（2026-11-13）**：该公式为 Phase 3 历史验证口径（Lua 实现保留）；V1 调用语义改为固定 lease_ttl 常量（见 design D4/Phase 4 范围），不代表 V1 依赖 lease_max_lifetime 配置
 - [x] 3.5 refill 语义一致性测试向量：四脚本（TOKEN_BUCKET/GRANT_MULTI/GRANT_LEASE/RETURN_LEASE）以相同桶状态+相同 TIME 输入跑相同向量 ⇒ refill 结果一致；验证：测试向量表留档
 - [x] 3.6 组测试报告 + commit `feat: add redis lease grant and return scripts`；验证：git log
 
@@ -39,9 +39,9 @@
 > **V1 范围（2026-11-13 裁决）**：状态机简化 **ACTIVE→CLOSED**（库存耗尽 ⇒ CLOSED/本地删除，无 CLOSING 归还态、无 Redis RETURN 调用）；无生命周期阈值/时钟/扫描器；Worker 崩溃 ⇒ 剩余库存损失（不恢复不补偿）。
 
 - [ ] 4.1 新增 `lib/lease.lua`（Worker 级模块表）：pools/leases 结构、lease 对象（lease_id/pool_key/granted/remaining/consumed/status/created_at——**V1 无 idle_threshold/max_lifetime/last_used_at**；不变量 remaining+consumed=granted、0≤remaining≤granted）；验证：resty 单测（结构断言 + remaining/consumed 守恒）
-- [ ] 4.2 TAKE（非 yield 同步片段：查 ACTIVE→remaining>0→remaining−−→consumed++→ALLOW；无 ⇒ NEED_GRANT；不访问 Redis、无等待、无补偿路径）；验证：resty 单测（递减/归零不可再取/多 Lease 插入序取用/remaining≥0 结构断言）+ yield 探针断言片段内无 yield
+- [ ] 4.2 TAKE（非 yield 同步片段：查 ACTIVE→remaining>0→remaining−−→consumed++→ALLOW；无 ⇒ NEED_GRANT；不访问 Redis、无等待、无补偿路径；**V1 无 last_used_at 更新**——无 idle 判定消费者）；验证：resty 单测（递减/归零不可再取/多 Lease 插入序取用/remaining≥0 结构断言）+ yield 探针断言片段内无 yield
 - [ ] 4.3 耗尽处理（V1 简化）：remaining=0 ⇒ Lease 标记 CLOSED/从 ACTIVE 集合移除（本地先行，同一非 yield 片段）；CLOSED 不可复活、不可重复消费；**无 RETURN 调用、无快照步骤**；验证：resty 单测（耗尽后 TAKE 不选中/CLOSED 不可复活/重复标记跳过）
-- [ ] 4.4 GRANT 调用接线（lease_id 生成：hostname+worker+计数+随机；GRANT_LEASE 调用与结果分类：成功建本地 Lease/granted=0/LEASE_EXISTS 与其他明确错误 ⇒ 故障分支/**不确定 ⇒ 不重试允许损失**；本地 `remaining+consumed=granted` 维护）；验证：resty 单测（GRANT 成功/不足/冲突/不确定四分类）+ **不得出现 remaining>granted 与负库存**结构断言
+- [ ] 4.4 GRANT 调用接线（lease_id 生成：hostname+worker+计数+随机；GRANT_LEASE 调用与结果分类：成功建本地 Lease/granted=0/LEASE_EXISTS 与其他明确错误 ⇒ 故障分支/**不确定 ⇒ 不重试允许损失**；本地 `remaining+consumed=granted` 维护）；**多 Lease 并存**：同 pool_key 多 Lease 各自独立 lease_id、GRANT 成功后非 yield 段登记（追加不覆盖）、TAKE 遍历选有剩余者；Redis 已原子扣桶 ⇒ 并存无重复分配；验证：resty 单测（GRANT 成功/不足/冲突/不确定四分类 + 多 Lease 并存）+ **不得出现 remaining>granted 与负库存**结构断言
 - [ ] 4.5 多 Worker 隔离：A/B 各自 Lease 互不可见互不代管；A 崩溃（table 丢弃）不影响 B 且不重新授权；验证：resty 双 VM/分进程验证 + spec（所有权场景）
 - [ ] 4.6 组测试报告 + commit `feat: add worker local lease manager`；验证：git log
 
@@ -69,7 +69,7 @@
 
 ## Phase 7：核心正确性与性能验证（`test: add phase4 lease performance report`；V1 压缩版）
 
-- [ ] 7.1 正确性测试 11 项：①多 Worker 并发申请不超发 ②本地并发 TAKE 不重复消费 ③remaining≥0 ④耗尽重申请流程 ⑤kill -9 损失不重新发放 ⑥batch=1 无 Lease 记录 ⑦多规则无 Lease 记录 ⑧多规则全或无 ⑨Fail-close ⑩430+Retry-After ⑪quota/dims/rules 回归；验证：E2E 断言逐项
+- [ ] 7.1 正确性测试 11 项：①多 Worker 并发申请不超发 ②本地并发 TAKE 不重复消费 ③remaining≥0 ④耗尽重申请流程 ⑤kill -9 损失不重新发放 ⑥batch=1 无 Lease 记录 ⑦多规则无 Lease 记录 ⑧多规则全或无 ⑨Fail-close ⑩429+Retry-After ⑪quota/dims/rules 回归；验证：E2E 断言逐项
 - [ ] 7.2 性能三点：M0（复用 Phase 1 数据）+ batch=1 + batch=10（Worker 1/多 × 速率低中高）；采集 RPS/p50/p95/p99/Redis QPS；重点验证 batch=10 是否显著降低 Redis 请求次数且保持限流正确性；验证：与 Phase 1 同口径
 - [ ] 7.3 Phase 3 矩阵证据核对：确认 `test/lease-redis-matrix.sh` 50 项与当前最终代码版本对应（必要时仅跑 smoke：GRANT 正常/RETURN 幂等/TTL 校验抽测）；验证：核对记录
 - [ ] 7.4 报告体例：编号/目的/环境/配置/参数/实际量/时长/RPS/p50/p95/p99/Redis QPS/异常/结论；未执行项 NOT RUN；原始数据入库；验证：体例符合

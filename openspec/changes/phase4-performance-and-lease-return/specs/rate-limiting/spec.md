@@ -104,7 +104,7 @@ Lease 授予必须（MUST）由单个 Redis Lua 脚本原子完成：参数校�
 - **THEN** 返回 LEASE_EXISTS 明确错误，不覆盖不幂等重放，进入故障分支
 
 ### Requirement: RETURN 写入顺序与幂等提交点
-> **V1 边界（2026-11-13）**：Lua 协议已实现（Phase 3 矩阵 50 项验证）；V1 请求路径不接入自动 RETURN 调用；恢复时直接使用本协议。
+> **V1 边界（2026-11-13）**：Lua 协议已实现（Phase 3 矩阵 50 项验证）；V1 请求路径不接入自动 RETURN 调用（requested/applied/discarded 在 V1 请求路径中不被消费）；恢复时直接使用本协议。
 RETURN 必须（MUST）由单个 Redis Lua 脚本完成，写顺序必须（MUST）为**先提交 RETURNED 幂等标记（含 return_requested）后一次 HSET 完整 Bucket 状态**（refill→+requested→capacity 封顶；requested=0 仍完成标记）——标记为幂等提交点：标记后桶更新失败 ⇒ 重试得 ALREADY_RETURNED 不再加桶（损失允许）；"先加桶后标记"必须（MUST）禁止。返回 requested/applied/discarded（applied+discarded=requested，0≤applied≤requested）；封顶丢弃计丢失，不得（MUST NOT）因封顶恢复 OPEN；同 lease_id 桶增加次数必须（MUST）≤1。
 
 #### Scenario: 标记后桶更新失败 ⇒ 重试不重复归还
@@ -172,8 +172,8 @@ RETURN 的全部校验必须（MUST）先于任何写且失败零写入：记录
 - **THEN** 停止重试，库存损失，日志 outcome=uncertain；参数/状态类明确错误不进入重试
 
 ### Requirement: 配置变更隔离与账目边界
-> **V1 边界（2026-11-13）**：V1 无自动 RETURN ⇒ return_requested/applied/discarded 恒为 0，未消费令牌全部计入 lost（保守损失）；RETURN 相关计数口径在恢复自动归还时生效。
-`pool_key` 必须（MUST）包含配置版本（复用既有策略指纹）：配置变更产生新 pool_key，新配置不得（MUST NOT）消费旧 Lease；旧 Lease 按创建时快照的生命周期参数完成消费与归还，生命周期配置变更不得（MUST NOT）追溯既有 Lease。对**明确的 Lease 集合**必须（MUST）满足 `granted = consumed + returned_applied + lost` 且 `consumed + returned_applied ≤ granted`；生产环境不承诺精确总账，只提供保守损失上界。Worker 崩溃只允许（MUST）造成库存损失，不得（MUST NOT）造成额度重复或跨 Worker 补偿。
+> **V1 账目口径（2026-11-13 裁决）**：V1 无自动 RETURN，账目统一为——**正常运行期间** `granted = consumed + outstanding`（outstanding = Worker 本地尚未消费的授权库存，即 Σremaining）；**Worker 崩溃后** `granted = consumed + lost`（lost = 崩溃导致无法继续消费的剩余授权库存）。V1 不承诺精确的实时 lost 审计（returned_applied 非 V1 正常账目）。
+`pool_key` 必须（MUST）包含配置版本（复用既有策略指纹）：配置变更产生新 pool_key，新配置不得（MUST NOT）消费旧 Lease；配置变更不得（MUST NOT）追溯既有 Lease。明确的 Lease 集合必须（MUST）满足 V1 账目口径且 `consumed ≤ granted`；生产不承诺精确总账。Worker 崩溃只允许（MUST）损失库存，不得（MUST NOT）重复授权或跨 Worker 补偿。
 
 #### Scenario: 配置变更隔离
 - **WHEN** 修改 limit（新指纹）后旧池 Lease 仍有剩余
