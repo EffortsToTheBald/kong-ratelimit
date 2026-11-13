@@ -65,7 +65,7 @@
 - [x] 6.3 配置隔离核对：pool_key 指纹覆盖 limit/window/burst/limit_by/header_name ⇒ 不同配置不共用本地库存；如有不明确处先报告再动；验证：配置变更 E2E（新旧 Lease 隔离）
 - [x] 6.4 全量回归：quota.sh（batch=1 基线 100/350/0 + batch=20 区间——锚点变化注明原因）+ dims.sh + rules.sh 全绿；故障双路径；脚本缓存丢失自愈；验证：spec（适用边界三场景 + EVALSHA 零回归）
 - [x] 6.5 并发与异常 E2E（V1 口径）：多 Worker 并发 TAKE/GRANT 全局额度正确（不超发）；本地并发 TAKE 不重复消费；库存耗尽 ⇒ 新 Lease 流程正确；kill -9 ⇒ 损失核验（granted−consumed=lost，不超发不重新授权）；Redis 超时不重复申请；验证：spec（所有权/账目场景）
-- [ ] 6.6 组测试报告 + commit `feat: integrate worker lease into rate limit path`；验证：git log
+- [x] 6.6 组测试报告 + commit `feat: integrate worker lease into rate limit path`；验证：git log
 
 ## Phase 7：核心正确性与性能验证（`test: add phase4 lease performance report`；V1 压缩版）
 
