@@ -38,12 +38,12 @@
 
 > **V1 范围（2026-11-13 裁决）**：状态机简化 **ACTIVE→CLOSED**（库存耗尽 ⇒ CLOSED/本地删除，无 CLOSING 归还态、无 Redis RETURN 调用）；无生命周期阈值/时钟/扫描器；Worker 崩溃 ⇒ 剩余库存损失（不恢复不补偿）。
 
-- [ ] 4.1 新增 `lib/lease.lua`（Worker 级模块表）：pools/leases 结构、lease 对象（lease_id/pool_key/granted/remaining/consumed/status/created_at——**V1 无 idle_threshold/max_lifetime/last_used_at**；不变量 remaining+consumed=granted、0≤remaining≤granted）；验证：resty 单测（结构断言 + remaining/consumed 守恒）
-- [ ] 4.2 TAKE（非 yield 同步片段：查 ACTIVE→remaining>0→remaining−−→consumed++→ALLOW；无 ⇒ NEED_GRANT；不访问 Redis、无等待、无补偿路径；**V1 无 last_used_at 更新**——无 idle 判定消费者）；验证：resty 单测（递减/归零不可再取/多 Lease 插入序取用/remaining≥0 结构断言）+ yield 探针断言片段内无 yield
-- [ ] 4.3 耗尽处理（V1 简化）：remaining=0 ⇒ Lease 标记 CLOSED/从 ACTIVE 集合移除（本地先行，同一非 yield 片段）；CLOSED 不可复活、不可重复消费；**无 RETURN 调用、无快照步骤**；验证：resty 单测（耗尽后 TAKE 不选中/CLOSED 不可复活/重复标记跳过）
-- [ ] 4.4 GRANT 调用接线（lease_id 生成：hostname+worker+计数+随机；GRANT_LEASE 调用与结果分类：成功建本地 Lease/granted=0/LEASE_EXISTS 与其他明确错误 ⇒ 故障分支/**不确定 ⇒ 不重试允许损失**；本地 `remaining+consumed=granted` 维护）；**多 Lease 并存**：同 pool_key 多 Lease 各自独立 lease_id、GRANT 成功后非 yield 段登记（追加不覆盖）、TAKE 遍历选有剩余者；Redis 已原子扣桶 ⇒ 并存无重复分配；验证：resty 单测（GRANT 成功/不足/冲突/不确定四分类 + 多 Lease 并存）+ **不得出现 remaining>granted 与负库存**结构断言
-- [ ] 4.5 多 Worker 隔离：A/B 各自 Lease 互不可见互不代管；A 崩溃（table 丢弃）不影响 B 且不重新授权；验证：resty 双 VM/分进程验证 + spec（所有权场景）
-- [ ] 4.6 组测试报告 + commit `feat: add worker local lease manager`；验证：git log
+- [x] 4.1 新增 `lib/lease.lua`（Worker 级模块表）：pools/leases 结构、lease 对象（lease_id/pool_key/granted/remaining/consumed/status/created_at——**V1 无 idle_threshold/max_lifetime/last_used_at**；不变量 remaining+consumed=granted、0≤remaining≤granted）；验证：resty 单测（结构断言 + remaining/consumed 守恒）
+- [x] 4.2 TAKE（非 yield 同步片段：查 ACTIVE→remaining>0→remaining−−→consumed++→ALLOW；无 ⇒ NEED_GRANT；不访问 Redis、无等待、无补偿路径；**V1 无 last_used_at 更新**——无 idle 判定消费者）；验证：resty 单测（递减/归零不可再取/多 Lease 插入序取用/remaining≥0 结构断言）+ yield 探针断言片段内无 yield
+- [x] 4.3 耗尽处理（V1 简化）：remaining=0 ⇒ Lease 标记 CLOSED/从 ACTIVE 集合移除（本地先行，同一非 yield 片段）；CLOSED 不可复活、不可重复消费；**无 RETURN 调用、无快照步骤**；验证：resty 单测（耗尽后 TAKE 不选中/CLOSED 不可复活/重复标记跳过）
+- [x] 4.4 GRANT 调用接线（lease_id 生成：hostname+worker+计数+随机；GRANT_LEASE 调用与结果分类：成功建本地 Lease/granted=0/LEASE_EXISTS 与其他明确错误 ⇒ 故障分支/**不确定 ⇒ 不重试允许损失**；本地 `remaining+consumed=granted` 维护）；**多 Lease 并存**：同 pool_key 多 Lease 各自独立 lease_id、GRANT 成功后非 yield 段登记（追加不覆盖）、TAKE 遍历选有剩余者；Redis 已原子扣桶 ⇒ 并存无重复分配；验证：resty 单测（GRANT 成功/不足/冲突/不确定四分类 + 多 Lease 并存）+ **不得出现 remaining>granted 与负库存**结构断言
+- [x] 4.5 多 Worker 隔离：A/B 各自 Lease 互不可见互不代管；A 崩溃（table 丢弃）不影响 B 且不重新授权；验证：resty 双 VM/分进程验证 + spec（所有权场景）
+- [x] 4.6 组测试报告 + commit `feat: add worker local lease manager`；验证：git log
 
 ## Phase 5：Lease 生命周期 —— **DEFERRED / OUT OF SCOPE FOR V1**
 

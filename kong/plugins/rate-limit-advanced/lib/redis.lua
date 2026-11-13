@@ -703,4 +703,47 @@ function _M.grant_multi(conf, keys, rates, bursts, ttls_ms)
   return parsed
 end
 
+--- GRANT_LEASE 调用（Phase 4）：Lease 授予（桶扣减 + Lease 记录创建，单脚本原子）。
+-- KEYS[1]=桶键  KEYS[2]=Lease Key（`<key_prefix>:lease:<lease_id>`，无大括号——
+-- 与 Phase 3 裸跑矩阵的 Key 口径一致）。
+-- 错误透传：LEASE_EXISTS / INVALID_ARGUMENT（脚本零写入）与超时/断开/畸形返回
+-- 一律原样返回给调用方（lease.lua 按 design D4 分类——不确定结果不重试不登记）。
+-- @return {granted, tokens, wait}（granted>=1 ⇒ 记录已建；granted=0 ⇒ 未建记录）
+--         或 nil, err
+function _M.grant_lease(conf, bucket_key, lease_id, pool_key, batch,
+                        lease_ttl_ms, rate, capacity, bucket_ttl_ms)
+  local lkey = (conf.redis.key_prefix or "kong:rl") .. ":lease:" .. lease_id
+
+  local r, cerr = connect(conf)
+  if not r then
+    return nil, cerr
+  end
+
+  local res, eerr = evalsha(r, SCRIPTS.grant_lease, 2,
+                            bucket_key, lkey,
+                            tostring(batch),
+                            tostring(lease_ttl_ms),
+                            lease_id,
+                            pool_key,
+                            tostring(rate),
+                            tostring(capacity),
+                            tostring(bucket_ttl_ms))
+  if not res then
+    r:close()
+    return nil, eerr
+  end
+
+  -- 畸形返回按 Redis 异常处理（close 而非 keepalive，进故障分支）；
+  -- want=batch：granted ∈ [0, batch]（部分授予允许）
+  local parsed, perr = parse_grant_response(res, batch)
+  if not parsed then
+    r:close()
+    return nil, perr
+  end
+
+  r:set_keepalive(10000, 100)
+
+  return parsed
+end
+
 return _M
