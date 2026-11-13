@@ -63,7 +63,7 @@
 - [x] 6.1 `algorithm.lua` 接线：单规则 batch>1 ⇒ TAKE → NEED_GRANT ⇒ GRANT_LEASE → 建本地 Lease/消费 1；granted=0 ⇒ 429；**batch=1 与多规则路径一行不动**；验证：resty 单测 + 三模式行为矩阵
 - [x] 6.2 `handler.lua`：故障分支接线核对（Redis 不可用 ⇒ 既有 503/降级语义不被 Lease 改变；不得用 Lease 绕过 Fail-close；429/503 语义不混淆）；**V1 无扫描器启动**；验证：启动日志 + 故障注入
 - [x] 6.3 配置隔离核对：pool_key 指纹覆盖 limit/window/burst/limit_by/header_name ⇒ 不同配置不共用本地库存；如有不明确处先报告再动；验证：配置变更 E2E（新旧 Lease 隔离）
-- [ ] 6.4 全量回归：quota.sh（batch=1 基线 100/350/0 + batch=20 区间——锚点变化注明原因）+ dims.sh + rules.sh 全绿；故障双路径；脚本缓存丢失自愈；验证：spec（适用边界三场景 + EVALSHA 零回归）
+- [x] 6.4 全量回归：quota.sh（batch=1 基线 100/350/0 + batch=20 区间——锚点变化注明原因）+ dims.sh + rules.sh 全绿；故障双路径；脚本缓存丢失自愈；验证：spec（适用边界三场景 + EVALSHA 零回归）
 - [ ] 6.5 并发与异常 E2E（V1 口径）：多 Worker 并发 TAKE/GRANT 全局额度正确（不超发）；本地并发 TAKE 不重复消费；库存耗尽 ⇒ 新 Lease 流程正确；kill -9 ⇒ 损失核验（granted−consumed=lost，不超发不重新授权）；Redis 超时不重复申请；验证：spec（所有权/账目场景）
 - [ ] 6.6 组测试报告 + commit `feat: integrate worker lease into rate limit path`；验证：git log
 
