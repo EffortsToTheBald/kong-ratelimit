@@ -81,7 +81,69 @@ $RC HSET "$B" tokens abc >/dev/null
 R=$(grant 5 60000 m4 "kong:rl:{p3g:m}" 0.016 100 120000 "kong:rl:lease:m4")
 report "$(echo "$R" | grep -q 'INVALID_ARGUMENT bucket tokens' && [ "$(tokens)" = "abc" ] && echo true)" \
   "桶字段非法 ⇒ INVALID_ARGUMENT 零写入"
-$RC HSET "$B" tokens 100 >/dev/null
+# P1-2：桶状态数值范围校验（负 tokens / 超 capacity / 负 ts）——非法不得静默修正、数据不变
+$RC HSET "$B" tokens -5 ts "$(date +%s)" >/dev/null
+R=$(grant 5 60000 m4 "kong:rl:{p3g:m}" 0.016 100 120000 "kong:rl:lease:m4")
+report "$(echo "$R" | grep -q 'INVALID_ARGUMENT bucket tokens: -5' && [ "$(tokens)" = "-5" ] && echo true)" \
+  "tokens=-5（负数）⇒ 拒绝且数据不变（不静默修正）"
+$RC HSET "$B" tokens 200 ts "$(date +%s)" >/dev/null
+R=$(grant 5 60000 m4 "kong:rl:{p3g:m}" 0.016 100 120000 "kong:rl:lease:m4")
+report "$(echo "$R" | grep -q 'INVALID_ARGUMENT bucket tokens: 200' && [ "$(tokens)" = "200" ] && echo true)" \
+  "tokens=200 > capacity=100 ⇒ 拒绝且数据不变"
+$RC HSET "$B" tokens 100 ts -1 >/dev/null
+R=$(grant 5 60000 m4 "kong:rl:{p3g:m}" 0.016 100 120000 "kong:rl:lease:m4")
+report "$(echo "$R" | grep -q 'INVALID_ARGUMENT bucket ts: -1' && [ "$($RC HGET "$B" ts)" = "-1" ] && echo true)" \
+  "ts=-1（负数）⇒ 拒绝且数据不变"
+# RETURN 同款范围校验（与 GRANT 合法性规则一致）
+fresh "kong:rl:lease:mr2"
+grant 5 60000 mr2 "kong:rl:{p3g:m}" 0.016 100 120000 "kong:rl:lease:mr2" >/dev/null
+$RC HSET "$B" tokens -5 ts "$(date +%s)" >/dev/null
+R=$(ret 1 "kong:rl:{p3g:m}" 120000 0.016 100 "kong:rl:lease:mr2")
+report "$(echo "$R" | grep -q 'INVALID_ARGUMENT bucket tokens: -5' && [ "$(tokens)" = "-5" ] && echo true)" \
+  "RETURN tokens=-5 ⇒ 拒绝且数据不变（与 GRANT 规则一致）"
+$RC HSET "$B" tokens 200 ts "$(date +%s)" >/dev/null
+R=$(ret 1 "kong:rl:{p3g:m}" 120000 0.016 100 "kong:rl:lease:mr2")
+report "$(echo "$R" | grep -q 'INVALID_ARGUMENT bucket tokens: 200' && [ "$(tokens)" = "200" ] && echo true)" \
+  "RETURN tokens=200 > capacity ⇒ 拒绝且数据不变"
+$RC DEL "$B" >/dev/null
+$RC HSET "$B" tokens 100 ts -1 >/dev/null
+R=$(ret 1 "kong:rl:{p3g:m}" 120000 0.016 100 "kong:rl:lease:mr2")
+report "$(echo "$R" | grep -q 'INVALID_ARGUMENT bucket ts: -1' && [ "$($RC HGET "$B" ts)" = "-1" ] && echo true)" \
+  "RETURN ts=-1 ⇒ 拒绝且数据不变"
+$RC HSET "$B" tokens 100 ts "$(date +%s)" >/dev/null
+# granted 非法（granted=-5 / granted=0 ⇒ INVALID_LEASE_STATE granted）
+fresh "kong:rl:lease:mg"
+$RC HSET "kong:rl:lease:mg" lease_id mg pool_key "kong:rl:{p3g:m}" granted -5 status OPEN created_at "$(date +%s)" >/dev/null
+R=$(ret 1 "kong:rl:{p3g:m}" 120000 0.016 100 "kong:rl:lease:mg")
+report "$(echo "$R" | grep -q 'INVALID_LEASE_STATE granted: -5' && echo true)" "granted=-5 ⇒ INVALID_LEASE_STATE granted"
+$RC DEL "$B" >/dev/null
+$RC HSET "kong:rl:lease:mg" granted 0 status OPEN >/dev/null
+R=$(ret 1 "kong:rl:{p3g:m}" 120000 0.016 100 "kong:rl:lease:mg")
+report "$(echo "$R" | grep -q 'INVALID_LEASE_STATE granted: 0' && echo true)" "granted=0 ⇒ INVALID_LEASE_STATE granted"
+# P1-1：不足分支持久化 refill（预置 tokens=0.5、ts 过去、refill 后仍 <1 ⇒ granted=0 但写回桶状态与 TTL）
+fresh "kong:rl:lease:mnr"
+TS_BEFORE=$($RC TIME | awk 'NR==1{print $1 - 5}')
+$RC HSET "$B" tokens 0.5 ts "$TS_BEFORE" >/dev/null
+NOW0=$($RC TIME | awk 'NR==1{print $1}')
+R=$(grant 5 60000 mnr "kong:rl:{p3g:m}" 0.016 100 120000 "kong:rl:lease:mnr")
+NOW1=$($RC TIME | awk 'NR==1{print $1}')
+TA=$(tokens); TSA=$($RC HGET "$B" ts); PT=$($RC PTTL "$B")
+echo "DBG-mnr: R1=[$(echo "$R" | head -1)] TA=[$TA] TSA=[$TSA] PT=[$PT] exists=[$($RC EXISTS "kong:rl:lease:mnr")] now0=$NOW0 now1=$NOW1" >&2
+report "$(echo "$R" | head -1 | grep -q '^0$' && [ "$($RC EXISTS "kong:rl:lease:mnr")" = "0" ] && echo true)" \
+  "不足分支：granted=0、不创建 Lease"
+TSC=$(awk -v a="$TSA" -v b="$TS_BEFORE" 'BEGIN{print (a>=b) ? 1 : 0}')
+echo "DBG-ts: TSA=[$TSA] TS_BEFORE=[$TS_BEFORE] cond=$TSC lenTSA=${#TSA}" >&2
+report "$([ "$TSC" = "1" ] && echo true)" \
+  "不足分支：ts 只前进（$TSA >= $TS_BEFORE）"
+report "$([ "$PT" -gt 110000 ] && [ "$PT" -le 120000 ] && echo true)" \
+  "不足分支：桶 TTL 写回（PTTL=$PT ≈ 120000）"
+TCONS=$(awk -v t="$TSA" -v n0="$NOW0" -v n1="$NOW1" 'BEGIN{print (t>=n0-1 && t<=n1+1) ? 1 : 0}')
+echo "DBG-tcons: TSA=[$TSA] NOW0=[$NOW0] NOW1=[$NOW1] cond=$TCONS" >&2
+report "$([ "$TCONS" = "1" ] && echo true)" \
+  "不足分支：tokens/ts 与统一语义一致（ts=$TSA ∈ [now0−1, now1+1]；tokens=$TA refill 后 <1 且已写回）"
+report "$(awk -v t="$TA" -v n0="$NOW0" -v n1="$NOW1" 'BEGIN{print (t>=n0-1 && t<=n1+1) ? 1 : 0}')" \
+report "$([ "$(echo "$R" | head -1)" = "2" ] && [ "$TA" = "0.5" ] && awk -v w="$W" 'BEGIN{exit !((w>31.2 && w<31.3))}' && echo true)" \
+  "wait 契约：部分授予 granted=2、tokens=0.5、wait=$((31.25))s（按扣减后 tokens 计算）"
 
 echo "===== RETURN_LEASE ====="
 fresh "kong:rl:lease:mr1"
@@ -99,7 +161,7 @@ report "$(echo "$R" | grep -q 'RETURN_CONFLICT' && echo true)" "同 ID 异参 �
 fresh "kong:rl:lease:mz"
 grant 5 60000 mz "kong:rl:{p3g:m}" 0.016 100 120000 "kong:rl:lease:mz" >/dev/null
 $RC DEL "kong:rl:lease:mz" >/dev/null
-$RC HSET "kong:rl:lease:mz" lease_id mz pool_key "kong:rl:{p3g:m}" granted 0 status OPEN >/dev/null
+$RC HSET "kong:rl:lease:mz" lease_id mz pool_key "kong:rl:{p3g:m}" granted 5 status OPEN created_at "$(date +%s)" >/dev/null   # 全消费场景：granted≥1、requested=0
 T0=$(tokens)
 R=$(ret 0 "kong:rl:{p3g:m}" 120000 0.016 100 "kong:rl:lease:mz")
 report "$([ "$(echo "$R" | head -1)" = "0" ] && [ "$(tokens)" = "$T0" ] && [ "$($RC HGET "kong:rl:lease:mz" status)" = "RETURNED" ] && [ "$($RC HGET "kong:rl:lease:mz" return_requested)" = "0" ] && echo true)" \

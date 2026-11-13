@@ -183,6 +183,11 @@ local rate         = tonumber(ARGV[5])
 local capacity     = tonumber(ARGV[6])
 local bucket_ttl_ms = tonumber(ARGV[7])
 
+-- 有限数值判定（Lua 无 isfinite：NaN 自不等、±inf 与 huge 比较）
+local function is_finite_num(v)
+  return v ~= nil and v == v and v ~= math.huge and v ~= -math.huge
+end
+
 -- 阶段 0：参数校验（零写入）
 if not batch or batch ~= math.floor(batch) or batch < 1 or batch >= 2^53 then
   return redis.error_reply('INVALID_ARGUMENT batch')
@@ -193,14 +198,15 @@ end
 if not lease_id or lease_id == '' or not pool_key or pool_key == '' then
   return redis.error_reply('INVALID_ARGUMENT lease_id/pool_key')
 end
-if not rate or rate <= 0 or not capacity or capacity <= 0 or capacity >= 2^53 then
+if not is_finite_num(rate) or rate <= 0
+   or not is_finite_num(capacity) or capacity <= 0 or capacity >= 2^53 then
   return redis.error_reply('INVALID_ARGUMENT rate/capacity')
 end
 if not bucket_ttl_ms or bucket_ttl_ms ~= math.floor(bucket_ttl_ms) or bucket_ttl_ms < 1 then
   return redis.error_reply('INVALID_ARGUMENT bucket_ttl_ms')
 end
 
--- 阶段 1：只读校验（零写入）
+-- 阶段 1：只读校验（零写入）——含桶状态数值合法性（P1-2）
 if redis.call('EXISTS', lkey) == 1 then
   return redis.error_reply('LEASE_EXISTS ' .. lease_id)
 end
@@ -213,11 +219,15 @@ elseif btype == 'hash' then
   local d = redis.call('HMGET', bkey, 'tokens', 'ts')
   if d[1] ~= false and d[1] ~= nil then
     tokens = tonumber(d[1])
-    if tokens == nil then return redis.error_reply('INVALID_ARGUMENT bucket tokens') end
+    if not is_finite_num(tokens) or tokens < 0 or tokens > capacity then
+      return redis.error_reply('INVALID_ARGUMENT bucket tokens: ' .. tostring(d[1]))
+    end
   end
   if d[2] ~= false and d[2] ~= nil then
     ts = tonumber(d[2])
-    if ts == nil then return redis.error_reply('INVALID_ARGUMENT bucket ts') end
+    if not is_finite_num(ts) or ts < 0 then
+      return redis.error_reply('INVALID_ARGUMENT bucket ts: ' .. tostring(d[2]))
+    end
   end
 else
   return redis.error_reply('INVALID_ARGUMENT bucket type: ' .. btype)
@@ -227,24 +237,34 @@ end
 local t   = redis.call('TIME')
 local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
 if tokens == nil then tokens = capacity end
+local elapsed = 0
 if ts ~= nil and now > ts then
-  tokens = math.min(capacity, tokens + (now - ts) * rate)
+  elapsed = now - ts
+end
+tokens = math.min(capacity, tokens + elapsed * rate)
+if elapsed > 0 then
   ts = now
 end
 -- P0-4：ts 只前进不后退（now<=ts 时不补充、不改小 ts）
 
 local granted = math.min(batch, math.floor(tokens))
-if granted < 1 then
-  -- tokens < 1：不创建 Lease、不扣桶；wait 口径与 TOKEN_BUCKET 一致
-  local wait = 0
-  if rate > 0 then wait = math.max(0, (1 - tokens) / rate) end
-  return { 0, tostring(tokens), tostring(wait) }
+-- wait 返回契约（与 TOKEN_BUCKET 一致）：按扣减后 tokens 计算
+local wait = 0
+if rate > 0 then
+  wait = math.max(0, (1 - tokens) / rate)
 end
 
+-- 桶状态写回：授予与不足分支统一（与 TOKEN_BUCKET 一致，审查 P1-1 裁决）
 tokens = tokens - granted
 if ts == nil or now > ts then ts = now end
 redis.call('HSET', bkey, 'tokens', tostring(tokens), 'ts', tostring(ts))
 redis.call('PEXPIRE', bkey, bucket_ttl_ms)
+
+if granted < 1 then
+  -- tokens < 1：不创建 Lease（桶状态已写回）
+  return { 0, tostring(tokens), tostring(wait) }
+end
+
 redis.call('HSET', lkey,
   'lease_id', lease_id,
   'pool_key', pool_key,
@@ -253,7 +273,7 @@ redis.call('HSET', lkey,
   'created_at', tostring(now))
 redis.call('PEXPIRE', lkey, lease_ttl_ms)
 
-return { granted, tostring(tokens), tostring(0) }
+return { granted, tostring(tokens), tostring(wait) }
 ]]
 
 -- ------------------------------------------------------------
@@ -267,6 +287,9 @@ return { granted, tostring(tokens), tostring(0) }
 local RETURN_LEASE = [[
 local lkey  = KEYS[1]
 local bkey  = KEYS[2]
+local function is_finite_num(v)
+  return v ~= nil and v == v and v ~= math.huge and v ~= -math.huge
+end
 local requested = tonumber(ARGV[1])
 local pool_key  = ARGV[2]
 local bucket_ttl_ms = tonumber(ARGV[3])
@@ -283,10 +306,13 @@ end
 if not bucket_ttl_ms or bucket_ttl_ms ~= math.floor(bucket_ttl_ms) or bucket_ttl_ms < 1 then
   return redis.error_reply('INVALID_ARGUMENT bucket_ttl_ms')
 end
-if not rate or rate <= 0 or not capacity or capacity <= 0 or capacity >= 2^53 then
+if not is_finite_num(rate) or rate <= 0
+   or not is_finite_num(capacity) or capacity <= 0 or capacity >= 2^53 then
   return redis.error_reply('INVALID_ARGUMENT rate/capacity')
 end
 
+-- 桶状态数值合法性（审查 P1-2 裁决，与 GRANT_LEASE 一致）：tokens ∈ [0, capacity]、
+--   ts ≥ 0、有限数值、granted 正整数 <2^53——非法返回明确错误码，不得静默修正，数据不变。
 -- 阶段 1：只读校验（零写入）
 if redis.call('EXISTS', lkey) == 0 then
   return redis.error_reply('LEASE_NOT_FOUND')
@@ -307,8 +333,9 @@ if lpk ~= pool_key then
   return redis.error_reply('POOL_MISMATCH')
 end
 local granted = tonumber(redis.call('HGET', lkey, 'granted'))
-if granted == nil or granted ~= math.floor(granted) or granted < 0 then
-  return redis.error_reply('INVALID_LEASE_STATE granted')
+if not is_finite_num(granted) or granted ~= math.floor(granted)
+   or granted < 1 or granted >= 2^53 then
+  return redis.error_reply('INVALID_LEASE_STATE granted: ' .. tostring(redis.call('HGET', lkey, 'granted')))
 end
 if requested > granted then
   return redis.error_reply('INVALID_REQUESTED requested=' .. tostring(requested) .. ' granted=' .. tostring(granted))
@@ -321,9 +348,18 @@ if btype ~= 'hash' then
   return redis.error_reply('INVALID_ARGUMENT bucket type: ' .. btype)
 end
 local d = redis.call('HMGET', bkey, 'tokens', 'ts')
-if (d[1] ~= false and d[1] ~= nil and tonumber(d[1]) == nil)
-   or (d[2] ~= false and d[2] ~= nil and tonumber(d[2]) == nil) then
-  return redis.error_reply('INVALID_ARGUMENT bucket fields')
+local btokens, bts
+if d[1] ~= false and d[1] ~= nil then
+  btokens = tonumber(d[1])
+  if not is_finite_num(btokens) or btokens < 0 or btokens > capacity then
+    return redis.error_reply('INVALID_ARGUMENT bucket tokens: ' .. tostring(d[1]))
+  end
+end
+if d[2] ~= false and d[2] ~= nil then
+  bts = tonumber(d[2])
+  if not is_finite_num(bts) or bts < 0 then
+    return redis.error_reply('INVALID_ARGUMENT bucket ts: ' .. tostring(d[2]))
+  end
 end
 
 -- 阶段 2：写（校验全通过后）
@@ -334,8 +370,8 @@ local applied = 0
 if requested > 0 then
   local t   = redis.call('TIME')
   local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
-  local tokens = tonumber(d[1])
-  local ts     = tonumber(d[2])
+  local tokens = btokens
+  local ts     = bts
   if tokens == nil then tokens = capacity end   -- hash 存在但无字段（与授予侧一致：满桶）
   if ts ~= nil and now > ts then
     tokens = math.min(capacity, tokens + (now - ts) * rate)

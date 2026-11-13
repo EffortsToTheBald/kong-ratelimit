@@ -80,6 +80,42 @@
 3. 单调时钟核查（Phase 5 前置强制项）未执行。
 4. Cluster Slot 一致性不承诺（Deferred，已在 Design 记录）。
 
-## 7. Git Commit
+## 7. Phase 3 第一组审查修复（2026-11-13，第二轮）
+
+> 审查（基于 d53f3f0）结论：核心原子性与幂等提交顺序符合设计，4 项需修复/补验。
+
+| 问题 | 修复 | 测试 |
+|---|---|---|
+| **P1-1** GRANT_LEASE 不足分支未持久化 refill | 单键脚本与 TOKEN_BUCKET 同构：**不足分支同样写回 refill 后 tokens/ts 并更新桶 TTL**；GRANT_MULTI 保持"不足不写"（多键全或无语义所需，结构差异如实记录） | 真集成 4 断言：granted=0/无记录/ts 只前进/桶 TTL 写回/统一语义 |
+| **P1-2** 桶状态数值范围校验缺失 | GRANT_LEASE/RETURN_LEASE 阶段 1 补齐：tokens∈[0,capacity]、ts≥0、有限数值（NaN/±inf 拒）、granted 正整数 <2^53——**非法拒绝且数据不变（不静默修正）** | 真集成 8 断言：负 tokens/超 capacity/负 ts × GRANT/RETURN + granted 非法 ×2 |
+| **P1-3** wait 返回语义未定义 | 与 TOKEN_BUCKET 契约统一：按**扣减后** tokens 计算（部分授予 wait>0） | 部分授予（tokens=2.5/batch=5/rate=0.016）：granted=2、剩 0.5、wait=31.25s 精确断言 |
+| **P2-4** Lease Key 占位符歧义 | design.md 注明 `kong:rl:lease:{lease_id}` 中 `{...}` 为占位符非 Hash Tag，实际 Key 无大括号（裸跑矩阵与实现一致）；Cluster Slot 一致性属 Deferred | 静态核对 |
+
+**TOKEN_BUCKET/GRANT_MULTI 的历史差异说明**：两脚本仅有 tonumber 级校验（无范围检查），属 Phase 1/3 已验收路径——按"不顺带扩大重构"原则**不修改**，差异记录于此（其输入由既有调用方 conf 推导，风险受控）。
+
+### 修复后测试结果
+
+- `test/lease-redis-matrix.sh`：**PASS=39 FAIL=0**（含新增 12 断言：不足分支持久化 ×4、wait 契约 ×1、范围校验 ×8）
+- `test/evalsha-unit.sh`（Phase 2 回归）：**PASS 8/8**
+- 双源 diff ×4：**PASS**
+- quota/dims/rules：**NOT RUN**（本组未接请求路径，Phase 6 集成阶段强制重跑）
+
+### 修复过程中的测试脚本自身缺陷记录（均为矩阵脚本问题，生产脚本零缺陷）
+
+1. redis-cli TIME 输出两行（秒+微秒），裸 `awk '{print $1}'` 输出两行 ⇒ 预置 ts 两行 ⇒ grant 读 ts 校验拒——全部 TIME 读取补 `NR==1`。
+2. `$(( $RC TIME ... ))` 双括号=算术展开（set -u 报变量未绑定）——已改单括号 `$()`。
+3. 部分授予/tokens<1 case 的 HSET 在 fresh（DEL 桶）之前执行被删——统一 fresh 在前、预置在后。
+4. multi_bucket 调用 ARGV 多传一参（ttl=1ms 桶秒过期）——已修。
+5. requested=0 测试场景误置 granted=0（与 P1-2 的 granted≥1 校验冲突）——改为 granted≥1 + requested=0（spec 语义：requested=0 表示全消费，granted 本身 ≥1）。
+6. `dexec $RC` 双层 exec、docker cp 用 service 名报错——已修（完整容器名）。
+
+## 8. Git Commit
+
+- 第一组：`feat: add redis lease grant and return scripts`
+- 本轮修复：`fix: phase3 group1 review fixes (refill persistence, validation, wait contract)`
+
+## 9. 尚未解决的问题
+
+同第一组报告 §6（调用封装 Phase 4、schema 生命周期参数 Phase 5、单调时钟核查 Phase 5 前置、Cluster Deferred）。无新增。
 
 - `feat: add redis lease grant and return scripts`（本组全部：两脚本 + 注册 + 矩阵 + 注入生成器 + 文档裁决同步）
