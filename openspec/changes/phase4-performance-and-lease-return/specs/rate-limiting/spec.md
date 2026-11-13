@@ -22,15 +22,19 @@
 - **THEN** 全部结果与既有锚点一致
 
 ### Requirement: 性能基线与对比测量
-> **V1 验收范围（2026-11-13 最终裁决）**：三点 = **M0（复用 Phase 1 基线）/ batch=1 / batch=10**；Worker 1/多、速率低/中/高；记录 RPS、p50/p95/p99、Redis QPS；重点验证 batch=10 降低 Redis 请求次数且保持限流正确性；与 Phase 1 同口径。**Deferred/Future**：batch=50/100、完整 EVAL/EVALSHA 对比、RETURN 开关、自动 RETURN 性能、故障恢复矩阵、生命周期统计——不得（MUST NOT）列为 V1 验收条件。Phase 1 Legacy 数据仅历史基线。不得（MUST NOT）编造数据；未执行必须（MUST）标 NOT RUN 及原因。（原完整矩阵表述为 Phase 7 恢复参考。）
+> **V1 验收范围（2026-11-13 最终裁决）**：三点 = **M0（复用 Phase 1 基线）/ batch=1 / batch=10**；Worker 1/多、速率低/中/高；记录 RPS、p50/p95/p99、Redis QPS；重点验证 batch=10 降低 Redis 请求次数且保持限流正确性；与 Phase 1 同口径。**Deferred/Future**：batch=50/100、完整 EVAL/EVALSHA 对比、RETURN 开关、自动 RETURN 性能、故障恢复矩阵、生命周期统计——不得（MUST NOT）列为 V1 验收条件。Phase 1 Legacy 数据仅历史基线。不得（MUST NOT）编造数据；未执行必须（MUST）标 NOT RUN 及原因。（原完整矩阵为 Phase 7 恢复参考；EVALSHA 功能已交付，仅完整性能对比矩阵延期。）
 性能数据必须（MUST）来自真实运行；V1 必须执行上述三点并与 Phase 1 保持相同测试口径；未执行的测试必须（MUST）标注 NOT RUN 及原因。
 
-#### Scenario: 基线先于复测且矩阵维度齐全
-- **WHEN** EVALSHA 改造合入前
-- **THEN** EVAL 基线已落盘 `bench/results.md`；复测与基线同参数对照，矩阵维度无缺漏或逐项 NOT RUN
+#### Scenario: M0 复用 Phase 1 Legacy 基线
+- **WHEN** 执行 V1 性能验收的 M0 点
+- **THEN** 直接引用 Phase 1 已落盘的 Legacy 基线数据（不重新执行），报告中标注数据来源与口径，不得（MUST NOT）冒充新 Lease 实现的实测数据
+
+#### Scenario: batch=1 与 batch=10 同口径实测
+- **WHEN** 按 tasks.md Phase 7.2 执行实测：batch=1（严格 Redis 路径）与 batch=10（Worker 本地 Lease 路径），各自覆盖 Worker 1/多 × 速率低/中/高，两者使用相同测试环境与测试口径
+- **THEN** 记录 RPS、p50/p95/p99、Redis QPS；验证 batch=10 降低 Redis 请求次数且限流正确性保持；未执行的测试必须（MUST）标注 NOT RUN 及原因，不得（MUST NOT）编造数据
 
 ### Requirement: Lease 模式适用边界
-> **V1 范围裁决（2026-11-13）**：V1 **不实现自动归还**——耗尽后本地删除/不再选中，崩溃损失（保守方向，绝不重新发放）；RETURN_LEASE Lua 协议已实现（Phase 3 矩阵 50 项）但 **V1 不接入自动 RETURN 调用**；idle/max_lifetime 归还属 Production TODO。
+> **V1 范围裁决（2026-11-13）**：V1 **不实现自动归还**——耗尽即 CLOSED：从可消费集合摘除、保留在本地 table 仅作诊断（不删除），崩溃损失（保守方向，绝不重新发放）；RETURN_LEASE Lua 协议已实现（Phase 3 矩阵 50 项）但 **V1 不接入自动 RETURN 调用**；idle/max_lifetime 归还属 Production TODO。
 Worker 本地 Lease 机制仅（ONLY）适用于**单规则 batch>1**（auto 解析后 >1）；其空闲归还行为（V1 注记）为 Phase 5 恢复项、V1 不实施。batch=1 保持既有严格 Redis 路径；多规则保持既有原子多键流程且不得（MUST NOT）使用本地 Lease；Lease 机制对 batch=1 与多规则必须（MUST）为 no-op（零 Lease 创建、零 RETURN、零相关错误日志）。
 
 #### Scenario: batch=1 严格路径零变化
@@ -46,7 +50,7 @@ Worker 本地 Lease 机制仅（ONLY）适用于**单规则 batch>1**（auto 解
 - **THEN** 首次请求经 GRANT 创建 Lease（Redis 可见 lease 记录，状态 OPEN），后续请求本地 TAKE 消费，无每请求 Redis 操作
 
 ### Requirement: Lease 所有权与本地状态机
-> **V1 范围裁决（2026-11-13）**：状态机简化为 **ACTIVE → CLOSED** 单向（耗尽即不可消费、本地删除；无 CLOSING 归还态、无 Redis RETURN 调用——RETURN_LEASE Lua 协议已实现并保留，V1 不接入）。关闭/RETURN 相关 MUST 为 Phase 5 恢复时规范。
+> **V1 范围裁决（2026-11-13）**：状态机简化为 **ACTIVE → CLOSED** 单向（remaining=0 ⇒ CLOSED：从可消费集合摘除、保留在本地 table 仅作诊断；无 CLOSING 归还态、无 Redis RETURN 调用——RETURN_LEASE Lua 协议已实现并保留，V1 不接入；不清理 Redis Lease 记录、不执行库存补偿）。关闭/RETURN 相关 MUST 为 Phase 5 恢复时规范。
 每个 Lease 必须（MUST）只属于创建它的 Worker（Worker 级 Lua table，不共享、不使用 shared.DICT 聚合库存）；状态机必须（MUST）单向，禁止 CLOSED 重入消费；TAKE 必须（MUST）在不含 yield 点的同步片段内完成查找/检查/递减，remaining 不得（MUST NOT）为负、无补偿路径。（Phase 5 恢复时：关闭本地先行——置 CLOSING、摘除、快照 requested、清零——之后才调用 Redis RETURN。）关闭后不得（MUST NOT）消费。
 
 #### Scenario: TAKE 无 yield 且无负库存
@@ -58,8 +62,8 @@ Worker 本地 Lease 机制仅（ONLY）适用于**单规则 batch>1**（auto 解
 - **THEN** 该 Lease 在 yield 前已置 CLOSING 并从 ACTIVE 集合摘除，期间任何请求 TAKE 不能消费它，后续 GRANT 创建的独立 Lease 不受影响
 
 #### Scenario: 关闭后不可消费
-- **WHEN** Lease 进入 CLOSING/CLOSED 后请求 TAKE
-- **THEN** 该 Lease 不再被选中；请求使用同池其他 ACTIVE Lease 或触发新 GRANT
+- **WHEN** Lease 进入 CLOSED 后请求 TAKE
+- **THEN** 该 Lease 已从可消费集合摘除、不参与 TAKE，但保留在本地 table 仅作诊断（不删除、不可复活、不得重新进入 ACTIVE）；请求消费同 pool_key 下其他 ACTIVE Lease，无可用 ACTIVE Lease 时进入新的 GRANT 流程
 
 #### Scenario: 多 Worker 隔离
 - **WHEN** Worker A 与 Worker B 各自 GRANT 创建 Lease A/B
@@ -176,14 +180,14 @@ RETURN 的全部校验必须（MUST）先于任何写且失败零写入：记录
 > **V1 账目口径（2026-11-13 裁决）**：V1 无自动 RETURN，账目统一为——**正常运行期间** `granted = consumed + outstanding`（outstanding = Worker 本地尚未消费的授权库存，即 Σremaining）；**Worker 崩溃后** `granted = consumed + lost`（lost = 崩溃导致无法继续消费的剩余授权库存）。V1 不承诺精确的实时 lost 审计（returned_applied 非 V1 正常账目）。
 `pool_key` 必须（MUST）包含配置版本（复用既有策略指纹）：配置变更产生新 pool_key，新配置不得（MUST NOT）消费旧 Lease；配置变更不得（MUST NOT）追溯既有 Lease。明确的 Lease 集合必须（MUST）满足 V1 账目口径且 `consumed ≤ granted`；生产不承诺精确总账。Worker 崩溃只允许（MUST）损失库存，不得（MUST NOT）重复授权或跨 Worker 补偿。
 
-#### Scenario: 配置变更隔离
-- **WHEN** 修改 limit（新指纹）后旧池 Lease 仍有剩余
-- **THEN** 旧 Lease 按创建时快照的阈值完成消费或归还，新流量走新 pool_key 的新 Lease，无混用
+#### Scenario: 配置变更隔离（V1：pool_key 隔离）
+- **WHEN** 修改 limit 产生新的策略指纹与新 pool_key，旧 pool_key 下仍存在未消费的 Lease
+- **THEN** 旧 Lease 仍绑定原 pool_key，新配置使用新 pool_key 且不得（MUST NOT）消费旧 Lease；旧 Lease 的 remaining 不得（MUST NOT）合并到新 Lease，新配置不得（MUST NOT）复用旧配置的本地库存；V1 不执行 idle/max 阈值关闭、不执行自动 RETURN（生命周期阈值快照行为为 Phase 5 Deferred，不作为 V1 验收要求）
 
-#### Scenario: 确定性账目闭合（V1：outstanding 口径）
-- **WHEN** 无故障的确定性序列（GRANT 100、消费 80、Lease 库存耗尽关闭）
-- **THEN** 该 Lease 集合正常运行账目：granted 100 = consumed 80 + outstanding 20 + lost 0（outstanding = Σ本地 remaining；V1 无 RETURN，耗尽部分计入 outstanding 直至 Worker 生命周期结束）
+#### Scenario: 正常运行账目闭合（V1：outstanding 口径）
+- **WHEN** 无故障的确定性序列：GRANT 100、消费 80、Worker 正常运行、Lease 仍处于 ACTIVE（未耗尽）
+- **THEN** granted = 100、consumed = 80、outstanding = 20（outstanding = Σ本地 remaining）、lost = 0；满足 `granted = consumed + outstanding`（同一份库存不得（MUST NOT）同时计入 outstanding 与 lost）
 
-#### Scenario: Worker 崩溃仅损失库存（V1：lost 口径）
-- **WHEN** Worker 在 Lease ACTIVE（本地 outstanding > 0）时崩溃
-- **THEN** 该 Worker 剩余库存无法继续消费（Lease 记录 TTL 后消亡），账目转为 granted − consumed = lost（本例 lost = 20）；不超发、不重复归还、其他 Worker 不受影响
+#### Scenario: Worker 崩溃账目（V1：lost 口径）
+- **WHEN** Worker 在 Lease ACTIVE（outstanding = 20）时崩溃
+- **THEN** 剩余 20 个授权库存无法继续消费 ⇒ lost = 20；满足 `granted = consumed + lost`；不执行自动归还、不进行跨 Worker 接管、不超发，其他 Worker 不受影响；lost 为账目口径，V1 不要求（MUST NOT）精确实时 lost 审计、持久化审计或跨 Worker 恢复
