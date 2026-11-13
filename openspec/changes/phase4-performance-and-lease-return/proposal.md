@@ -12,7 +12,7 @@ Phase 3 归档后，正确性基线（Phase 1）、多维与语义（Phase 2）�
 ## What Changes
 
 - **EVALSHA**：四脚本统一脚本表（TOKEN_BUCKET/GRANT_MULTI/GRANT_LEASE/RETURN_LEASE）；timer 延迟加载 + 懒加载；明确 NOSCRIPT → LOAD → 重试恰一次；超时不得当作 NOSCRIPT；GRANT 与 RETURN 自愈路径分别验证。
-- **Redis Lease 数据模型**：`lease:{lease_id}` 独立 Key（status OPEN/RETURNED、granted、pool_key、created_at）；GRANT Lua 原子完成 refill/扣桶/建记录（部分授予允许、tokens<1 不建记录、同 ID 冲突拒绝）；RETURN Lua 三阶段（参数校验/只读校验/写）幂等，返回 requested/applied/discarded（capacity 封顶丢弃计丢失）；Lease TTL 覆盖 max_lifetime + RETURN 重试窗口 + 余量。
+- **Redis Lease 数据模型**：`kong:rl:lease:{lease_id}` 独立 Key（status OPEN/RETURNED、granted、pool_key、created_at）；GRANT Lua 原子完成 refill/扣桶/建记录（部分授予允许、tokens<1 不建记录、同 ID 冲突拒绝）；RETURN Lua 三阶段（参数校验/只读校验/写）幂等，返回 requested/applied/discarded（capacity 封顶丢弃计丢失）；Lease TTL 覆盖 max_lifetime + RETURN 重试窗口 + 余量。
 - **Worker 本地 Lease**：`lib/lease.lua`（Worker 级 table）——take（非 yield 同步片段）、状态机 ACTIVE→CLOSING→CLOSED（单向）、关闭流程本地先行（摘除后才允许 RETURN 的 yield）；每 Worker 1s 扫描器 + 重入保护；单调时钟（软单调包装 + 首日核查原生 API）。
 - **生命周期**：`lease_return_idle`（默认 10s，0–3600，0=关空闲触发）+ `lease_max_lifetime`（默认 300s，10–3600，强制轮换不可关）；二者以创建时快照写入 Lease，配置变更不追溯。
 - **超时语义**：GRANT 结果不明确 ⇒ 不重试、允许损失；RETURN 结果不明确 ⇒ 仅原 ID + 原 requested 有限幂等重试（≤2 次），达上限允许损失。

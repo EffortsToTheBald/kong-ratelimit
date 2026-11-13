@@ -1,6 +1,7 @@
 # Tasks
 
 > 规格依据：`specs/rate-limiting/spec.md`（9 条 ADDED）；实现依据：`design.md`（D1–D8 + 不变量表 + Future Considerations）+ 最终实施规范（Phase 0–8、commit 规范、禁止事项）。
+> **阶段编号映射（2026-11-13 裁决）**：本文件任务组 3/4/5/6 ↔ 实施规范 Phase 3/4/5/6；Phase 7（性能第三组）与 Phase 8（清理）按规范独立阶段执行。**Lease Key = `kong:rl:lease:{lease_id}`**（遵循 kong:rl 前缀；Cluster Slot 一致性不在本阶段保证范围）。**阈值字段名统一 `idle_threshold`**。Phase 3 开工核对结论见本轮对话与 commit 记录（无阻塞性冲突）。
 > **执行原则**：先检查代码再修改；Phase 0 只审查不改生产代码；不跳阶段、不混提交；测试失败即停；不修改测试预期（除非证明原测试有误并说明）；NOT RUN 如实标注；不保留两套生产限流实现；发现规范与代码冲突先报告。
 
 ## Phase 0：代码现状审查（不修改生产代码）
@@ -14,7 +15,7 @@
 - [x] 1.2 首日事实核查（阻塞项前置）：LuaJIT FFI `clock_gettime(CLOCK_MONOTONIC)` 可用性（ABI/返回值/错误处理/容器兼容）；`CLIENT PAUSE` 可用性；Worker 级模块 table 隔离实证；验证：resty 输出留档；**单调时钟核查不通过 ⇒ 停止 Phase 5 生命周期实现并报告**（不阻塞 Phase 1/2）
 - [x] 1.3 `matrix.sh` 扩展第一组维度：batch 1/10/50/100、速率低/中/高、Worker 1/多、单/多规则、Redis CPU（INFO cpu 差值）、Kong CPU、commandstats 分类列；验证：单组 dry-run 通过
 - [x] 1.4 执行 EVAL 基线 → `bench/results.md` 基线段（含原始数据保存）；验证：数据真实、同参数可在 Phase 2/7 复跑
-- [ ] 1.5 commit `test: add phase4 eval performance baseline`；验证：git log 出现该提交
+- [x] 1.5 commit `test: add phase4 eval performance baseline`；验证：git log 出现该提交（`8b04976`）
 
 ## Phase 2：EVALSHA（`feat: add evalsha script management`）
 
@@ -26,12 +27,12 @@
 
 ## Phase 3：Redis Lease 数据模型（`feat: add redis lease grant and return scripts`；不接请求路径）
 
-- [ ] 3.1 `redis/grant_lease.lua`（独立裸跑）与内嵌 GRANT_LEASE 双源：KEYS[1]=桶键、KEYS[2]=lease:{lease_id}、ARGV=[batch,lease_ttl_ms,lease_id,pool_key,rate,capacity]（rate/capacity 与其他脚本统一 ARGV 方案）；三阶段（参数校验 ⇒ EXISTS ⇒ LEASE_EXISTS；桶类型/字段校验 ⇒ refill(elapsed=max(0,now−ts))/granted=min(batch,floor(tokens))/tokens<1 ⇒ granted=0 不建记录/扣桶 + HSET lease(status=OPEN,granted,pool_key,created_at=Redis TIME) + PEXPIRE）；验证：双源 diff 空 + resty 裸跑矩阵（满桶/部分授予/不足 granted=0 无记录/LEASE_EXISTS/参数与桶字段非法 ⇒ 零写入）
-- [ ] 3.2 `redis/return_lease.lua`（独立裸跑）与内嵌 RETURN_LEASE 双源：**幂等提交点先行**——KEYS[1]=lease:{lease_id}、KEYS[2]=桶键、ARGV=[requested,pool_key,bucket_ttl_ms,rate,capacity]；校验（requested 非负整数<2^53 ⇒ INVALID_ARGUMENT；不存在 ⇒ LEASE_NOT_FOUND；RETURNED ⇒ 同 requested ALREADY_RETURNED/不同 RETURN_CONFLICT；非 OPEN/POOL_MISMATCH/requested>granted 拒绝；桶不存在 ⇒ BUCKET_NOT_FOUND；桶字段非法拒绝——均零写入）⇒ 提交点 HSET lease(status=RETURNED,return_requested) ⇒ requested>0 ⇒ refill→+requested→capacity 封顶 ⇒ 一次 HSET 完整桶状态 + TTL ⇒ 返回 {requested,applied,discarded}；验证：双源 diff 空 + resty 裸跑矩阵（§5.9 十二项全覆盖：正常/重复同参桶不增/异参 RETURN_CONFLICT/并发两 RETURN 桶只增一次/requested=0 转状态/requested=granted/requested>granted 拒/Lease 过期 LEASE_NOT_FOUND/Bucket 过期 BUCKET_NOT_FOUND 零写入/参数非法零写入）
-- [ ] 3.3 标记后桶更新失败测试：注入 RETURNED 提交后、桶 HSET 前失败 ⇒ 重试 ALREADY_RETURNED 桶不增、差额计损失；验证：spec（幂等提交点场景）
-- [ ] 3.4 Lease TTL：GRANT 侧公式 `lease_ttl = lease_max_lifetime + 3×redis_timeout_s + 60`（统一不缩短；RETURNED 不缩 TTL）；验证：PTTL 断言 == 公式值
-- [ ] 3.5 refill 语义一致性测试向量：四脚本（TOKEN_BUCKET/GRANT_MULTI/GRANT_LEASE/RETURN_LEASE）以相同桶状态+相同 TIME 输入跑相同向量 ⇒ refill 结果一致；验证：测试向量表留档
-- [ ] 3.6 组测试报告 + commit `feat: add redis lease grant and return scripts`；验证：git log
+- [x] 3.1 `redis/grant_lease.lua`（独立裸跑）与内嵌 GRANT_LEASE 双源：KEYS[1]=桶键、KEYS[2]=kong:rl:lease:{lease_id}、ARGV=[batch,lease_ttl_ms,lease_id,pool_key,rate,capacity,bucket_ttl_ms]（rate/capacity/bucket_ttl 与其他脚本统一 ARGV 方案）；三阶段（参数校验 ⇒ EXISTS ⇒ LEASE_EXISTS；桶类型/字段校验 ⇒ refill(elapsed=max(0,now−ts))/granted=min(batch,floor(tokens))/tokens<1 ⇒ granted=0 不建记录/扣桶 + HSET lease(status=OPEN,granted,pool_key,created_at=Redis TIME) + PEXPIRE）；验证：双源 diff 空 + resty 裸跑矩阵（满桶/部分授予/不足 granted=0 无记录/LEASE_EXISTS/参数与桶字段非法 ⇒ 零写入）
+- [x] 3.2 `redis/return_lease.lua`（独立裸跑）与内嵌 RETURN_LEASE 双源：**幂等提交点先行**——KEYS[1]=kong:rl:lease:{lease_id}、KEYS[2]=桶键、ARGV=[requested,pool_key,bucket_ttl_ms,rate,capacity]；校验（requested 非负整数<2^53 ⇒ INVALID_ARGUMENT；不存在 ⇒ LEASE_NOT_FOUND；RETURNED ⇒ 同 requested ALREADY_RETURNED/不同 RETURN_CONFLICT；非 OPEN/POOL_MISMATCH/requested>granted 拒绝；桶不存在 ⇒ BUCKET_NOT_FOUND；桶字段非法拒绝——均零写入）⇒ 提交点 HSET lease(status=RETURNED,return_requested) ⇒ requested>0 ⇒ refill→+requested→capacity 封顶 ⇒ 一次 HSET 完整桶状态 + TTL ⇒ 返回 {requested,applied,discarded}；验证：双源 diff 空 + resty 裸跑矩阵（§5.9 十二项全覆盖：正常/重复同参桶不增/异参 RETURN_CONFLICT/并发两 RETURN 桶只增一次/requested=0 转状态/requested=granted/requested>granted 拒/Lease 过期 LEASE_NOT_FOUND/Bucket 过期 BUCKET_NOT_FOUND 零写入/参数非法零写入）
+- [x] 3.3 标记后桶更新失败测试：注入 RETURNED 提交后、桶 HSET 前失败 ⇒ 重试 ALREADY_RETURNED 桶不增、差额计损失；验证：spec（幂等提交点场景）
+- [x] 3.4 Lease TTL：GRANT 侧公式 `lease_ttl = lease_max_lifetime + 3×redis_timeout_s + 60`（统一不缩短；RETURNED 不缩 TTL）；验证：PTTL 断言 == 公式值
+- [x] 3.5 refill 语义一致性测试向量：四脚本（TOKEN_BUCKET/GRANT_MULTI/GRANT_LEASE/RETURN_LEASE）以相同桶状态+相同 TIME 输入跑相同向量 ⇒ refill 结果一致；验证：测试向量表留档
+- [x] 3.6 组测试报告 + commit `feat: add redis lease grant and return scripts`；验证：git log
 
 ## Phase 4：Worker 本地 Lease（`feat: add worker local lease manager`；不接扫描器，先单测）
 

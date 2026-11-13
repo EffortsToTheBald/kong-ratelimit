@@ -1,0 +1,16 @@
+39:R=$(grant 5 5000 m1 "kong:rl:{p3g:m}" 0.016 100  19
+45:R=$(grant 5 5000 m1 "kong:rl:{p3g:m}" 0.016 100  19
+49:R=$(grant 5 5000 m2 "kong:rl:{p3g:m}" 0.016 100  19
+53:R=$(grant 5 5000 m3 "kong:rl:{p3g:m}" 0.016 100  19
+58:R=$(grant 0 5000 m4 "kong:rl:{p3g:m}" 0.016 100  19
+60:R=$(grant 1.5 5000 m4 "kong:rl:{p3g:m}" 0.016 100  19
+62:R=$(grant 5 5000 m4 "kong:rl:{p3g:m}" -1 100  19
+66:R=$(grant 5 5000 m4 "kong:rl:{p3g:m}" 0.016 100  19
+73:grant 5 5000 mr1 "kong:rl:{p3g:m}" 0.016 100  30
+85:grant 5 5000 mz "kong:rl:{p3g:m}" 0.016 100  13
+94:grant 5 5000 mx "kong:rl:{p3g:m}" 0.016 100  29
+102:grant 5 100 mexp "kong:rl:{p3g:m}" 0.016 100  15
+108:grant 5 5000 mb "kong:rl:{p3g:m}" 0.016 100  13
+116:grant 5 5000 mf "kong:rl:{p3g:m}" 0.016 100  13
+122:grant 5 5000 mc "kong:rl:{p3g:m}" 0.016 100  13
+134:grant 5 5000 mi "kong:rl:{p3g:m}" 0.016 100  13

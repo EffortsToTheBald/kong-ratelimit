@@ -165,6 +165,194 @@ for i = 1, n do
 end
 return out
 ]]
+-- ------------------------------------------------------------
+-- GRANT_LEASE（Phase 3）：Lease 授予（桶扣减 + Lease 记录创建原子）。
+-- KEYS[1]=桶键 KEYS[2]=kong:rl:lease:{lease_id}
+-- ARGV=[batch, lease_ttl_ms, lease_id, pool_key, rate, capacity, bucket_ttl_ms]
+-- 返回 {granted, tokens, wait} 或错误码（LEASE_EXISTS/INVALID_ARGUMENT，零写入）。
+-- tokens<1 ⇒ granted=0 不建记录。详细语义见 redis/grant_lease.lua（双源）。
+-- ------------------------------------------------------------
+local GRANT_LEASE = [[
+local bkey   = KEYS[1]
+local lkey   = KEYS[2]
+local batch  = tonumber(ARGV[1])
+local lease_ttl_ms = tonumber(ARGV[2])
+local lease_id     = ARGV[3]
+local pool_key     = ARGV[4]
+local rate         = tonumber(ARGV[5])
+local capacity     = tonumber(ARGV[6])
+local bucket_ttl_ms = tonumber(ARGV[7])
+
+-- 阶段 0：参数校验（零写入）
+if not batch or batch ~= math.floor(batch) or batch < 1 or batch >= 2^53 then
+  return redis.error_reply('INVALID_ARGUMENT batch')
+end
+if not lease_ttl_ms or lease_ttl_ms ~= math.floor(lease_ttl_ms) or lease_ttl_ms < 1 then
+  return redis.error_reply('INVALID_ARGUMENT lease_ttl_ms')
+end
+if not lease_id or lease_id == '' or not pool_key or pool_key == '' then
+  return redis.error_reply('INVALID_ARGUMENT lease_id/pool_key')
+end
+if not rate or rate <= 0 or not capacity or capacity <= 0 or capacity >= 2^53 then
+  return redis.error_reply('INVALID_ARGUMENT rate/capacity')
+end
+if not bucket_ttl_ms or bucket_ttl_ms ~= math.floor(bucket_ttl_ms) or bucket_ttl_ms < 1 then
+  return redis.error_reply('INVALID_ARGUMENT bucket_ttl_ms')
+end
+
+-- 阶段 1：只读校验（零写入）
+if redis.call('EXISTS', lkey) == 1 then
+  return redis.error_reply('LEASE_EXISTS ' .. lease_id)
+end
+local btype = redis.call('TYPE', bkey).ok
+local tokens, ts
+if btype == 'none' then
+  tokens = capacity   -- 新桶满桶（与 TOKEN_BUCKET 一致）
+  ts = nil
+elseif btype == 'hash' then
+  local d = redis.call('HMGET', bkey, 'tokens', 'ts')
+  if d[1] ~= false and d[1] ~= nil then
+    tokens = tonumber(d[1])
+    if tokens == nil then return redis.error_reply('INVALID_ARGUMENT bucket tokens') end
+  end
+  if d[2] ~= false and d[2] ~= nil then
+    ts = tonumber(d[2])
+    if ts == nil then return redis.error_reply('INVALID_ARGUMENT bucket ts') end
+  end
+else
+  return redis.error_reply('INVALID_ARGUMENT bucket type: ' .. btype)
+end
+
+-- 阶段 2：refill → 授予判定 → 扣桶 → 建 Lease（原子，Redis 串行无穿插）
+local t   = redis.call('TIME')
+local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+if tokens == nil then tokens = capacity end
+if ts ~= nil and now > ts then
+  tokens = math.min(capacity, tokens + (now - ts) * rate)
+  ts = now
+end
+-- P0-4：ts 只前进不后退（now<=ts 时不补充、不改小 ts）
+
+local granted = math.min(batch, math.floor(tokens))
+if granted < 1 then
+  -- tokens < 1：不创建 Lease、不扣桶；wait 口径与 TOKEN_BUCKET 一致
+  local wait = 0
+  if rate > 0 then wait = math.max(0, (1 - tokens) / rate) end
+  return { 0, tostring(tokens), tostring(wait) }
+end
+
+tokens = tokens - granted
+if ts == nil or now > ts then ts = now end
+redis.call('HSET', bkey, 'tokens', tostring(tokens), 'ts', tostring(ts))
+redis.call('PEXPIRE', bkey, bucket_ttl_ms)
+redis.call('HSET', lkey,
+  'lease_id', lease_id,
+  'pool_key', pool_key,
+  'granted', granted,
+  'status', 'OPEN',
+  'created_at', tostring(now))
+redis.call('PEXPIRE', lkey, lease_ttl_ms)
+
+return { granted, tostring(tokens), tostring(0) }
+]]
+
+-- ------------------------------------------------------------
+-- RETURN_LEASE（Phase 3）：Lease 幂等归还（提交点先行）。
+-- KEYS[1]=kong:rl:lease:{lease_id} KEYS[2]=桶键
+-- ARGV=[requested, pool_key, bucket_ttl_ms, rate, capacity]
+-- 写顺序铁律：先写 RETURNED 标记（幂等提交点），后一次 HSET 完整桶状态。
+-- 返回 {requested, applied, discarded} 或错误码（均零写入）。
+-- 详细语义见 redis/return_lease.lua（双源）。
+-- ------------------------------------------------------------
+local RETURN_LEASE = [[
+local lkey  = KEYS[1]
+local bkey  = KEYS[2]
+local requested = tonumber(ARGV[1])
+local pool_key  = ARGV[2]
+local bucket_ttl_ms = tonumber(ARGV[3])
+local rate      = tonumber(ARGV[4])
+local capacity  = tonumber(ARGV[5])
+
+-- 阶段 0：参数校验（零写入）
+if not requested or requested ~= math.floor(requested) or requested < 0 or requested >= 2^53 then
+  return redis.error_reply('INVALID_ARGUMENT requested')
+end
+if not pool_key or pool_key == '' then
+  return redis.error_reply('INVALID_ARGUMENT pool_key')
+end
+if not bucket_ttl_ms or bucket_ttl_ms ~= math.floor(bucket_ttl_ms) or bucket_ttl_ms < 1 then
+  return redis.error_reply('INVALID_ARGUMENT bucket_ttl_ms')
+end
+if not rate or rate <= 0 or not capacity or capacity <= 0 or capacity >= 2^53 then
+  return redis.error_reply('INVALID_ARGUMENT rate/capacity')
+end
+
+-- 阶段 1：只读校验（零写入）
+if redis.call('EXISTS', lkey) == 0 then
+  return redis.error_reply('LEASE_NOT_FOUND')
+end
+local status = redis.call('HGET', lkey, 'status')
+if status == 'RETURNED' then
+  local rr = redis.call('HGET', lkey, 'return_requested')
+  if tonumber(rr) == requested then
+    return redis.error_reply('ALREADY_RETURNED')
+  end
+  return redis.error_reply('RETURN_CONFLICT requested=' .. tostring(requested) .. ' return_requested=' .. tostring(rr))
+end
+if status ~= 'OPEN' then
+  return redis.error_reply('INVALID_LEASE_STATE ' .. tostring(status))
+end
+local lpk = redis.call('HGET', lkey, 'pool_key')
+if lpk ~= pool_key then
+  return redis.error_reply('POOL_MISMATCH')
+end
+local granted = tonumber(redis.call('HGET', lkey, 'granted'))
+if granted == nil or granted ~= math.floor(granted) or granted < 0 then
+  return redis.error_reply('INVALID_LEASE_STATE granted')
+end
+if requested > granted then
+  return redis.error_reply('INVALID_REQUESTED requested=' .. tostring(requested) .. ' granted=' .. tostring(granted))
+end
+local btype = redis.call('TYPE', bkey).ok
+if btype == 'none' then
+  return redis.error_reply('BUCKET_NOT_FOUND')
+end
+if btype ~= 'hash' then
+  return redis.error_reply('INVALID_ARGUMENT bucket type: ' .. btype)
+end
+local d = redis.call('HMGET', bkey, 'tokens', 'ts')
+if (d[1] ~= false and d[1] ~= nil and tonumber(d[1]) == nil)
+   or (d[2] ~= false and d[2] ~= nil and tonumber(d[2]) == nil) then
+  return redis.error_reply('INVALID_ARGUMENT bucket fields')
+end
+
+-- 阶段 2：写（校验全通过后）
+-- 【幂等提交点】先写 RETURNED 标记与 return_requested（此后任何失败 ⇒ 重试得 ALREADY_RETURNED）
+redis.call('HSET', lkey, 'status', 'RETURNED', 'return_requested', requested)
+
+local applied = 0
+if requested > 0 then
+  local t   = redis.call('TIME')
+  local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+  local tokens = tonumber(d[1])
+  local ts     = tonumber(d[2])
+  if tokens == nil then tokens = capacity end   -- hash 存在但无字段（与授予侧一致：满桶）
+  if ts ~= nil and now > ts then
+    tokens = math.min(capacity, tokens + (now - ts) * rate)
+    ts = now
+  end
+  local refilled = tokens
+  local new_tokens = math.min(capacity, refilled + requested)
+  applied = new_tokens - refilled
+  if ts == nil or now > ts then ts = now end
+  redis.call('HSET', bkey, 'tokens', tostring(new_tokens), 'ts', tostring(ts))
+  redis.call('PEXPIRE', bkey, bucket_ttl_ms)
+end
+-- requested=0：跳过桶更新，仍完成 OPEN→RETURNED（账目闭合）
+
+-- Lease 记录 TTL 不重设（RETURNED 保留至原 TTL = 幂等保护窗口）
+return { requested, applied, requested - applied }
+]]
 
 _M.multi_script = GRANT_MULTI
 
@@ -185,6 +373,8 @@ local function register_script(name, src)
 end
 register_script("token_bucket", TOKEN_BUCKET)
 register_script("grant_multi", GRANT_MULTI)
+register_script("grant_lease", GRANT_LEASE)
+register_script("return_lease", RETURN_LEASE)
 _M.scripts = SCRIPTS
 
 local function is_noscript_err(err)

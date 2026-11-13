@@ -62,7 +62,7 @@ lease_obj = {
   consumed,         -- 本地累计消费（账目观测）
   created_at,       -- 本地单调时钟
   last_used_at,     -- 本地单调时钟
-  idle_limit,       -- 创建时配置快照
+  idle_threshold,       -- 创建时配置快照
   max_lifetime,     -- 创建时配置快照
   state,            -- "ACTIVE" | "CLOSING" | "CLOSED"
 }
@@ -85,8 +85,8 @@ ACTIVE ──(空闲阈值 / max_lifetime 到期)──► CLOSING ──(RETURN
 
 ```
 1. state == "ACTIVE"？否 ⇒ 跳过
-2. 达到 idle（idle_limit > 0 且 idle ≥ idle_limit）或 age ≥ max_lifetime？
-   否 ⇒ 跳过（idle_limit=0 时跳过 idle 条件，max_lifetime 恒检查）
+2. 达到 idle（idle_threshold > 0 且 idle ≥ idle_threshold）或 age ≥ max_lifetime？
+   否 ⇒ 跳过（idle_threshold=0 时跳过 idle 条件，max_lifetime 恒检查）
 3. state = "CLOSING"
 4. 从 pools[pool_key].leases 摘除本 Lease
 5. requested = remaining；remaining = 0
@@ -104,7 +104,7 @@ ACTIVE ──(空闲阈值 / max_lifetime 到期)──► CLOSING ──(RETURN
 ### D4. GRANT_LEASE Lua（桶扣减与 Lease 创建同脚本原子）
 
 ```
-KEYS[1] = 桶键      KEYS[2] = lease:{lease_id}
+KEYS[1] = 桶键      KEYS[2] = kong:rl:lease:{lease_id}
 ARGV = [batch, lease_ttl_ms, lease_id, pool_key]（其余 rate/burst 由桶现状+TIME 推导，同既有脚本）
 
 阶段 0 参数校验（零写入）：batch 正整数；lease_ttl ≥ 1；lease_id/pool_key 非空
