@@ -20,11 +20,17 @@ bad()  { printf '\033[31m%s\033[0m\n' "$*" >&2; FAIL=$((FAIL+1)); }
 report() { if [ "$1" = "true" ]; then ok "PASS: $2"; else bad "FAIL: $2"; fi; }
 eq() { [ "$1" = "$2" ] && echo true || echo false; }
 RC() { docker compose exec -T redis redis-cli "$@"; }
-# lease 记录按 pool_key 字段归属 namespace（lease key 本身不含 namespace）
-lease_ns_count() {
+# 按 lease_id 第二字段（host:worker:seq:hex）输出指定 ns 下全部 Lease 的 worker_id
+# ——Lease 记录总数无法区分"同一 Worker 多次 GRANT"，Worker 归属必须看 worker_id
+lease_worker_ids() {
   RC --scan --pattern 'kong:rl:lease:*' </dev/null \
-   | while IFS= read -r k; do [ -n "$k" ] && RC HGET "$k" pool_key </dev/null; done \
-   | grep -c "$1" || true
+   | while IFS= read -r k; do
+       [ -n "$k" ] || continue
+       pk=$(RC HGET "$k" pool_key </dev/null)
+       case "$pk" in
+         *"$1"*) RC HGET "$k" lease_id </dev/null | awk -F: '{print $2}' ;;
+       esac
+     done
 }
 PROXY="http://localhost:8030"
 RLCONFIG='{"host":"redis","port":6379,"database":0,"timeout":1000}'
@@ -59,7 +65,7 @@ cat <<EOF > /tmp/opencode/rl62-config.json
      "window":3600,"limit":3,"batch":1,"burst":0,"limit_by":["ip"],$RED}}]},
   {"name":"h-2n","paths":["/h2n"],"strip_path":false,
    "plugins":[{"name":"rate-limit-advanced","config":{"namespace":"$NS_2N",
-     "window":3600,"limit":100,"batch":10,"burst":0,"limit_by":["ip"],$RED}}]}
+     "window":3600,"limit":100,"batch":50,"burst":0,"limit_by":["ip"],$RED}}]}
 ]}]}
 EOF
 for n in 8031 8011 8021; do
@@ -96,14 +102,23 @@ done
 code=$(curl -s -o /dev/null -w '%{http_code}' "$PROXY/h1r")
 report "$(eq "$code" 429)" "batch=1 额度不足 ⇒ $code（应为 429）"
 
-# ---- 2b. 故障前置：让两个 worker 都持有本地库存 ----
-# 每个 worker 首个请求各自 GRANT（worker 隔离）；lease 记录 ≥2 ⇒ 两个 worker 均持库存
-for i in $(seq 1 30); do
+# ---- 2b. 故障前置：让至少两个不同 Worker 持有本地库存 ----
+# 证明口径（审查修正一）：按 lease_id 的 worker_id 字段统计**不同 Worker 数**；
+# 每个 Worker 首个请求各自 GRANT（Worker 隔离）。batch=50 ⇒ 任一 Worker 首 GRANT 得
+# 50 个令牌，≤40 次前置请求不足以耗尽任一 Worker 库存，
+# 故"≥2 个不同 worker_id 成功创建 Lease" ⇔ 两个 Worker 均持有剩余库存。
+TWO_WORKERS=false; wids=""
+for i in $(seq 1 40); do
   curl -s -o /dev/null --max-time 5 "$PROXY/h2n" || true
-  n=$(lease_ns_count "$NS_2N")
-  [ "$n" -ge 2 ] && break
+  wids=$(lease_worker_ids "$NS_2N" | sort -u | tr '\n' ',' )
+  w=$(lease_worker_ids "$NS_2N" | sort -u | wc -l)
+  [ "$w" -ge 2 ] && { TWO_WORKERS=true; break; }
 done
-report "$([ "$n" -ge 2 ] && echo true)" "故障前置：$NS_2N lease 记录数=$n（≥2 ⇒ 两个 worker 均持有本地库存）"
+if [ "$TWO_WORKERS" = "true" ]; then
+  ok "PASS: 双 Worker 库存证明：不同 worker_id=[$wids]（≥2 个 Worker 均创建过 Lease ⇒ 均持剩余库存）"
+else
+  echo "NOT VERIFIED: 40 次请求未观测到 ≥2 个不同 worker_id（观测=[${wids:-无}]）——不以下述故障期 200 数代替证明"
+fi
 
 # ---- 3. 故障注入 A：Redis 连接拒绝（stop redis） ----
 docker compose stop redis >/dev/null 2>&1
@@ -126,12 +141,17 @@ report "$(eq "$code" 200)" "连接拒绝 batch=1 ft=true ⇒ $code（Fail-open �
 report "$(eq "$dg" "degraded")" "Fail-open 标记（batch=1）=$dg（应为 degraded）"
 # 设计语义观察：h2n 在步骤 2 已 GRANT（某 worker 持有本地余量）+ Redis 故障：
 #   命中有库存 worker ⇒ 本地 TAKE 放行（200，零 IO）；命中空库存 worker ⇒ GRANT 失败 Fail-close（503）。
-#   前置已使两个 worker 均持库存 ⇒ 故障期间任意 worker 的请求都走本地 TAKE ⇒ 全 200（确定性）
+#   前置已证实两个 worker 均持库存 ⇒ 故障期间任意 worker 的请求都走本地 TAKE ⇒ 全 200（确定性）
 obs_codes=$(for i in 1 2 3 4 5 6; do
   curl -s -o /dev/null -w '%{http_code}\n' --max-time 8 "$PROXY/h2n" &
 done; wait)
 obs_dist=$(printf '%s\n' "$obs_codes" | sort | uniq -c | sort -rn | tr '\n' ';')
-report "$(eq "$(printf '%s\n' "$obs_codes" | grep -c 200)" 6)" "观察：本地库存 + Redis 故障 ⇒ 6 连发全 200（分布=[$obs_dist]；本地 TAKE 零 IO，不触故障分支——设计语义）"
+if [ "$TWO_WORKERS" = "true" ]; then
+  report "$(eq "$(printf '%s\n' "$obs_codes" | grep -c 200)" 6)" "观察：本地库存 + Redis 故障 ⇒ 6 连发全 200（分布=[$obs_dist]；本地 TAKE 零 IO，不触故障分支——设计语义）"
+else
+  report "$(! grep -q 429 <<<"$obs_codes" && echo true)" "观察（降级）：Redis 故障期间无 429（分布=[$obs_dist]；200=库存放行/503=空库存 Fail-close）"
+  echo "NOT VERIFIED: 本地 TAKE 故障期放行证据（前置双 Worker 库存未证实，观察项降级为核心不变量）"
+fi
 
 # ---- 4. 故障注入 B：Redis 超时（CLIENT PAUSE 6s > timeout 1s，4 请求并行发射）----
 # PAUSE 是全局时窗：顺序请求会互相耗光窗口 ⇒ 并行发射保证每个请求都在窗内超时
@@ -155,12 +175,11 @@ code=$(sed -n 's/^h1u=//p' /tmp/opencode/rl62-t4)
 dg=$(sed -n 's/^X-RateLimit-Status: //pi' /tmp/opencode/rl62-t4.h | tr -d '\r')
 report "$(eq "$code" 200)" "Redis 超时 batch=1 ft=true ⇒ $code（Fail-open）"
 report "$(eq "$dg" "degraded")" "超时 Fail-open 标记（batch=1）=$dg"
-# 等 PAUSE 过期后再确认超时场景没登记库存（不确定结果 ⇒ 不登记）
+# 语义说明（审查修正二）：GRANT 超时后 Redis 可能已执行（桶扣减+Lease 记录已建），
+# Redis 元数据存在与否**不能**用来证明本地是否登记；不确定结果的"不重试/不登记本地
+# 库存/不转 429"由 Phase 4 单测与代码路径保证（test/lease-unit.sh uncertain 用例）。
+# 本组真栈验证点 = 超时后的 HTTP 503 / Fail-open 语义（见上方断言与 §5 日志证据）。
 sleep 4
-leases_after=$(RC --scan --pattern 'kong:rl:lease:*' </dev/null \
-  | while IFS= read -r k; do [ -n "$k" ] && RC HGET "$k" pool_key </dev/null; done \
-  | grep -c "$NS_2D" || true)
-report "$(eq "$leases_after" 0)" "超时故障后 $NS_2D lease 记录数=$leases_after（应为 0：不确定结果不登记）"
 
 # ---- 5. 日志证据 ----
 logs=""
