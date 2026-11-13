@@ -3,23 +3,20 @@
 -- access 阶段：判定是否放行。放在 access 意味着超限请求根本不会打到上游。
 -- ============================================================
 local algorithm = require "kong.plugins.rate-limit-advanced.lib.algorithm"
-local store = require "kong.plugins.rate-limit-advanced.lib.store"
 
 local _M = {
   -- 高于大部分业务插件，保证限流先于业务逻辑执行（key-auth 是 1250，这里低于它，
   -- 意味着先认证再限流，可以按 consumer 维度计数）
   PRIORITY = 1002,
-  VERSION = "0.1.0",
+  VERSION = "0.2.0",
 }
 
--- D5：启动自检——shared dict 缺失时本地库存会静默降级为 worker 私有表，
--- 精度下降但功能不中断。必须在启动期把这件事喊出来（P1-8）。
+-- V1 Lease 模型（Phase 6）：库存 = Worker 私有 Lua table（lease.lua），
+-- 不依赖 shared dict；本地 TAKE 零 IO，Redis 故障语义只由 GRANT 路径决定
+-- （Fail-close/Fail-open 分支保持 batch=1 时代原样，见 access 内 nil-decision 分支）。
+-- Design D2：shared-dict 降级告警随 store.lua 废弃而删除（store 本体 Phase 8 清理）。
 function _M:init_worker()
-  local backend = store.backend()
-  if backend ~= "shared_dict" then
-    kong.log.warn("rate-limit-advanced: lua_shared_dict kong_rl 不可用，本地库存降级为 ",
-                  backend, "（每 worker 独立库存，精度下降）")
-  end
+  kong.log.notice("rate-limit-advanced: V1 lease mode (worker-private table, no shared dict)")
 end
 
 function _M:access(conf)
