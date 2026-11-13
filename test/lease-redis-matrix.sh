@@ -141,9 +141,18 @@ TCONS=$(awk -v t="$TSA" -v n0="$NOW0" -v n1="$NOW1" 'BEGIN{print (t>=n0-1 && t<=
 echo "DBG-tcons: TSA=[$TSA] NOW0=[$NOW0] NOW1=[$NOW1] cond=$TCONS" >&2
 report "$([ "$TCONS" = "1" ] && echo true)" \
   "不足分支：tokens/ts 与统一语义一致（ts=$TSA ∈ [now0−1, now1+1]；tokens=$TA refill 后 <1 且已写回）"
-report "$(awk -v t="$TA" -v n0="$NOW0" -v n1="$NOW1" 'BEGIN{print (t>=n0-1 && t<=n1+1) ? 1 : 0}')" \
-report "$([ "$(echo "$R" | head -1)" = "2" ] && [ "$TA" = "0.5" ] && awk -v w="$W" 'BEGIN{exit !((w>31.2 && w<31.3))}' && echo true)" \
-  "wait 契约：部分授予 granted=2、tokens=0.5、wait=$((31.25))s（按扣减后 tokens 计算）"
+fresh "kong:rl:lease:mw"
+$RC HSET "$B" tokens 2.5 >/dev/null
+RW=$(grant 5 60000 mw "kong:rl:{p3g:m}" 0.016 100 120000 "kong:rl:lease:mw")
+WGRANT=$(echo "$RW" | sed -n '1p')
+WTOKENS=$(echo "$RW" | sed -n '2p')
+WWAIT=$(echo "$RW" | sed -n '3p')
+WOK=$(awk -v g="$WGRANT" -v t="$WTOKENS" -v w="$WWAIT" 'BEGIN{
+  gr=(g==2); tk=(t>=0.5 && t<=0.5); wt=(w>=31.2 && w<=31.3)
+  print (gr && tk && wt) ? 1 : 0}')
+echo "DBG-wait: RW=[$RW] cond=$WOK" >&2
+report "$([ "$WOK" = "1" ] && echo true)" \
+  "wait 契约：部分授予 granted=2、tokens≈0.5、wait≈31.25s（按扣减后 tokens 计算，真值=$WWAIT）"
 
 echo "===== RETURN_LEASE ====="
 fresh "kong:rl:lease:mr1"
@@ -218,6 +227,37 @@ report "$(echo "$R" | grep -q 'INJECTED_FAILURE' && [ "$($RC HGET "kong:rl:lease
 R=$(ret 5 "kong:rl:{p3g:m}" 120000 0.016 100 "kong:rl:lease:mi")
 report "$(echo "$R" | grep -q 'ALREADY_RETURNED' && [ "$(tokens)" = "$T0" ] && echo true)" \
   "注入后同参重试：ALREADY_RETURNED、桶不重复增加（差额计损失）"
+
+echo "===== TTL 参数非法值（P1-2：有限/正整数/<2^53）====="
+fresh "kong:rl:lease:mt1"
+T0=$(tokens)
+R=$(grant 5 0 mt1 "kong:rl:{p3g:m}" 0.016 100 120000 "kong:rl:lease:mt1")
+report "$(echo "$R" | grep -q 'INVALID_ARGUMENT lease_ttl_ms: 0' && [ "$(tokens)" = "$T0" ] && echo true)" "lease_ttl_ms=0 ⇒ 拒绝零写入"
+R=$(grant 5 -1 mt1 "kong:rl:{p3g:m}" 0.016 100 120000 "kong:rl:lease:mt1")
+report "$(echo "$R" | grep -q 'INVALID_ARGUMENT lease_ttl_ms: -1' && echo true)" "lease_ttl_ms=-1 ⇒ 拒绝"
+R=$(grant 5 1.5 mt1 "kong:rl:{p3g:m}" 0.016 100 120000 "kong:rl:lease:mt1")
+report "$(echo "$R" | grep -q 'INVALID_ARGUMENT lease_ttl_ms: 1.5' && echo true)" "lease_ttl_ms=1.5 ⇒ 拒绝"
+R=$(grant 5 100000000000000000000 mt1 "kong:rl:{p3g:m}" 0.016 100 120000 "kong:rl:lease:mt1")
+report "$(echo "$R" | grep -q 'INVALID_ARGUMENT lease_ttl_ms: 100000000000000000000' && echo true)" "lease_ttl_ms=1e20 ⇒ 拒绝（>=2^53）"
+R=$(grant 5 60000 mt1 "kong:rl:{p3g:m}" 0.016 100 0 "kong:rl:lease:mt1")
+report "$(echo "$R" | grep -q 'INVALID_ARGUMENT bucket_ttl_ms: 0' && echo true)" "GRANT bucket_ttl_ms=0 ⇒ 拒绝"
+R=$(grant 5 60000 mt1 "kong:rl:{p3g:m}" 0.016 100 100000000000000000000 "kong:rl:lease:mt1")
+report "$(echo "$R" | grep -q 'INVALID_ARGUMENT bucket_ttl_ms: 100000000000000000000' && echo true)" "GRANT bucket_ttl_ms=1e20 ⇒ 拒绝"
+fresh "kong:rl:lease:mt2"
+grant 5 60000 mt2 "kong:rl:{p3g:m}" 0.016 100 120000 "kong:rl:lease:mt2" >/dev/null
+T0=$(tokens)
+R=$(ret 2 "kong:rl:{p3g:m}" 0 0.016 100 "kong:rl:lease:mt2")
+report "$(echo "$R" | grep -q 'INVALID_ARGUMENT bucket_ttl_ms: 0' && [ "$(tokens)" = "$T0" ] && [ "$($RC HGET "kong:rl:lease:mt2" status)" = "OPEN" ] && echo true)" \
+  "RETURN bucket_ttl_ms=0 ⇒ 拒绝零写入（Lease 仍 OPEN）"
+R=$(ret 2 "kong:rl:{p3g:m}" -1 0.016 100 "kong:rl:lease:mt2")
+report "$(echo "$R" | grep -q 'INVALID_ARGUMENT bucket_ttl_ms: -1' && [ "$($RC HGET "kong:rl:lease:mt2" status)" = "OPEN" ] && echo true)" \
+  "RETURN bucket_ttl_ms=-1 ⇒ 拒绝（Lease 仍 OPEN，未标 RETURNED）"
+R=$(ret 2 "kong:rl:{p3g:m}" 1.5 0.016 100 "kong:rl:lease:mt2")
+report "$(echo "$R" | grep -q 'INVALID_ARGUMENT bucket_ttl_ms: 1.5' && [ "$($RC HGET "kong:rl:lease:mt2" status)" = "OPEN" ] && echo true)" \
+  "RETURN bucket_ttl_ms=1.5 ⇒ 拒绝"
+R=$(ret 2 "kong:rl:{p3g:m}" 100000000000000000000 0.016 100 "kong:rl:lease:mt2")
+report "$(echo "$R" | grep -q 'INVALID_ARGUMENT bucket_ttl_ms: 100000000000000000000' && [ "$($RC HGET "kong:rl:lease:mt2" status)" = "OPEN" ] && echo true)" \
+  "RETURN bucket_ttl_ms=1e20 ⇒ 拒绝（无'已标 RETURNED 但后续失败'中间态）"
 
 echo "===== refill 测试向量（四脚本同状态同向量）====="
 # 向量：预置 tokens=100、ts=now−10、rate=1/s、capacity=1000 ⇒ refill=110

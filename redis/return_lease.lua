@@ -26,6 +26,9 @@ local bkey  = KEYS[2]
 local function is_finite_num(v)
   return v ~= nil and v == v and v ~= math.huge and v ~= -math.huge
 end
+local function is_valid_ttl(v)
+  return is_finite_num(v) and v == math.floor(v) and v >= 1 and v < 2^53
+end
 local requested = tonumber(ARGV[1])
 local pool_key  = ARGV[2]
 local bucket_ttl_ms = tonumber(ARGV[3])
@@ -39,8 +42,8 @@ end
 if not pool_key or pool_key == '' then
   return redis.error_reply('INVALID_ARGUMENT pool_key')
 end
-if not bucket_ttl_ms or bucket_ttl_ms ~= math.floor(bucket_ttl_ms) or bucket_ttl_ms < 1 then
-  return redis.error_reply('INVALID_ARGUMENT bucket_ttl_ms')
+if not is_valid_ttl(bucket_ttl_ms) then
+  return redis.error_reply('INVALID_ARGUMENT bucket_ttl_ms: ' .. tostring(ARGV[3]))
 end
 if not is_finite_num(rate) or rate <= 0
    or not is_finite_num(capacity) or capacity <= 0 or capacity >= 2^53 then

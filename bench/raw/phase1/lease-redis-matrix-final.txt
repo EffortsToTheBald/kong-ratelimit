@@ -1,0 +1,51 @@
+[32mPASS: 正常授予：granted=5、桶=95（100−5）、OPEN 记录[0m
+[32mPASS: Lease TTL：PTTL=59567 ∈ [55000,60000]（传入 60000，断言前执行延迟合法）[0m
+[32mPASS: Lease 记录字段：pool_key/lease_id 正确[0m
+[32mPASS: 同 ID 二次 GRANT ⇒ LEASE_EXISTS（零写入）[0m
+[32mPASS: 部分授予：floor(2.5)=2[0m
+[32mPASS: tokens<1 ⇒ granted=0、不创建记录、桶不变[0m
+[32mPASS: batch=0 ⇒ INVALID_ARGUMENT 零写入[0m
+[32mPASS: batch=1.5 ⇒ INVALID_ARGUMENT[0m
+[32mPASS: rate=-1 ⇒ INVALID_ARGUMENT[0m
+[32mPASS: 桶字段非法 ⇒ INVALID_ARGUMENT 零写入[0m
+[32mPASS: tokens=-5（负数）⇒ 拒绝且数据不变（不静默修正）[0m
+[32mPASS: tokens=200 > capacity=100 ⇒ 拒绝且数据不变[0m
+[32mPASS: ts=-1（负数）⇒ 拒绝且数据不变[0m
+[32mPASS: RETURN tokens=-5 ⇒ 拒绝且数据不变（与 GRANT 规则一致）[0m
+[32mPASS: RETURN tokens=200 > capacity ⇒ 拒绝且数据不变[0m
+[32mPASS: RETURN ts=-1 ⇒ 拒绝且数据不变[0m
+[32mPASS: granted=-5 ⇒ INVALID_LEASE_STATE granted[0m
+[32mPASS: granted=0 ⇒ INVALID_LEASE_STATE granted[0m
+[32mPASS: 不足分支：granted=0、不创建 Lease[0m
+[32mPASS: 不足分支：ts 只前进（1794550880.2287 >= 1794550874）[0m
+[32mPASS: 不足分支：桶 TTL 写回（PTTL=119589 ≈ 120000）[0m
+[32mPASS: 不足分支：tokens/ts 与统一语义一致（ts=1794550880.2287 ∈ [now0−1, now1+1]；tokens=0.5996594543457 refill 后 <1 且已写回）[0m
+[32mPASS: wait 契约：部分授予 granted=2、tokens≈0.5、wait≈31.25s（按扣减后 tokens 计算，真值=31.25）[0m
+[32mPASS: 正常归还：applied=5、桶 95→100、OPEN→RETURNED、return_requested=5[0m
+[32mPASS: 同参重复 ⇒ ALREADY_RETURNED 桶不变[0m
+[32mPASS: 同 ID 异参 ⇒ RETURN_CONFLICT[0m
+[32mPASS: requested=0 ⇒ 跳过桶更新、OPEN→RETURNED（账目闭合）[0m
+[32mPASS: requested>granted ⇒ INVALID_REQUESTED 零写入[0m
+[32mPASS: pool_key 不匹配 ⇒ POOL_MISMATCH 零写入[0m
+[32mPASS: Lease 过期 ⇒ LEASE_NOT_FOUND（不得推测归还）[0m
+[32mPASS: Bucket 不存在 ⇒ BUCKET_NOT_FOUND、不创建新桶、零写入[0m
+[32mPASS: requested=1.5（小数）⇒ INVALID_ARGUMENT 零写入[0m
+[32mPASS: 并发两 RETURN：一成功（applied=5）一 ALREADY_RETURNED、桶只加一次[0m
+[32mPASS: 提交点后失败注入：Lease 已 RETURNED、桶未加（幂等提交点先行实证）[0m
+[32mPASS: 注入后同参重试：ALREADY_RETURNED、桶不重复增加（差额计损失）[0m
+[32mPASS: lease_ttl_ms=0 ⇒ 拒绝零写入[0m
+[32mPASS: lease_ttl_ms=-1 ⇒ 拒绝[0m
+[32mPASS: lease_ttl_ms=1.5 ⇒ 拒绝[0m
+[32mPASS: lease_ttl_ms=1e20 ⇒ 拒绝（>=2^53）[0m
+[32mPASS: GRANT bucket_ttl_ms=0 ⇒ 拒绝[0m
+[32mPASS: GRANT bucket_ttl_ms=1e20 ⇒ 拒绝[0m
+[32mPASS: RETURN bucket_ttl_ms=0 ⇒ 拒绝零写入（Lease 仍 OPEN）[0m
+[32mPASS: RETURN bucket_ttl_ms=-1 ⇒ 拒绝（Lease 仍 OPEN，未标 RETURNED）[0m
+[32mPASS: RETURN bucket_ttl_ms=1.5 ⇒ 拒绝[0m
+[32mPASS: RETURN bucket_ttl_ms=1e20 ⇒ 拒绝（无'已标 RETURNED 但后续失败'中间态）[0m
+[32mPASS: refill 向量 GRANT_LEASE(batch=1，扣 granted=1)：tokens=109.99026799202 ≈ 109（rate×10s 补充，区间含 exec 间隔）[0m
+[32mPASS: refill 向量 RETURN_LEASE(requested=1，加 applied=1)：tokens=111.67679905891 ≈ 111（rate×10s 补充，区间含 exec 间隔）[0m
+[32mPASS: refill 向量 TOKEN_BUCKET(want=1，扣 granted=1)：tokens=109.31017708778 ≈ 109（rate×10s 补充，区间含 exec 间隔）[0m
+[32mPASS: refill 向量 GRANT_MULTI(batch=1，扣 granted=1)：tokens=109.89400696754 ≈ 109（rate×10s 补充，区间含 exec 间隔）[0m
+[32mPASS: refill 一致性：四脚本归一化最大偏差 <3s（109.99026799202/111.67679905891/109.31017708778/109.89400696754）[0m
+===== 汇总: PASS=50 FAIL=0 =====

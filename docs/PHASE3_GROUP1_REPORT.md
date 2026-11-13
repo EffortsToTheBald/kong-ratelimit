@@ -82,6 +82,31 @@
 
 ## 7. Phase 3 第一组审查修复（2026-11-13，第二轮）
 
+> 审查（基于 d30592b）结论：FAIL——3 项 P1 待修。
+
+| 问题 | 修复 | 测试 |
+|---|---|---|
+| **P1-1** GRANT_LEASE wait 在扣减前计算（与接口契约不符） | 顺序修正：granted 判定 → tokens 扣减 → wait=按扣减后 tokens 计算 → 写回 → 返回；双源同步 | 真集成：tokens=2.5/batch=5/rate=0.016 ⇒ 从 Redis 返回值分别解析 granted=2、tokens≈0.5、wait≈31.25（误差区间断言，非字符串比对） |
+| **P1-2** TTL 参数校验缺有限性与 2^53 上界（inf/1e20 可穿透 floor 比较） | `is_valid_ttl`：有限数值+正整数+≥1+<2^53；统一应用于 GRANT_LEASE lease_ttl_ms/bucket_ttl_ms 与 RETURN_LEASE bucket_ttl_ms；全部在任何写之前 | 真集成 11 断言：0/−1/1.5/1e20 × 三参数；非法 ⇒ INVALID_ARGUMENT 零写入（桶未扣/Lease 未建/Lease 仍 OPEN 无"已标 RETURNED 后续失败"中间态） |
+| **P1-3** 矩阵 wait 测试段缺陷（report 参数/续行/R 未重新执行） | 测试段重写：独立 fresh+HSET 预置、真实部分授予、从返回值 sed 解析三字段、awk 数值断言（granted==2、tokens∈[0.5,0.5]、wait∈[31.2,31.3]） | 真集成 PASS（真值 wait=31.25） |
+
+**Design 同步**：TTL 校验规则（`is_valid_ttl` 语义）已记录于 D4（refill 持久化语义段）。
+
+### 第二轮修复后测试结果
+
+- `test/lease-redis-matrix.sh`：**PASS=50 FAIL=0**（矩阵 39 + wait 契约 1 + TTL 非法 11 − 原有重叠）
+- `test/evalsha-unit.sh`（Phase 2 回归）：**PASS 8/8**
+- 双源 diff ×4：**PASS**
+- 原始输出：`bench/raw/phase1/lease-redis-matrix-final.txt` / `-full.txt`
+- quota/dims/rules：**NOT RUN**（Phase 6 集成阶段强制重跑）
+
+### 第二轮实现期发现（测试脚本自身）
+
+1. 1e20 断言最初 grep '1e+20' 与 Redis 错误串不符（错误串回显原始 ARGV 字符串）——断言已改为精确原串；**脚本拒绝行为本身正确**（真集成确认 INVALID_ARGUMENT 返回）。
+2. 编辑过程残留孤儿行一次——已清理（矩阵脚本最终版经 `bash -n` 与完整执行验证）。
+
+## 8. Git Commit
+
 > 审查（基于 d53f3f0）结论：核心原子性与幂等提交顺序符合设计，4 项需修复/补验。
 
 | 问题 | 修复 | 测试 |
@@ -112,7 +137,8 @@
 ## 8. Git Commit
 
 - 第一组：`feat: add redis lease grant and return scripts`
-- 本轮修复：`fix: phase3 group1 review fixes (refill persistence, validation, wait contract)`
+- 第一轮修复：`fix: phase3 group1 review fixes (refill persistence, validation, wait contract)`
+- 第二轮修复：`fix: phase3 group1 round2 (wait order, ttl validation bounds, wait test rewrite)`
 
 ## 9. 尚未解决的问题
 

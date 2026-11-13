@@ -188,12 +188,16 @@ local function is_finite_num(v)
   return v ~= nil and v == v and v ~= math.huge and v ~= -math.huge
 end
 
+local function is_valid_ttl(v)
+  return is_finite_num(v) and v == math.floor(v) and v >= 1 and v < 2^53
+end
+
 -- 阶段 0：参数校验（零写入）
 if not batch or batch ~= math.floor(batch) or batch < 1 or batch >= 2^53 then
   return redis.error_reply('INVALID_ARGUMENT batch')
 end
-if not lease_ttl_ms or lease_ttl_ms ~= math.floor(lease_ttl_ms) or lease_ttl_ms < 1 then
-  return redis.error_reply('INVALID_ARGUMENT lease_ttl_ms')
+if not is_valid_ttl(lease_ttl_ms) then
+  return redis.error_reply('INVALID_ARGUMENT lease_ttl_ms: ' .. tostring(ARGV[2]))
 end
 if not lease_id or lease_id == '' or not pool_key or pool_key == '' then
   return redis.error_reply('INVALID_ARGUMENT lease_id/pool_key')
@@ -202,8 +206,8 @@ if not is_finite_num(rate) or rate <= 0
    or not is_finite_num(capacity) or capacity <= 0 or capacity >= 2^53 then
   return redis.error_reply('INVALID_ARGUMENT rate/capacity')
 end
-if not bucket_ttl_ms or bucket_ttl_ms ~= math.floor(bucket_ttl_ms) or bucket_ttl_ms < 1 then
-  return redis.error_reply('INVALID_ARGUMENT bucket_ttl_ms')
+if not is_valid_ttl(bucket_ttl_ms) then
+  return redis.error_reply('INVALID_ARGUMENT bucket_ttl_ms: ' .. tostring(ARGV[7]))
 end
 
 -- 阶段 1：只读校验（零写入）——含桶状态数值合法性（P1-2）
@@ -248,14 +252,15 @@ end
 -- P0-4：ts 只前进不后退（now<=ts 时不补充、不改小 ts）
 
 local granted = math.min(batch, math.floor(tokens))
--- wait 返回契约（与 TOKEN_BUCKET 一致）：按扣减后 tokens 计算
+-- 顺序（审查 P1-1）：1) granted 判定 2) 扣减 3) wait 按扣减后 tokens 计算
+--   4) 写回 Bucket 5) 返回 granted/tokens/wait
+tokens = tokens - granted
 local wait = 0
 if rate > 0 then
   wait = math.max(0, (1 - tokens) / rate)
 end
 
 -- 桶状态写回：授予与不足分支统一（与 TOKEN_BUCKET 一致，审查 P1-1 裁决）
-tokens = tokens - granted
 if ts == nil or now > ts then ts = now end
 redis.call('HSET', bkey, 'tokens', tostring(tokens), 'ts', tostring(ts))
 redis.call('PEXPIRE', bkey, bucket_ttl_ms)
@@ -290,6 +295,9 @@ local bkey  = KEYS[2]
 local function is_finite_num(v)
   return v ~= nil and v == v and v ~= math.huge and v ~= -math.huge
 end
+local function is_valid_ttl(v)
+  return is_finite_num(v) and v == math.floor(v) and v >= 1 and v < 2^53
+end
 local requested = tonumber(ARGV[1])
 local pool_key  = ARGV[2]
 local bucket_ttl_ms = tonumber(ARGV[3])
@@ -303,8 +311,8 @@ end
 if not pool_key or pool_key == '' then
   return redis.error_reply('INVALID_ARGUMENT pool_key')
 end
-if not bucket_ttl_ms or bucket_ttl_ms ~= math.floor(bucket_ttl_ms) or bucket_ttl_ms < 1 then
-  return redis.error_reply('INVALID_ARGUMENT bucket_ttl_ms')
+if not is_valid_ttl(bucket_ttl_ms) then
+  return redis.error_reply('INVALID_ARGUMENT bucket_ttl_ms: ' .. tostring(ARGV[3]))
 end
 if not is_finite_num(rate) or rate <= 0
    or not is_finite_num(capacity) or capacity <= 0 or capacity >= 2^53 then

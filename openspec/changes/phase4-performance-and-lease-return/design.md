@@ -103,7 +103,7 @@ ACTIVE ──(空闲阈值 / max_lifetime 到期)──► CLOSING ──(RETURN
 
 ### D4. GRANT_LEASE Lua（桶扣减与 Lease 创建同脚本原子）
 
-**refill 持久化语义（Phase 3 第一组审查裁决，四脚本对照）**：TOKEN_BUCKET **无条件写回** refill 状态（granted=0 时也 HSET+PEXPIRE）；GRANT_MULTI 因多键全或无语义不足时不写（结构差异，非不一致）；GRANT_LEASE 单键与 TOKEN_BUCKET 同构 ⇒ **不足分支同样写回 refill 后 tokens/ts 并更新桶 TTL**；RETURN_LEASE requested=0 时跳过桶更新（Spec 规定，账目闭合由 RETURNED 标记承载）。wait 契约统一：与 TOKEN_BUCKET 一致，按**扣减后** tokens 计算（部分授予时 wait>0）。桶状态数值合法性：tokens∈[0,capacity]、ts≥0、有限数值、granted 正整数——非法返回明确错误码、不得静默修正、数据不变（GRANT_LEASE/RETURN_LEASE 实施；TOKEN_BUCKET/GRANT_MULTI 为历史已验收路径，差异记录不重构）。
+**refill 持久化语义（Phase 3 第一组审查裁决，四脚本对照）**：TOKEN_BUCKET **无条件写回** refill 状态（granted=0 时也 HSET+PEXPIRE）；GRANT_MULTI 因多键全或无语义不足时不写（结构差异，非不一致）；GRANT_LEASE 单键与 TOKEN_BUCKET 同构 ⇒ **不足分支同样写回 refill 后 tokens/ts 并更新桶 TTL**；RETURN_LEASE requested=0 时跳过桶更新（Spec 规定，账目闭合由 RETURNED 标记承载）。wait 契约统一：与 TOKEN_BUCKET 一致，按**扣减后** tokens 计算（部分授予时 wait>0）。桶状态数值合法性：tokens∈[0,capacity]、ts≥0、有限数值、granted 正整数——非法返回明确错误码、不得静默修正、数据不变（GRANT_LEASE/RETURN_LEASE 实施；TOKEN_BUCKET/GRANT_MULTI 为历史已验收路径，差异记录不重构）。**TTL 参数合法性（P1-2 第二轮）**：lease_ttl_ms 与 bucket_ttl_ms 统一规则 = 有限数值 + 正整数 + ≥1 且 <2^53（`is_valid_ttl`）——防 inf 通过 floor 比较（inf==inf 恒真）、1e20 精度丢失（>2^53 后 floor 失真）与超大毫秒值；GRANT_LEASE 两处 TTL 与 RETURN_LEASE 一处全部在任何写之前校验，非法 ⇒ INVALID_ARGUMENT 零写入（无"桶已扣 Lease 未建"/"已标 RETURNED 后续失败"中间态）。
 
 ```
 KEYS[1] = 桶键      KEYS[2] = kong:rl:lease:{lease_id}
