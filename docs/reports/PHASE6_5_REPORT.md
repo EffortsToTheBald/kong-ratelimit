@@ -59,7 +59,7 @@
 
 - **P1（确认库存期间 Redis 暂停）**：req1 GRANT（rem=9）→ `CLIENT PAUSE 4000` → req2-10 全部 200、remaining 8..0（**确认库存仍可本地 TAKE，与 Redis 无关**）→ req11（池空，新 GRANT 超时）⇒ **503**（既有故障分支，非 429）→ 恢复后 200 rem=9（正常新 GRANT L2）
 - **场景 A（Redis 未执行）**：`CLIENT PAUSE 5000 WRITE`（EVALSHA 拦截排队、管理命令可用）→ 0.5s `CLIENT KILL`（先于 Kong 1s 超时）⇒ 请求 503、**记录数=0**（确定性未执行，命令随连接缓冲丢弃）→ 恢复后 200 rem=9（无幻影库存）
-- **场景 B（已执行、响应丢失）**：SIGSTOP redis（宿主侧信号，见 §4 环境问题）→ 请求 ⇒ Kong 1s 超时 503 关闭连接 → SIGCONT ⇒ Redis 消费内核缓冲区中已到达的 EVALSHA ⇒ **真实执行（记录恰 1，响应丢失）** → 同 Worker 后续请求 200 **rem=9** 且记录 +1 ⇒ **不确定结果未登记本地库存、未重试（恰 1 条记录）、按正常流程重新申请**
+- **场景 B（已执行、响应丢失）**——同 Worker 归属链路实证（v2 修正）：fd5 keepalive 客户端连接提前建立且唯一（ESTAB 客户端连接数=1）→ inode（`/proc/net/tcp`）→ worker fd → **Worker PID 唯一映射**（如 inode=`44243484` → PID=`15937`）→ **SIGSTOP redis**（宿主侧信号）→ **超时请求经同一 fd5 发出** ⇒ Kong 1s 超时 503（不确定进故障分支，非 429）→ 复核 fd5 存活且归属 PID 不变（503 未关闭客户端连接）→ **SIGCONT** ⇒ Redis 消费内核缓冲中已到达的 EVALSHA ⇒ **真实执行（记录恰 1，响应丢失）** → **同一 fd5 发送后续请求**（Worker PID 复核一致）⇒ 200 **rem=9** 且记录 +1 ⇒ **不确定结果未登记本地库存、未重试（恰 1 条记录）、同一 Worker 按正常流程重新申请新 Lease**；归属核对共 3 次（请求前/503 后/后续请求后），inode 与 PID 全程一致 ⇒ 超时请求与后续请求确由同一 Worker 处理（非仅同一 Kong 节点）；若 Kong 在 503 后关闭客户端连接则按验收口径标记 NOT VERIFIED（不降低标准），实测未发生
 - granted=0（明确拒绝⇒429）由 concurrent-lease-e2e 的 300×429 与 6.4 quota b20 覆盖
 - 三种情况（未执行 / 已执行响应丢失 / granted=0）分别有独立断言，未混淆
 
@@ -99,6 +99,7 @@ outstanding(排空后各 Worker 池余量, remaining 头终态=0/429) = 0
   2. PID namespace 内部向 PID 1 发送 SIGSTOP 被内核丢弃（默认处置信号）⇒ 冻结无效——改从宿主机 namespace 外部发信号（`docker inspect` 取宿主 PID）
   3. 宿主机非 root ⇒ kill EPERM → `docker run --pid host --privileged busybox kill`（STOP/CONT 实证 T 状态生效）
   4. `ss` 不可用 → `/proc/net/tcp` inode + fd 匹配
+- **v2 修正记录（场景 B 同 Worker 证据补强）**：初版超时请求经独立 curl、后续请求经另一 fd5 ⇒ 无法证明同一 Worker。修正为共用 fd5 keepalive 连接 + inode→fd→PID 三次核对（请求前/503 后/后续请求后）；503 后连接存活性显式验证（若断开则 NOT VERIFIED，实测未断开）。统计 22 断言（新增：连接唯一性、归属唯一性、503 后存活、归属全程一致）
 - **NOT VERIFIED：无**。观测边界说明（冻结设计所限，非缺口）：Lease 消费量在 Redis 不可见（V1 消费纯本地），consumed 经 HTTP 200 计数 + `X-RateLimit-Remaining` 逐请求核验；CLOSED 为本地语义，Redis 侧记录保持 OPEN，本地 CLOSED 行为经 remaining 序列（0 后跳 9）与新 GRANT 记录间接实证
 
 ## 5. 统计
@@ -108,8 +109,8 @@ outstanding(排空后各 Worker 池余量, remaining 头终态=0/429) = 0
 | concurrent-lease-e2e.sh | PASS 17 / FAIL 0 | 2 次执行均全绿 |
 | lease-exhaustion-e2e.sh | PASS 11 / FAIL 0 | 5 次执行：4 全绿 + 1 次 9/2 偶发（随后 3 连全绿） |
 | worker-crash-e2e.sh | PASS 16 / FAIL 0 | 2 次执行（第 1 次脚本 bug 修复后全绿） |
-| lease-timeout-uncertain-e2e.sh | PASS 18 / FAIL 0 | 2 轮全绿 |
-| **合计（最近一轮）** | **PASS 62 / FAIL 0 / NOT VERIFIED 0** | |
+| lease-timeout-uncertain-e2e.sh | PASS 22 / FAIL 0 / NOT VERIFIED 0 | **v2 修正后连续 4 轮全绿**（修正前 18 断言：超时请求经独立 curl、同 Worker 未证明——证据缺口已补） |
+| **合计（最近一轮）** | **PASS 66 / FAIL 0 / NOT VERIFIED 0** | |
 | NOT RUN | Phase 6.6（组报告与最终 commit） | 未执行 |
 
 所有断言基于真实执行；无未执行项标 PASS。
