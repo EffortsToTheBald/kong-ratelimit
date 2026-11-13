@@ -29,7 +29,8 @@
 - **THEN** EVAL 基线已落盘 `bench/results.md`；复测与基线同参数对照，矩阵维度无缺漏或逐项 NOT RUN
 
 ### Requirement: Lease 模式适用边界
-Worker 本地 Lease 机制仅（ONLY）适用于**单规则 batch>1**（batch 经 auto 解析后 >1）：batch=1 保持既有严格 Redis 路径（每请求一次 Redis、不创建 Lease、语义零变化）；多规则继续使用既有 Redis 原子多键流程（先全检、全过统一扣减、任一不足全不扣、Fail-Closed 语义不变），且不得（MUST NOT）使用本地 Lease；Lease 机制对 batch=1 与多规则必须（MUST）为 no-op（零 Lease 创建、零 RETURN、零相关错误日志）。
+> **V1 范围裁决（2026-11-13）**：V1 **不实现自动归还**——耗尽后本地删除/不再选中，崩溃损失（保守方向，绝不重新发放）；RETURN_LEASE Lua 协议已实现（Phase 3 矩阵 50 项）但 **V1 不接入自动 RETURN 调用**；idle/max_lifetime 归还属 Production TODO。
+Worker 本地 Lease 机制仅（ONLY）适用于**单规则 batch>1**（auto 解析后 >1）；其空闲归还行为（V1 注记）为 Phase 5 恢复项、V1 不实施。batch=1 保持既有严格 Redis 路径；多规则保持既有原子多键流程且不得（MUST NOT）使用本地 Lease；Lease 机制对 batch=1 与多规则必须（MUST）为 no-op（零 Lease 创建、零 RETURN、零相关错误日志）。
 
 #### Scenario: batch=1 严格路径零变化
 - **WHEN** 以 batch=1 配置复跑 Phase 1 基线（450 请求恰 100 放行）与故障双路径
@@ -44,7 +45,8 @@ Worker 本地 Lease 机制仅（ONLY）适用于**单规则 batch>1**（batch �
 - **THEN** 首次请求经 GRANT 创建 Lease（Redis 可见 lease 记录，状态 OPEN），后续请求本地 TAKE 消费，无每请求 Redis 操作
 
 ### Requirement: Lease 所有权与本地状态机
-每个 Lease 必须（MUST）只属于创建它的 Worker（Worker 级 Lua table 持有，不共享、不使用 ngx.shared.DICT 聚合库存）；状态机必须（MUST）为 ACTIVE→CLOSING→CLOSED 单向，禁止 CLOSING 回 ACTIVE、CLOSED 重入消费、同一 Lease 关闭两次。TAKE 必须（MUST）在**不含 yield 点的同一同步片段**内完成查找/检查/递减/更新 last_used_at，remaining 不得（MUST NOT）为负、不得（MUST NOT）有补偿路径。关闭必须（MUST）本地先行——置 CLOSING、从 ACTIVE 集合摘除、快照 remaining 为 requested、置 remaining=0（同一非 yield 片段）——之后才调用 Redis RETURN（允许 yield）。关闭后的 Lease 不得（MUST NOT）被消费。
+> **V1 范围裁决（2026-11-13）**：状态机简化为 **ACTIVE → CLOSED** 单向（耗尽即不可消费、本地删除；无 CLOSING 归还态、无 Redis RETURN 调用——RETURN_LEASE Lua 协议已实现并保留，V1 不接入）。关闭/RETURN 相关 MUST 为 Phase 5 恢复时规范。
+每个 Lease 必须（MUST）只属于创建它的 Worker（Worker 级 Lua table，不共享、不使用 shared.DICT 聚合库存）；状态机必须（MUST）单向，禁止 CLOSED 重入消费；TAKE 必须（MUST）在不含 yield 点的同步片段内完成查找/检查/递减，remaining 不得（MUST NOT）为负、无补偿路径。（Phase 5 恢复时：关闭本地先行——置 CLOSING、摘除、快照 requested、清零——之后才调用 Redis RETURN。）关闭后不得（MUST NOT）消费。
 
 #### Scenario: TAKE 无 yield 且无负库存
 - **WHEN** 请求在活跃 Lease 上 TAKE
@@ -63,7 +65,8 @@ Worker 本地 Lease 机制仅（ONLY）适用于**单规则 batch>1**（batch �
 - **THEN** A 只能消费与关闭 A，B 只能消费与关闭 B；A 崩溃不影响 B 的 Lease 与消费
 
 ### Requirement: Lease 生命周期管理
-每个 Lease 必须（MUST）具备两个关闭条件：idle（now−last_used_at ≥ `lease_return_idle`，默认 10s，0–3600，0=禁用空闲触发）或 age（now−created_at ≥ `lease_max_lifetime`，默认 300s，10–3600，强制轮换不得（MUST NOT）关闭）；`max_lifetime ≥ idle` 必须（MUST）由配置校验强制。本地间隔必须（MUST）使用真正单调时钟（CLOCK_MONOTONIC 语义；不得（MUST NOT）以 ngx.now()/update_time 或 max 包装声称单调、不得（MUST NOT）用 Redis TIME）；环境无可靠实现必须（MUST）停止生命周期实现并报告限制；时钟必须（MUST）可注入。每个 Worker 必须（MUST）运行 1 秒扫描器（仅本 Worker）并具备重入保护（辅助措施）。关闭阈值必须（MUST）取自创建时配置快照，不得（MUST NOT）追溯既有 Lease。
+> **状态：DEFERRED / OUT OF SCOPE FOR V1（2026-11-13 裁决）**——本条为 Phase 5 恢复自动归还时的完整规范；V1 不实施且不得视为已交付能力。V1 生命周期 = ACTIVE 至库存耗尽，耗尽即不可消费，剩余令牌随 Worker 损失（保守方向）。
+每个 Lease 必须（MUST）具备两个关闭条件：idle（单调时钟间隔 ≥ `lease_return_idle`，默认 10s，0–3600，0=禁用）或 age（≥ `lease_max_lifetime`，默认 300s，10–3600，强制轮换）；`max_lifetime ≥ idle` 由配置校验强制。本地间隔必须（MUST）用真正单调时钟（CLOCK_MONOTONIC 语义，不得冒充）；时钟必须（MUST）可注入。每 Worker 必须（MUST）运行 1s 扫描器 + 重入保护。阈值必须（MUST）取创建时快照。
 
 #### Scenario: 空闲超时关闭
 - **WHEN** Lease 的 last_used_at 距今 ≥ lease_return_idle
@@ -101,7 +104,8 @@ Lease 授予必须（MUST）由单个 Redis Lua 脚本原子完成：参数校�
 - **THEN** 返回 LEASE_EXISTS 明确错误，不覆盖不幂等重放，进入故障分支
 
 ### Requirement: RETURN 写入顺序与幂等提交点
-RETURN 必须（MUST）由单个 Redis Lua 脚本完成，写顺序必须（MUST）为**先提交 RETURNED 幂等标记（含 return_requested 字段记录首次归还量），后一次 HSET 写入完整 Bucket 状态**（refill→+requested→capacity 封顶；requested=0 仍完成标记跳过桶更新）——标记是幂等提交点：标记成功后任何桶更新失败 ⇒ 重试得 ALREADY_RETURNED 不再加桶（损失允许）；"先加桶后标记"必须（MUST）禁止（Redis Lua 运行时错误不回滚 ⇒ 会产生桶已加而 Lease 仍 OPEN 的重复归还风险）。返回 requested/applied/discarded（applied+discarded=requested，0≤applied≤requested）；封顶丢弃计丢失，不得（MUST NOT）因封顶恢复 OPEN；同 lease_id 的桶库存增加次数必须（MUST）≤1。
+> **V1 边界（2026-11-13）**：Lua 协议已实现（Phase 3 矩阵 50 项验证）；V1 请求路径不接入自动 RETURN 调用；恢复时直接使用本协议。
+RETURN 必须（MUST）由单个 Redis Lua 脚本完成，写顺序必须（MUST）为**先提交 RETURNED 幂等标记（含 return_requested）后一次 HSET 完整 Bucket 状态**（refill→+requested→capacity 封顶；requested=0 仍完成标记）——标记为幂等提交点：标记后桶更新失败 ⇒ 重试得 ALREADY_RETURNED 不再加桶（损失允许）；"先加桶后标记"必须（MUST）禁止。返回 requested/applied/discarded（applied+discarded=requested，0≤applied≤requested）；封顶丢弃计丢失，不得（MUST NOT）因封顶恢复 OPEN；同 lease_id 桶增加次数必须（MUST）≤1。
 
 #### Scenario: 标记后桶更新失败 ⇒ 重试不重复归还
 - **WHEN** 脚本在写入 RETURNED 标记后、Bucket HSET 前发生异常，客户端以原参数重试
@@ -116,7 +120,8 @@ RETURN 必须（MUST）由单个 Redis Lua 脚本完成，写顺序必须（MUST
 - **THEN** 不修改桶，状态仍 OPEN→RETURNED（账目闭合）
 
 ### Requirement: RETURN 校验与错误码语义
-RETURN 的全部校验必须（MUST）先于任何写且失败零写入：记录不存在 ⇒ LEASE_NOT_FOUND（不得（MUST NOT）加桶）；status=RETURNED ⇒ 同 requested 得 ALREADY_RETURNED、不同 requested 得 RETURN_CONFLICT（不得（MUST NOT）视为相同重试）；非 OPEN ⇒ INVALID_LEASE_STATE；pool_key 不匹配 ⇒ POOL_MISMATCH；requested > granted ⇒ INVALID_REQUESTED；Bucket 不存在 ⇒ BUCKET_NOT_FOUND 拒绝（不得（MUST NOT）在新 Bucket 补偿旧 Lease）；参数非法 ⇒ INVALID_ARGUMENT。结果不明确（超时/连接中断）⇒ 仅原 lease_id + 原 requested 有限重试（总计 ≤3 次尝试；明确错误不重试），达上限允许损失；禁止换 ID 重试、禁止把 LEASE_NOT_FOUND 当成功。
+> **V1 边界**：Lua 协议已实现（Phase 3 验证）；V1 请求路径不接入自动 RETURN 调用。
+RETURN 的全部校验必须（MUST）先于任何写且失败零写入：记录不存在 ⇒ LEASE_NOT_FOUND（不得（MUST NOT）加桶）；status=RETURNED ⇒ 同 requested 得 ALREADY_RETURNED、不同得 RETURN_CONFLICT；非 OPEN ⇒ INVALID_LEASE_STATE；pool_key 不匹配 ⇒ POOL_MISMATCH；requested > granted ⇒ INVALID_REQUESTED；Bucket 不存在 ⇒ BUCKET_NOT_FOUND（不得（MUST NOT）在新 Bucket 补偿）；参数非法 ⇒ INVALID_ARGUMENT。结果不明确 ⇒ 仅原 lease_id + 原 requested 有限重试（总计 ≤3 次；明确错误不重试），达上限允许损失；禁止换 ID 重试、禁止把 LEASE_NOT_FOUND 当成功。
 
 #### Scenario: 同 ID 不同 requested ⇒ RETURN_CONFLICT
 - **WHEN** Lease 已 RETURNED（return_requested=5）后以 requested=3 再次提交
@@ -167,6 +172,7 @@ RETURN 的全部校验必须（MUST）先于任何写且失败零写入：记录
 - **THEN** 停止重试，库存损失，日志 outcome=uncertain；参数/状态类明确错误不进入重试
 
 ### Requirement: 配置变更隔离与账目边界
+> **V1 边界（2026-11-13）**：V1 无自动 RETURN ⇒ return_requested/applied/discarded 恒为 0，未消费令牌全部计入 lost（保守损失）；RETURN 相关计数口径在恢复自动归还时生效。
 `pool_key` 必须（MUST）包含配置版本（复用既有策略指纹）：配置变更产生新 pool_key，新配置不得（MUST NOT）消费旧 Lease；旧 Lease 按创建时快照的生命周期参数完成消费与归还，生命周期配置变更不得（MUST NOT）追溯既有 Lease。对**明确的 Lease 集合**必须（MUST）满足 `granted = consumed + returned_applied + lost` 且 `consumed + returned_applied ≤ granted`；生产环境不承诺精确总账，只提供保守损失上界。Worker 崩溃只允许（MUST）造成库存损失，不得（MUST NOT）造成额度重复或跨 Worker 补偿。
 
 #### Scenario: 配置变更隔离

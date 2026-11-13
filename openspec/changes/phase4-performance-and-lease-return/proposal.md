@@ -1,5 +1,9 @@
 # Proposal
 
+## V1 范围裁决（2026-11-13）
+
+**取消自动生命周期管理，收敛为符合 Take-home Assignment 的 V1**：V1 请求路径**不接入自动 RETURN 调用**（RETURN_LEASE Lua 协议已实现并保留，恢复时直接使用）；**Phase 5 生命周期（CLOCK_MONOTONIC/扫描器/idle/max_lifetime）整体 DEFERRED**；状态机简化 **ACTIVE→CLOSED**（耗尽即损失，保守方向）。安全语义不弱化（GRANT 超时不重试/TAKE 无 yield/Fail-close/多规则原子性全保留）。下文 Why/What 中涉及自动归还与生命周期的表述以本节为准。
+
 ## Why
 
 Phase 3 归档后，正确性基线（Phase 1）、多维与语义（Phase 2）、多规则联合判定（Phase 3）已闭环。距离"Ready for Production"还剩两类明确记录的短板：

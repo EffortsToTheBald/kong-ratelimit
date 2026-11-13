@@ -36,45 +36,51 @@
 
 ## Phase 4：Worker 本地 Lease（`feat: add worker local lease manager`；不接扫描器，先单测）
 
-- [ ] 4.1 新增 `lib/lease.lua`（Worker 级模块表）：pools/leases 结构、lease 对象（lease_id/pool_key/granted/remaining/consumed/status/created_at/last_used_at/idle_threshold/max_lifetime——阈值为创建时快照；不变量 remaining+consumed=granted、0≤remaining≤granted）；时钟经可注入单调接口；验证：resty 单测（结构断言 + 时钟注入）
-- [ ] 4.2 TAKE（非 yield 同步片段：查 ACTIVE→remaining>0→remaining−−→consumed++→last_used_at 更新→ALLOW；无 ⇒ NEED_GRANT；不访问 Redis、无等待、无补偿路径）；验证：resty 单测（递减/归零不可再取/多 Lease 插入序取用/remaining≥0 结构断言）+ yield 探针断言片段内无 yield
-- [ ] 4.3 状态机与唯一关闭流程：ACTIVE→CLOSING→CLOSED 单向；关闭步骤（ACTIVE 检查/条件判定/置 CLOSING/从 ACTIVE 集合摘除/requested=remaining/remaining=0/置 CLOSED）同一非 yield 片段；关闭后不可消费、不可复活、不重复关闭；验证：resty 单测（关闭后 TAKE 不选中/CLOSED 不可复活/重复关闭跳过）
-- [ ] 4.4 GRANT 调用接线（lease_id 生成：hostname+worker+计数+随机；GRANT_LEASE 调用与结果分类：成功建本地 Lease/granted=0/LEASE_EXISTS 与其他明确错误 ⇒ 故障分支/不确定 ⇒ 不重试允许损失；本地 `remaining+consumed=granted` 维护）；验证：resty 单测（GRANT 成功/不足/冲突/不确定四分类）+ **不得出现 remaining>granted 与负库存**结构断言
-- [ ] 4.5 多 Worker 隔离：A/B 各自 Lease 互不可见互不代管；A 崩溃（table 丢弃）不影响 B；验证：resty 双 VM/分进程验证 + spec（所有权场景）
+> **V1 范围（2026-11-13 裁决）**：状态机简化 **ACTIVE→CLOSED**（库存耗尽 ⇒ CLOSED/本地删除，无 CLOSING 归还态、无 Redis RETURN 调用）；无生命周期阈值/时钟/扫描器；Worker 崩溃 ⇒ 剩余库存损失（不恢复不补偿）。
+
+- [ ] 4.1 新增 `lib/lease.lua`（Worker 级模块表）：pools/leases 结构、lease 对象（lease_id/pool_key/granted/remaining/consumed/status/created_at——**V1 无 idle_threshold/max_lifetime/last_used_at**；不变量 remaining+consumed=granted、0≤remaining≤granted）；验证：resty 单测（结构断言 + remaining/consumed 守恒）
+- [ ] 4.2 TAKE（非 yield 同步片段：查 ACTIVE→remaining>0→remaining−−→consumed++→ALLOW；无 ⇒ NEED_GRANT；不访问 Redis、无等待、无补偿路径）；验证：resty 单测（递减/归零不可再取/多 Lease 插入序取用/remaining≥0 结构断言）+ yield 探针断言片段内无 yield
+- [ ] 4.3 耗尽处理（V1 简化）：remaining=0 ⇒ Lease 标记 CLOSED/从 ACTIVE 集合移除（本地先行，同一非 yield 片段）；CLOSED 不可复活、不可重复消费；**无 RETURN 调用、无快照步骤**；验证：resty 单测（耗尽后 TAKE 不选中/CLOSED 不可复活/重复标记跳过）
+- [ ] 4.4 GRANT 调用接线（lease_id 生成：hostname+worker+计数+随机；GRANT_LEASE 调用与结果分类：成功建本地 Lease/granted=0/LEASE_EXISTS 与其他明确错误 ⇒ 故障分支/**不确定 ⇒ 不重试允许损失**；本地 `remaining+consumed=granted` 维护）；验证：resty 单测（GRANT 成功/不足/冲突/不确定四分类）+ **不得出现 remaining>granted 与负库存**结构断言
+- [ ] 4.5 多 Worker 隔离：A/B 各自 Lease 互不可见互不代管；A 崩溃（table 丢弃）不影响 B 且不重新授权；验证：resty 双 VM/分进程验证 + spec（所有权场景）
 - [ ] 4.6 组测试报告 + commit `feat: add worker local lease manager`；验证：git log
 
-## Phase 5：Lease 生命周期（`feat: add lease lifecycle and idle return`）
+## Phase 5：Lease 生命周期 —— **DEFERRED / OUT OF SCOPE FOR V1**
 
-- [ ] 5.1 单调时钟落地（1.2 结论：FFI CLOCK_MONOTONIC 经可注入接口；核查不通过 ⇒ 停止本 Phase 并报告，不得用不合格时钟顶替）；验证：注入时钟单测六件套——正常推进/回拨/前跳/单调推进而墙上不变/idle 触发/max 触发
-- [ ] 5.2 每 Worker 扫描器（1s 周期，仅本 Worker ACTIVE Lease）+ `sweeping` 重入保护 + 单 Lease RETURN 失败不影响其他 Lease + 扫描延迟/RETURN 开始时间记录；验证：resty 单测（到期发现/重入保护/失败隔离）
-- [ ] 5.3 idle/max 关闭触发（idle_threshold>0 且 idle≥阈值；或 age≥max_lifetime——阈值取 Lease 创建快照）调用统一关闭函数；idle=0 仅 max 生效；验证：resty 注入时钟单测 + spec（生命周期场景）
-- [ ] 5.4 RETURN 有限重试策略落地：仅 uncertain（超时/连接中断）原 ID+原 requested 重试，总计 ≤3 次尝试（明确错误不重试；ALREADY_RETURNED=成功终态）；达上限 ⇒ CLOSED + lost；验证：resty 单测（计数/上限/分类）+ E2E CLIENT PAUSE（幂等重试成功且桶只加一次）
-- [ ] 5.5 配置快照与隔离 E2E：改 limit ⇒ 新 pool_key 新 Lease；改 idle/max ⇒ 既有 Lease 用旧阈值、新 Lease 用新值；旧 Lease RETURN 校验 pool_key（POOL_MISMATCH 拒绝路径）；验证：spec（配置隔离场景）
-- [ ] 5.6 组测试报告 + commit `feat: add lease lifecycle and idle return`；验证：git log
+> **2026-11-13 裁决**：本阶段整体 **V1 不实施**。V1 采用"库存耗尽即损失"的保守模型（Phase 4.3），不实现自动归还。以下任务原样保留为 Phase 5 恢复时的规范，**不得**偷偷合并进 Phase 4 或 Phase 6。
 
-## Phase 6：请求路径集成（`feat: integrate worker lease into rate limit path`）
+- [ ] 5.1 【DEFERRED】单调时钟落地（FFI CLOCK_MONOTONIC；核查不通过 ⇒ 停止本 Phase 并报告）
+- [ ] 5.2 【DEFERRED】每 Worker 扫描器 + sweeping 重入保护 + 失败隔离 + 延迟记录
+- [ ] 5.3 【DEFERRED】idle/max 关闭触发（阈值取 Lease 创建快照；idle=0 仅 max 生效）
+- [ ] 5.4 【DEFERRED】RETURN 有限重试策略落地（仅 uncertain，原 ID+原 requested，≤3 次）
+- [ ] 5.5 【DEFERRED】配置快照与隔离 E2E（POOL_MISMATCH 拒绝路径 E2E）
+- [ ] 5.6 【DEFERRED】组测试报告 + commit `feat: add lease lifecycle and idle return`
+
+## Phase 6：请求路径集成（`feat: integrate worker lease into rate limit path`；V1 核心阶段）
+
+> **V1 范围**：只接 batch>1 的 Lease 消费与申请；**无扫描器启动、无 SIGTERM 归还、无关闭/RETURN 交错**（库存耗尽 ⇒ 新 Lease）。
 
 - [ ] 6.1 `algorithm.lua` 接线：单规则 batch>1 ⇒ TAKE → NEED_GRANT ⇒ GRANT_LEASE → 建本地 Lease/消费 1；granted=0 ⇒ 429；**batch=1 与多规则路径一行不动**；验证：resty 单测 + 三模式行为矩阵
-- [ ] 6.2 `handler.lua`：每 Worker 扫描器启动；故障分支接线核对（Redis 不可用 ⇒ 既有 503/降级语义不被 Lease 改变；不得用 Lease 绕过 Fail-close；429/503 语义不混淆）；验证：启动日志 + 故障注入
-- [ ] 6.3 SIGTERM best-effort（按 1.3 结论）：可行 ⇒ exiting 轮询触发本 Worker 关闭（不阻塞退出、不重复 RETURN、不做保证性表述）；不可行 ⇒ 报告 NOT RUN + 损失声明；验证：spec 边界
+- [ ] 6.2 `handler.lua`：故障分支接线核对（Redis 不可用 ⇒ 既有 503/降级语义不被 Lease 改变；不得用 Lease 绕过 Fail-close；429/503 语义不混淆）；**V1 无扫描器启动**；验证：启动日志 + 故障注入
+- [ ] 6.3 配置隔离核对：pool_key 指纹覆盖 limit/window/burst/limit_by/header_name ⇒ 不同配置不共用本地库存；如有不明确处先报告再动；验证：配置变更 E2E（新旧 Lease 隔离）
 - [ ] 6.4 全量回归：quota.sh（batch=1 基线 100/350/0 + batch=20 区间——锚点变化注明原因）+ dims.sh + rules.sh 全绿；故障双路径；脚本缓存丢失自愈；验证：spec（适用边界三场景 + EVALSHA 零回归）
-- [ ] 6.5 并发与异常 E2E：TAKE/关闭/RETURN 交错（场景 A/B/C）；多 Worker 并发 GRANT 全局额度正确；kill -9 确定性账目（granted−consumed−returned_applied=lost）；CLOSING/RETURN 中崩溃 ⇒ 损失方向核验；Worker 异常退出不发生补偿性超发；验证：spec（状态机/所有权/账目场景）
+- [ ] 6.5 并发与异常 E2E（V1 口径）：多 Worker 并发 TAKE/GRANT 全局额度正确（不超发）；本地并发 TAKE 不重复消费；库存耗尽 ⇒ 新 Lease 流程正确；kill -9 ⇒ 损失核验（granted−consumed=lost，不超发不重新授权）；Redis 超时不重复申请；验证：spec（所有权/账目场景）
 - [ ] 6.6 组测试报告 + commit `feat: integrate worker lease into rate limit path`；验证：git log
 
-## Phase 7：性能测试与报告（`test: add phase4 lease performance report`）
+## Phase 7：核心正确性与性能验证（`test: add phase4 lease performance report`；V1 压缩版）
 
-- [ ] 7.1 第三组测试（Lease+EVALSHA）：batch 1/10/50/100（batch=1 为原路径对照）× Worker 1/多 × 速率低中高 × RETURN 开/关 × 不同 idle/max_lifetime × Redis 正常/短暂故障恢复；验证：GRANT/RETURN 次数、granted/consumed/requested/applied/discarded/lost、扫描器延迟、RETURN 失败次数采集齐
-- [ ] 7.2 三组对比与结论（§12.5 八问逐项回答：EVALSHA 收益/batch↑ QPS 下降/p99 改善/RETURN 开销/idle-max 与损失/多 Worker 正确性/故障恢复无重复归还/与 batch=1 基线的限流差异）；验证：结论必须同时评估限流语义与库存损失
-- [ ] 7.3 报告体例：每项测试含编号/目的/环境/Worker 数/Redis 配置/限流配置/压测参数/实际请求量/时长/RPS/p50/p95/p99/Redis QPS/Redis CPU/Kong CPU/异常/结论；未执行项 NOT RUN；验证：results.md + reports 符合体例
-- [ ] 7.4 commit `test: add phase4 lease performance report`；验证：git log
+- [ ] 7.1 正确性测试 11 项：①多 Worker 并发申请不超发 ②本地并发 TAKE 不重复消费 ③remaining≥0 ④耗尽重申请流程 ⑤kill -9 损失不重新发放 ⑥batch=1 无 Lease 记录 ⑦多规则无 Lease 记录 ⑧多规则全或无 ⑨Fail-close ⑩430+Retry-After ⑪quota/dims/rules 回归；验证：E2E 断言逐项
+- [ ] 7.2 性能三点：M0（复用 Phase 1 数据）+ batch=1 + batch=10（Worker 1/多 × 速率低中高）；采集 RPS/p50/p95/p99/Redis QPS；重点验证 batch=10 是否显著降低 Redis 请求次数且保持限流正确性；验证：与 Phase 1 同口径
+- [ ] 7.3 Phase 3 矩阵证据核对：确认 `test/lease-redis-matrix.sh` 50 项与当前最终代码版本对应（必要时仅跑 smoke：GRANT 正常/RETURN 幂等/TTL 校验抽测）；验证：核对记录
+- [ ] 7.4 报告体例：编号/目的/环境/配置/参数/实际量/时长/RPS/p50/p95/p99/Redis QPS/异常/结论；未执行项 NOT RUN；原始数据入库；验证：体例符合
+- [ ] 7.5 commit `test: add phase4 lease performance report`；验证：git log
 
-## Phase 8：清理（`refactor: remove legacy local inventory implementation`；仅当全部测试通过）
+## Phase 8：清理与最终交付（`refactor: remove legacy local inventory implementation`；仅当全部测试通过）
 
-- [ ] 8.1 删除 `lib/store.lua` 及全部引用、compose 的 `KONG_NGINX_HTTP_LUA_SHARED_DICT` 与相关 docs 段落、重复/不可达代码、过时配置；保留测试与诊断日志；验证：grep 无残留引用 + 启动正常 + 全量回归仍全绿
-- [ ] 8.2 README 与配置说明更新（Lease 模式、参数、错误码语义）；验证：文档与实现一致
-- [ ] 8.3 commit `refactor: remove legacy local inventory implementation`；验证：git log
+- [ ] 8.1 删除 `lib/store.lua` 及全部引用、compose 的 `KONG_NGINX_HTTP_LUA_SHARED_DICT` 与相关 docs 段落、重复/不可达代码；验证：grep 无残留 + 启动正常 + 全量回归仍全绿
+- [ ] 8.2 最终交付文档：架构图、请求处理流程图、Lease 授权与本地消费流程图、README（Lease 模式与错误码语义）、**Production TODO**（Cluster/Worker 接管/SIGTERM 可靠归还/idle 自动归还/CLOCK_MONOTONIC 生命周期/精确总账/多规则 Lease/batch 调优/预取策略/soak/监控审计/自动回收——均标注"未实现，属延期"）；验证：文档与实现一致、延期项与已交付项无混淆
+- [ ] 8.3 最终代码审查 + commit `refactor: remove legacy local inventory implementation`；验证：git log
 
-## Workflow follow-up
 
 - 全部 Phase 完成且人工验收通过后执行 `openspec archive phase4-performance-and-lease-return`（9 条 ADDED 追加合入主 spec）。
 - 遗留输入（Deferred）：GRANT 幂等、Redis Cluster、精确生产总账、Worker 接管、SIGTERM 可靠归还、多规则 β、Lease 清理索引。

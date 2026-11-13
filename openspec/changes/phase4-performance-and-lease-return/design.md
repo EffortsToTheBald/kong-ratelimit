@@ -25,15 +25,15 @@
 
 **Goals:**
 
-- EVALSHA（四脚本统一脚本表；NOSCRIPT 自愈；超时≠NOSCRIPT；不重复扣减）。
-- 单规则 batch>1 的独立 Lease 机制：GRANT 原子创建 Lease、Worker 本地 TAKE、状态机关闭、Redis 幂等 RETURN（同 ID + 同 requested）。
-- Lease 生命周期：idle 超时 + 最大生命周期强制轮换；每 Worker 扫描器；单调时钟。
-- 性能矩阵（batch 1/10/50/100 × 速率 × Worker 数 × 单/多规则 × EVAL/EVALSHA × RETURN 开关 × Redis 故障恢复），真实数据。
+- EVALSHA（四脚本统一脚本表；NOSCRIPT 自愈；超时≠NOSCRIPT；不重复扣减）——**已完成（Phase 2）**。
+- 单规则 batch>1 的独立 Lease 机制：GRANT 原子创建 Lease、Worker 本地 TAKE、库存耗尽 CLOSED/删除；**V1 无关闭归还流程**（Redis 幂等 RETURN Lua 已实现但 V1 不接入）。
+- 性能对比（V1 压缩：M0 复用 Phase 1 + batch=1 严格模式 + batch=10 Lease 模式），真实数据。
 - batch=1 与多规则语义零变化；热路径（TAKE）零 Redis 操作。
 
-**Non-Goals（详见 Future Considerations）:**
+**Non-Goals（V1，详见 Future Considerations 与 V1 范围裁决节）:**
 
-- Redis Cluster 多 Slot 原子；多规则本地库存；跨 Worker Lease 共享；Worker 故障接管；生产精确消费总账；SIGTERM 可靠归还保证；跨实例本地库存共享；Lease 过期后的库存补偿；复杂分布式库存协调协议。
+- **自动生命周期管理（V1 整体 DEFERRED）**：CLOCK_MONOTONIC+FFI、idle scanner、自动 RETURN 调用、max_lifetime 关闭、扫描器重入保护、生命周期配置（lease_return_idle/lease_max_lifetime 不进 V1 schema）。
+- Redis Cluster 多 Slot 原子；多规则本地库存；跨 Worker Lease 共享；Worker 故障接管；生产精确消费总账；SIGTERM 可靠归还保证；跨实例本地库存共享；Lease 过期后的库存补偿；复杂分布式库存协调协议；batch 自动调优；复杂预取策略；soak test；生产监控审计。
 
 ## Decisions
 
