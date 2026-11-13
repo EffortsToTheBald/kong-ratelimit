@@ -67,7 +67,7 @@ do
         { "limit",      { limit = 200 } },
         { "window",     { window = 7200 } },
         { "burst",      { burst = 5 } },
-        { "limit_by",   { limit_by = { "ip", "header" }, header_name = "X-K" } },
+        { "limit_by",   { limit_by = { "ip", "method" } } },  -- 仅 limit_by 变化（单维度独立证明）
     }
     for _, c in ipairs(cases) do
         local kb = algorithm.build_key(copy(base_conf(), c[2]))
