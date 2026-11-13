@@ -126,7 +126,7 @@ run_k6() {
     # k6 偶发在 summary 写盘后挂起不退出（Phase 1 排查记录）——timeout 兜底：
     # 数据已写盘则取回继续，不视为失败（exit 124）
     set +e
-    ( cd "$PROJECT_ROOT" && timeout 300 k6 run --quiet "${envargs[@]}" -e "OUT=$out" "$script" >&2 )
+    ( cd "$PROJECT_ROOT" && timeout 60 k6 run --quiet "${envargs[@]}" -e "OUT=$out" "$script" >&2 )
     local k6rc=$?
     set -e
     if [ "$k6rc" -ne 0 ] && [ "$k6rc" -ne 124 ]; then

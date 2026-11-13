@@ -168,6 +168,67 @@ return out
 
 _M.multi_script = GRANT_MULTI
 
+-- ------------------------------------------------------------
+-- EVALSHA 统一管理（Phase 2）：
+--   * 脚本表持有 src 与 SHA；SHA 以 SCRIPT LOAD 返回值为准，Worker 级缓存
+--     （OpenResty 每个 Worker 独立 Lua VM，模块状态天然按 Worker 隔离）。
+--   * Redis 脚本缓存是**实例级**（单实例部署前提下，任一连接 LOAD 后
+--     该实例上所有连接的 EVALSHA 均可用；Cluster 的按节点缓存为 Deferred）。
+--   * init_worker 不做任何 Redis IO：懒加载（首次调用触发 LOAD）。
+--   * 仅"明确 NOSCRIPT"触发 LOAD + 重试恰一次；超时/连接断开/普通错误
+--     一律原样透传，绝不当作 NOSCRIPT（防止重复执行已成功的扣减）。
+-- ------------------------------------------------------------
+local SCRIPTS = {}
+
+local function register_script(name, src)
+    SCRIPTS[name] = { name = name, src = src, sha = nil }
+end
+register_script("token_bucket", TOKEN_BUCKET)
+register_script("grant_multi", GRANT_MULTI)
+_M.scripts = SCRIPTS
+
+local function is_noscript_err(err)
+    return type(err) == "string" and string.find(err, "NOSCRIPT", 1, true) ~= nil
+end
+
+local function load_script(r, entry)
+    local sha, err = r:script("LOAD", entry.src)
+    if not sha or sha == ngx.null then
+        return nil, "script load failed: " .. tostring(err)
+    end
+    entry.sha = sha
+    -- NOSCRIPT 仅在脚本缓存丢失（FLUSH/重启）后出现，频率极低，warn 便于审计
+    if kong and kong.log then
+        kong.log.warn("rate-limit-advanced: script cache miss (NOSCRIPT), loaded: ", entry.name)
+    end
+    return sha
+end
+
+--- EVALSHA 包装：懒加载 + NOSCRIPT 重载重试恰一次。
+-- @return res, err —— err 为明确错误时调用方走既有故障分支
+local function evalsha(r, entry, ...)
+    if not entry.sha then
+        local sha, lerr = load_script(r, entry)
+        if not sha then
+            return nil, lerr
+        end
+    end
+    local res, err = r:evalsha(entry.sha, ...)
+    if not res and is_noscript_err(err) then
+        local sha, lerr = load_script(r, entry)
+        if not sha then
+            return nil, lerr
+        end
+        res, err = r:evalsha(entry.sha, ...)
+        if not res and is_noscript_err(err) then
+            return nil, "script still missing after reload: " .. tostring(err)
+        end
+    end
+    return res, err
+end
+_M.load_script = load_script
+_M.evalsha = evalsha
+
 --- D3：防御性校验 EVAL 返回值（纯函数，不依赖 cosocket，可被 resty 单测直接调用）。
 -- 合法形态：{ granted(整数, 0..want), tokens(数值), wait(数值, >=0) }。
 -- 任一不满足 → nil, 原因；调用方（grant）将其视为 Redis 异常并进入故障分支。
@@ -339,11 +400,11 @@ function _M.grant(conf, key, want, ttl_ms, rate, burst)
     end
   end
 
-  local res, eerr = r:eval(TOKEN_BUCKET, 1, key,
-                           tostring(rate),
-                           tostring(burst),
-                           tostring(want),
-                           tostring(ttl_ms))
+  local res, eerr = evalsha(r, SCRIPTS.token_bucket, 1, key,
+                            tostring(rate),
+                            tostring(burst),
+                            tostring(want),
+                            tostring(ttl_ms))
   if not res then
     r:close()
     return nil, "eval: " .. tostring(eerr)
@@ -390,7 +451,7 @@ function _M.grant_multi(conf, keys, rates, bursts, ttls_ms)
     args[#args + 1] = argv[i]
   end
 
-  local res, eerr = r:eval(GRANT_MULTI, unpack(args))
+  local res, eerr = evalsha(r, SCRIPTS.grant_multi, unpack(args))
   if not res then
     r:close()
     return nil, "eval: " .. tostring(eerr)

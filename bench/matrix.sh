@@ -28,19 +28,22 @@ source "$SCRIPT_DIR/common.sh"
 
 WORKERS="${WORKERS:-2}"      # 目标 Worker 数（-w 覆盖）
 LOGLEVEL="${LOGLEVEL:-notice}" # KONG_LOG_LEVEL（-L 覆盖；error 组用于隔离调试日志背压因素）
-RHOST="redis"                  # Redis host（-H ip 切换 IP 直连，绕开容器 DNS 间歇阻塞——Phase 0 发现的现有缺陷）
-EHOST="echo"                   # 上游 echo host（-E ip 切换 IP 直连；容器 DNS 缺陷影响 proxy 链路）
+TAG="${TAG:-p1}"               # 输出标签（-T 覆盖；Phase 2 用 p2，避免覆盖 Phase 1 基线文件）
+RHOST="redis"                  # Redis host（-H <host>：传 IP 绕开容器 DNS 间歇阻塞——Phase 0 发现的现有缺陷）
+EHOST="echo"                   # 上游 echo host（-E <host>：传 IP；容器 DNS 缺陷影响 proxy 链路）
 DUR="${DUR:-20}"             # 每组时长（秒）
 RATES="${RATES:-100,500,1000}"
 BATCHES="${BATCHES:-10,50,100}"
 LIMIT=1000000                # 故意放大，隔离限流路径（只测放行）
 WINDOW=60
 
-while getopts "w:L:HE:d:r:b:h" opt; do
+while getopts "w:L:H:E:T:d:r:b:h" opt; do
     case "$opt" in
         w) WORKERS="$OPTARG" ;;
         L) LOGLEVEL="$OPTARG" ;;
-        H) RHOST="ip" ;;
+        H) RHOST="$OPTARG" ;;
+        E) EHOST="$OPTARG" ;;
+        T) TAG="$OPTARG" ;;
         d) DUR="$OPTARG" ;;
         r) RATES="$OPTARG" ;;
         b) BATCHES="$OPTARG" ;;
@@ -51,14 +54,9 @@ done
 
 assert_prerequisites
 RHOST_ARG="$RHOST"
-if [ "$RHOST" = "ip" ]; then
-    RHOST_ARG=$(docker inspect kong-ratelimit-redis-1 -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
-    log "Redis IP 直连：$RHOST_ARG"
-fi
 EHOST_ARG="$EHOST"
-if [ "$EHOST" = "ip" ]; then
-    EHOST_ARG=$(docker inspect kong-ratelimit-echo-1 -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
-    log "echo 上游 IP 直连：$EHOST_ARG"
+if [ "$RHOST_ARG" != "redis" ] || [ "$EHOST_ARG" != "echo" ]; then
+    log "直连模式：redis=$RHOST_ARG echo=$EHOST_ARG"
 fi
 IFS=',' read -ra RATE_ARR <<< "$RATES"
 IFS=',' read -ra BATCH_ARR <<< "$BATCHES"
@@ -71,9 +69,9 @@ redis_info_field() { # redis_info_field <field> —— 行首精确匹配（used
         | grep -E "^${1}:" | head -1 | cut -d: -f2 | tr -d '\r'
 }
 
-redis_eval_calls() { # 当前 cmdstat_eval 累计调用次数（截断逗号后的 usec 段）
+redis_cmd_calls() { # redis_cmd_calls <cmd> —— INFO commandstats 里该命令的累计 calls（eval/evalsha/script）
     docker compose -f "$COMPOSE_FILE" exec -T redis redis-cli INFO commandstats 2>/dev/null \
-        | awk -F: '/cmdstat_eval:/{split($2,a,"calls="); split(a[2],b,","); gsub(/\r/,"",b[1]); print b[1]; exit}'
+        | awk -F: -v c="cmdstat_${1}:" '$0 ~ c {split($2,a,"calls="); split(a[2],b,","); gsub(/\r/,"",b[1]); print b[1]; exit}'
 }
 
 kong_log_lines() {
@@ -85,8 +83,9 @@ kong_log_count_since() { # kong_log_count_since <kongN> <start_line> <pattern>
 }
 
 kong_cpu_usec() { # 容器 cgroup v2 cpu.stat 累计（微秒）
-    docker exec "kong$1" sh -c 'cat /sys/fs/cgroup/cpu.stat 2>/dev/null | head -1' \
-        | awk '{print $2}'
+    # 禁用 cat|head 模式：pipefail 下 cat 被 SIGPIPE ⇒ set -e 静默退出
+    docker exec "kong$1" sh -c 'cat /sys/fs/cgroup/cpu.stat 2>/dev/null' \
+        | awk '/^usage_usec/{print $2; exit}'
 }
 
 assert_worker_count() { # 校验每个 kong 节点实际 worker 数
@@ -159,7 +158,9 @@ declare -A SNAP
 snap_start() {
     SNAP[cmd0]=$(redis_cmd_count)
     SNAP[cpu0_r]=$(redis_info_field used_cpu_sys); SNAP[cpu1_r]=$(redis_info_field used_cpu_user)
-    SNAP[eval0]=$(redis_eval_calls)
+    SNAP[eval0]=$(redis_cmd_calls eval)
+    SNAP[esha0]=$(redis_cmd_calls evalsha)
+    SNAP[scpt0]=$(redis_cmd_calls script)
     for node in 1 2 3; do
         SNAP["log0_$node"]=$(kong_log_lines "$node")
         SNAP["kcpu0_$node"]=$(kong_cpu_usec "$node")
@@ -169,7 +170,9 @@ snap_start() {
 snap_end() {
     SNAP[cmd1]=$(redis_cmd_count)
     SNAP[cpu2_r]=$(redis_info_field used_cpu_sys); SNAP[cpu3_r]=$(redis_info_field used_cpu_user)
-    SNAP[eval1]=$(redis_eval_calls)
+    SNAP[eval1]=$(redis_cmd_calls eval)
+    SNAP[esha1]=$(redis_cmd_calls evalsha)
+    SNAP[scpt1]=$(redis_cmd_calls script)
     for node in 1 2 3; do
         SNAP["log1_$node"]=$(kong_log_lines "$node")
         SNAP["kcpu1_$node"]=$(kong_cpu_usec "$node")
@@ -191,6 +194,8 @@ report_row() { # report_row <label> <batch> <rps_target> <elapsed> <summary_file
     cpu_r=$(awk -v a="${SNAP[cpu0_r]}" -v b="${SNAP[cpu1_r]}" -v c="${SNAP[cpu2_r]}" -v d="${SNAP[cpu3_r]}" -v e="$elapsed" \
         'BEGIN{ if(e>0) printf "%.3f",((c-a)+(d-b))/e; else print 0 }')
     evals=$(( SNAP[eval1] - SNAP[eval0] ))
+    local eshas=$(( SNAP[esha1] - SNAP[esha0] ))
+    local scpts=$(( SNAP[scpt1] - SNAP[scpt0] ))
     hits=0; grants=0; multis=0
     for node in 1 2 3; do
         hits=$(( hits + $(kong_log_count_since "$node" "${SNAP[log0_$node]}" 'local_hit') ))
@@ -203,7 +208,7 @@ report_row() { # report_row <label> <batch> <rps_target> <elapsed> <summary_file
     printf '    p50=%-7.2f p95=%-7.2f p99=%-7.2f rps=%-6.0f redisQPS=%-6s evals=%-6s localHit=%-6s grant=%-5s multi=%-5s redisCPU=%ss kongCPU=%s核\n' \
         "$p50" "$p95" "$p99" "$rps" "$qps" "$evals" "$hits" "$grants" "$multis" "$cpu_r" "$kcpu"
 
-    ROWS+=("$label|$batch|$rps_t|$(printf '%.0f' "$rps")|$(printf '%.2f' "$p50")|$(printf '%.2f' "$p95")|$(printf '%.2f' "$p99")|$okcnt|$limcnt|$qps|$evals|$hits|$grants|$multis|$cpu_r|$kcpu|$attempt")
+    ROWS+=("$label|$batch|$rps_t|$(printf '%.0f' "$rps")|$(printf '%.2f' "$p50")|$(printf '%.2f' "$p95")|$(printf '%.2f' "$p99")|$okcnt|$limcnt|$qps|$evals|$eshas|$scpts|$hits|$grants|$multis|$cpu_r|$kcpu|$attempt")
 }
 
 run_case_once() { # run_case_once <label> <kind> <batch> <rate> <attempt> → echo "p99 rps"；结果行写入 ROWS
@@ -225,7 +230,7 @@ run_case_once() { # run_case_once <label> <kind> <batch> <rate> <attempt> → ec
     local start_ns end_ns elapsed
     start_ns=$(date +%s%N)
     local out
-    out=$(run_k6 k6/latency.js "p1-w${WORKERS}-${label// /_}-r${rate}-a${attempt}.json" \
+    out=$(run_k6 k6/latency.js "${TAG}-w${WORKERS}-${label// /_}-r${rate}-a${attempt}.json" \
             "RPS=$rate" "DUR=${DUR}s" "NODES=$NODES_CSV")
     end_ns=$(date +%s%N)
     elapsed=$(awk -v a="$start_ns" -v b="$end_ns" 'BEGIN{printf "%.3f",(b-a)/1e9}')
@@ -281,18 +286,18 @@ done
 for rate in "${RATE_ARR[@]}"; do run_case_checked "C-multi" multi 0 "$rate"; done
 
 # ---------- 输出 ----------
-OUT_FILE="$PROJECT_ROOT/bench/out/results-p1-w${WORKERS}-${LOGLEVEL}-${RHOST}.md"
+OUT_FILE="$PROJECT_ROOT/bench/out/results-${TAG}-w${WORKERS}-${LOGLEVEL}-${RHOST}.md"
 mkdir -p "$(dirname "$OUT_FILE")"
 {
-    echo "# Phase 4 第一组基线 —— Legacy EVAL + Shared Inventory（Worker=$WORKERS, log=$LOGLEVEL, redisHost=$RHOST_ARG）"
+    echo "# Phase 4 性能矩阵 —— Legacy EVAL + Shared Inventory（标签=$TAG, Worker=$WORKERS, log=$LOGLEVEL, redisHost=$RHOST_ARG, echoHost=$EHOST_ARG）"
     echo
     echo "生成时间：$(date '+%F %T')　limit=$LIMIT window=${WINDOW}s 时长=${DUR}s RPS=$RATES batch=$BATCHES"
     echo
-    echo "| 场景 | batch | RPS目标 | 实测RPS | p50 | p95 | p99 | 200 | 429 | RedisQPS | EVAL次数 | 本地命中 | slowGrant | multiGrant | RedisCPU(s) | KongCPU(核) | 尝试 |"
-    echo "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+    echo "| 场景 | batch | RPS目标 | 实测RPS | p50 | p95 | p99 | 200 | 429 | RedisQPS | EVAL次数 | EVALSHA次数 | SCRIPT_LOAD次数 | 本地命中 | slowGrant | multiGrant | RedisCPU(s) | KongCPU(核) | 尝试 |"
+    echo "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
     for row in "${ROWS[@]}"; do
         IFS='|' read -ra f <<< "$row"
-        echo "| ${f[0]} | ${f[1]} | ${f[2]} | ${f[3]} | ${f[4]} | ${f[5]} | ${f[6]} | ${f[7]} | ${f[8]} | ${f[9]} | ${f[10]} | ${f[11]} | ${f[12]} | ${f[13]} | ${f[14]} | ${f[15]} | ${f[16]} |"
+        echo "| ${f[0]} | ${f[1]} | ${f[2]} | ${f[3]} | ${f[4]} | ${f[5]} | ${f[6]} | ${f[7]} | ${f[8]} | ${f[9]} | ${f[10]} | ${f[11]} | ${f[12]} | ${f[13]} | ${f[14]} | ${f[15]} | ${f[16]} | ${f[17]} | ${f[18]} |"
     done
     cat <<'EOF'
 
