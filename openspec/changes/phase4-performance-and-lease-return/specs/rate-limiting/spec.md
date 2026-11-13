@@ -22,7 +22,8 @@
 - **THEN** 全部结果与既有锚点一致
 
 ### Requirement: 性能基线与对比测量
-性能数据必须（MUST）来自真实运行：先以现有 EVAL 实现测量基线，EVALSHA 落地后同参数复测。测试矩阵必须（MUST）覆盖：batch（1/10/50/100）、请求速率（低/中/高）、Kong Worker 数（1/多）、规则数量（单/多规则）、执行方式（EVAL/EVALSHA）、RETURN 开关（关/开）、Redis（正常/故障恢复）。每组记录 RPS、p50/p95/p99、Redis QPS、Redis CPU、Kong CPU、GRANT 次数、RETURN 次数、实际归还量、丢弃量、本地库存损失、限流误差。不得（MUST NOT）编造数据；未执行的测试必须（MUST）标注 NOT RUN 及原因。
+> **V1 验收范围（2026-11-13 最终裁决）**：三点 = **M0（复用 Phase 1 基线）/ batch=1 / batch=10**；Worker 1/多、速率低/中/高；记录 RPS、p50/p95/p99、Redis QPS；重点验证 batch=10 降低 Redis 请求次数且保持限流正确性；与 Phase 1 同口径。**Deferred/Future**：batch=50/100、完整 EVAL/EVALSHA 对比、RETURN 开关、自动 RETURN 性能、故障恢复矩阵、生命周期统计——不得（MUST NOT）列为 V1 验收条件。Phase 1 Legacy 数据仅历史基线。不得（MUST NOT）编造数据；未执行必须（MUST）标 NOT RUN 及原因。（原完整矩阵表述为 Phase 7 恢复参考。）
+性能数据必须（MUST）来自真实运行；V1 必须执行上述三点并与 Phase 1 保持相同测试口径；未执行的测试必须（MUST）标注 NOT RUN 及原因。
 
 #### Scenario: 基线先于复测且矩阵维度齐全
 - **WHEN** EVALSHA 改造合入前
@@ -52,7 +53,7 @@ Worker 本地 Lease 机制仅（ONLY）适用于**单规则 batch>1**（auto 解
 - **WHEN** 请求在活跃 Lease 上 TAKE
 - **THEN** 检查与递减在同一非 yield 片段完成（代码审查 + 协议级测试断言），remaining 单调非负，无补偿路径
 
-#### Scenario: 关闭先于 RETURN 且摘除即时
+#### Scenario: 关闭先于 RETURN 且摘除即时（**DEFERRED / Phase 5**——V1 无 Timer 关闭与 RETURN，不作为 V1 验收条件）
 - **WHEN** Timer 决定关闭某 Lease 并在 RETURN 期间发生 yield
 - **THEN** 该 Lease 在 yield 前已置 CLOSING 并从 ACTIVE 集合摘除，期间任何请求 TAKE 不能消费它，后续 GRANT 创建的独立 Lease 不受影响
 
@@ -179,10 +180,10 @@ RETURN 的全部校验必须（MUST）先于任何写且失败零写入：记录
 - **WHEN** 修改 limit（新指纹）后旧池 Lease 仍有剩余
 - **THEN** 旧 Lease 按创建时快照的阈值完成消费或归还，新流量走新 pool_key 的新 Lease，无混用
 
-#### Scenario: 确定性账目闭合
-- **WHEN** 无故障的确定性序列（GRANT 100、消费 80、关闭归还 20）
-- **THEN** 该 Lease 集合：granted 100 = consumed 80 + returned_applied 20 + lost 0
+#### Scenario: 确定性账目闭合（V1：outstanding 口径）
+- **WHEN** 无故障的确定性序列（GRANT 100、消费 80、Lease 库存耗尽关闭）
+- **THEN** 该 Lease 集合正常运行账目：granted 100 = consumed 80 + outstanding 20 + lost 0（outstanding = Σ本地 remaining；V1 无 RETURN，耗尽部分计入 outstanding 直至 Worker 生命周期结束）
 
-#### Scenario: Worker 崩溃仅损失库存
-- **WHEN** Worker 在 Lease ACTIVE 或 CLOSING（RETURN 未完成）时崩溃
-- **THEN** 该 Worker 剩余库存无法归还（Lease 记录 TTL 后消亡），granted − consumed − returned_applied = lost；不超发、不重复归还、其他 Worker 不受影响
+#### Scenario: Worker 崩溃仅损失库存（V1：lost 口径）
+- **WHEN** Worker 在 Lease ACTIVE（本地 outstanding > 0）时崩溃
+- **THEN** 该 Worker 剩余库存无法继续消费（Lease 记录 TTL 后消亡），账目转为 granted − consumed = lost（本例 lost = 20）；不超发、不重复归还、其他 Worker 不受影响

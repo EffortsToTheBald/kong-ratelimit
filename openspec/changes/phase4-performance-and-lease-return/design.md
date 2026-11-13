@@ -72,7 +72,7 @@ lease_obj = {
 - **TAKE 顺序**：按 Lease 插入序取首个有存量者（语义与 LRU/FIFO 无正确性差异；V1 无 max_lifetime 轮换，耗尽的 Lease CLOSED 后留在本地 table 中仅作诊断记录，不参与消费）。
 - **多 Lease 并存约束（V1）**：同一 pool_key 可同时存在多个 Lease（各自独立 lease_id）；GRANT 成功后在**不发生 yield 的本地代码段中**登记新 Lease（追加到 leases 列表，**不得覆盖已有 Lease**）；TAKE 遍历可消费 Lease、选有剩余者；检查与递减在同一无 yield 片段。Redis GRANT 已原子扣减全局桶 ⇒ 多 Lease 并存不会重复分配全局库存。
 
-**测试用例**：resty 协议级单测（直接驱动 lease.lua，注入时钟）：TAKE 递减/归零不可再取/多 Lease 并存/关闭后不可消费/CLOSED 不可复活/负库存不可能（结构断言）。
+**测试用例**：resty 协议级单测（直接驱动 lease.lua）：TAKE 递减/归零不可再取/多 Lease 并存/耗尽后不可消费/CLOSED 不可复活/负库存不可能（结构断言）。**V1 无注入时钟前提**（无 idle/max 生命周期判定——注入时钟属 Phase 5 Deferred）。
 
 ### D3. Lease 状态机与关闭流程（本地先行，Redis 后行）
 
@@ -190,14 +190,14 @@ ARGV = [batch, lease_ttl_ms, lease_id, pool_key]（其余 rate/burst 由桶现�
 - `lease_return_idle` / `lease_max_lifetime` **不在指纹内且不进 V1 schema**（生命周期参数 V1 DEFERRED）：Phase 5 恢复时才引入，届时通过 Lease 创建时快照实现隔离（无需 first-writer-wins/冲突告警——所有权已按 Worker 隔离）。
 - batch 变更：batch 不在指纹内；batch 变更后的新 GRANT 以新 batch 授予，既有 Lease 按其 granted 消费/归还——账目不受影响。
 
-**测试用例**：配置变更 E2E（改 limit ⇒ 新 pool_key 新 Lease，旧 Lease 按快照关闭；改 idle/max ⇒ 既有 Lease 用旧阈值，新 Lease 用新值）。
+**测试用例**：配置变更 E2E（改 limit ⇒ 新 pool_key 新 Lease，新旧 Lease 隔离）。**idle/max 阈值变更部分（"旧 Lease 按旧阈值关闭/新 Lease 用新值"）属 Phase 5 Deferred**——V1 不引入 lease_return_idle/lease_max_lifetime 配置，不作为 V1 验收要求。
 
 ### D8. 指标与账目观测
 
-- **Worker 本地计数器 + 结构化日志**（notice）：lease_granted/consumed/return_requested/return_applied/return_discarded/return_failed/return_duplicate/active/closed/local_remaining 口径（§14.1 命名）；TAKE 热路径零 Redis 操作（计数为本地变量）。Prometheus 暴露留 Phase 5（Deferred）；本期以日志 + resty 可调用的 `lease.stats()` 供测试与报告取证。
+- **Worker 本地计数器 + 结构化日志**（notice）：V1 必须口径 = lease_granted/consumed/active/closed/local_remaining；**return_requested/return_applied/return_discarded/return_failed/return_duplicate 为未来扩展定义——V1 请求路径不消费这些指标（无自动 RETURN），不得（MUST NOT）列为 V1 必须实现**（恢复自动归还时启用）。TAKE 热路径零 Redis 操作（计数为本地变量）。Prometheus 暴露留 Phase 5（Deferred）；本期以日志 + resty 可调用的 `lease.stats()` 供测试与报告取证。
 - **确定性账目（V1 口径）**：正常运行 `granted = consumed + outstanding`（outstanding = Σ本地 remaining）；Worker 崩溃后 `granted = consumed + lost`（lost = 无法继续消费的剩余授权库存）。`returned_applied` 非 V1 正常账目组成部分（RETURN Lua 已实现、V1 不接入；恢复自动归还时重新引入）。桶当前 tokens 因 refill/封顶**不能**直接当总账——测试只对明确 Lease 集合统计。
 
-**测试用例**：确定性序列账目闭合（grant 100/consume 80/return 20 ⇒ 恒等式）；封顶丢弃场景（discarded 计 lost）。
+**测试用例（V1 口径）**：确定性序列账目闭合（grant 100/consume 80 ⇒ outstanding 20，恒等式 granted = consumed + outstanding）；Worker 崩溃口径（granted = consumed + lost）。**封顶丢弃/RETURN 归还（return 20）场景属 Phase 5 Deferred**（V1 无自动 RETURN，returned_applied 非 V1 正常账目）。
 
 ## 正确性不变量（Spec 同款，逐条给出证明边界）
 
@@ -269,8 +269,8 @@ ARGV = [batch, lease_ttl_ms, lease_id, pool_key]（其余 rate/burst 由桶现�
 | 5 | TAKE 无负库存 | 协议级单测 + 结构断言（无补偿路径） |
 | 6 | TAKE 无 yield 点 | 代码审查 + 可注入 yield 探针测试 |
 | 7 | 关闭后不可消费 | 状态机单测（场景 A/B/C） |
-| 8 | 空闲超时关闭 | 注入时钟单测 + E2E |
-| 9 | 最大生命周期强制关闭 | 注入时钟单测（持续消费 Lease）+ E2E |
+| 8 | 空闲超时关闭（**Phase 5 Deferred，非 V1 验收**） | 注入时钟单测 + E2E |
+| 9 | 最大生命周期强制关闭（**Phase 5 Deferred，非 V1 验收**） | 注入时钟单测（持续消费 Lease）+ E2E |
 | 10 | GRANT 原子创建 Lease 记录 | 裸跑矩阵 + 失败无"扣桶无记录"成功返回 |
 | 11 | RETURN 原子更新桶与状态 | 裸跑矩阵 + 无 OPEN 中间态断言 |
 | 12 | 重复 RETURN 不重复加桶 | 幂等单测 + E2E |
