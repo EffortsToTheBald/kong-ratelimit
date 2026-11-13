@@ -26,7 +26,7 @@
 **Goals:**
 
 - EVALSHA（四脚本统一脚本表；NOSCRIPT 自愈；超时≠NOSCRIPT；不重复扣减）——**已完成（Phase 2）**。
-- 单规则 batch>1 的独立 Lease 机制：GRANT 原子创建 Lease、Worker 本地 TAKE、库存耗尽 CLOSED/删除；**V1 无关闭归还流程**（Redis 幂等 RETURN Lua 已实现但 V1 不接入）。
+- 单规则 batch>1 的独立 Lease 机制：GRANT 原子创建 Lease、Worker 本地 TAKE、库存耗尽 CLOSED/从可消费集合摘除并保留本地诊断记录；**V1 无关闭归还流程**（Redis 幂等 RETURN Lua 已实现但 V1 不接入）。
 - 性能对比（V1 压缩：M0 复用 Phase 1 + batch=1 严格模式 + batch=10 Lease 模式），真实数据。
 - batch=1 与多规则语义零变化；热路径（TAKE）零 Redis 操作。
 
