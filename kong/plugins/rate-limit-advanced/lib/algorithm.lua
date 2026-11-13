@@ -9,8 +9,16 @@ local bit = require "bit"
 
 local store = require "kong.plugins.rate-limit-advanced.lib.store"
 local redis_mod = require "kong.plugins.rate-limit-advanced.lib.redis"
+local lease = require "kong.plugins.rate-limit-advanced.lib.lease"
 
 local _M = {}
+
+-- V1 固定 Lease TTL（design D4/D9）：只管理 Redis Lease 元数据过期，
+-- 与桶 TTL / 归还无关（V1 无 RETURN）。取 1h：
+--   覆盖测试口径内最慢的本地消耗窗口（limit=100/window=3600/batch=20 ⇒ ~720s 消耗完一批），
+--   同时给崩溃 Worker 的残留记录一个有界生命周期，防止记录无限累积。
+-- Phase 5 引入 RETURN/max_lifetime 后该常量交还配置管理。
+local LEASE_TTL_MS = 3600000
 
 local MAX_DIM_VALUE_LEN = 256
 
@@ -319,6 +327,98 @@ function _M.check_multi(conf)
   }
 end
 
+--- D2/D4/D7：单规则 batch>1 的 Lease 决策（Phase 6 接线）。
+-- pool_key = 既有桶键（含策略指纹 + 维度值，D7）⇒ 本地库存与 Redis 桶一一对应，
+-- 配置变化经由指纹变化自然隔离旧库存。
+-- 流程：本地 TAKE（非 yield 原子）→ 有库存放行；
+--       NEED_GRANT ⇒ GRANT_LEASE（D4 四分类）：
+--         明确授予   ⇒ 登记 Lease（lease.grant 内完成）→ 本次请求再 TAKE 恰好消费 1 个
+--         granted=0  ⇒ 429（既有 Retry-After 语义，wait 透传）
+--         显式错误   ⇒ nil, err（LEASE_EXISTS / INVALID_ARGUMENT / 脚本装载失败）
+--         不确定     ⇒ nil, err（不重试、不登记，允许损失——冻结决策）
+-- V1 口径：无扫描器、无 RETURN、无自动归还；耗尽 Lease 由 lease.take 内 CLOSED 摘除。
+-- @return decision table 或 nil, err（err 为字符串，沿 handler 既有故障分支）
+function _M.check_lease(conf, key)
+  local now      = ngx.now()
+  local ttl_s    = math.max(1, math.floor(conf.window * 2))
+  local ttl_ms   = ttl_s * 1000
+  local rate, burst = _M.rate_and_burst(conf)
+  local batch    = _M.resolve_batch(conf)
+  -- fast path 本地无库存时，只能近似"下一令牌时刻"：一个补充周期 window/limit 秒
+  local next_tick = math.ceil(1 / rate)
+
+  -- 1) fast path：Worker 本地 TAKE，零网络 IO
+  local tok, remaining = lease.take(key)
+  if tok then
+    kong.log.notice(
+    "[RL-DEBUG] local_hit key=", key,
+    " remaining=", remaining
+    )
+    local reset
+    if remaining > 0 then
+      reset = math.floor(now)          -- 下一令牌已可用
+    else
+      reset = math.floor(now + next_tick) -- 刚取走最后一个，保守近似
+    end
+    return {
+      allowed   = true,
+      remaining = math.max(0, remaining),
+      reset     = reset,
+    }
+  end
+
+  -- 2) 本地无库存 ⇒ GRANT_LEASE 申请新 Lease（D4 四分类）
+  local res, gerr = lease.grant(conf, key, key, batch, LEASE_TTL_MS,
+                                rate, burst, ttl_ms)
+  if not res then
+    -- explicit_error 与 uncertain 均进既有故障分支（Fail-close）：
+    -- 显式错误确定零写入、不确定结果可能已执行——两者都不允许伪装成 429
+    kong.log.err("rate-limit-advanced: lease grant failed (",
+                 tostring(gerr.kind), "): ", tostring(gerr.err))
+    return nil, gerr.err
+  end
+  kong.log.notice(
+  "[RL-DEBUG] lease_grant key=", key,
+  " lease_id=", res.lease_id,
+  " granted=", res.granted,
+  " wait=", res.wait
+  )
+
+  -- 3) 明确不足（granted=0，桶令牌数不足 1）⇒ 429（既有语义，不建 Lease）
+  if res.ok == false then
+    local wait = res.wait
+    if not wait or wait <= 0 then
+      wait = 1
+    end
+    return {
+      allowed     = false,
+      remaining   = 0,
+      retry_after = wait,
+    }
+  end
+
+  -- 4) 明确授予（granted>=1，Lease 已登记）⇒ 本次请求必须恰好消费 1 个，
+  --    不得只登记库存却漏掉当前请求（granted>=1 ⇒ active 非空 ⇒ TAKE 必成功；
+  --    防御分支按故障处理，绝不放行未授权库存）
+  local tok2, remaining2 = lease.take(key)
+  if not tok2 then
+    kong.log.err("rate-limit-advanced: lease take after grant returned NEED_GRANT: ",
+                 tostring(key))
+    return nil, "lease take after grant returned NEED_GRANT"
+  end
+  kong.log.notice(
+  "[RL-DEBUG] lease_take_after_grant key=", key,
+  " remaining=", remaining2
+  )
+
+  -- slow path allowed：wait=0 ⇒ 下一令牌已可用；wait>0 ⇒ 部分授予后桶内 tokens<1
+  return {
+    allowed   = true,
+    remaining = math.max(0, remaining2),
+    reset     = math.floor(now + (res.wait or 0)),
+  }
+end
+
 --- 核心决策。
 -- remaining 口径（快/慢路径一致）：均为"本节点视角"的剩余——
 -- fast path 是本地库存余量；slow path 的 granted-1 恰好等于 fill 后的本地库存。
@@ -341,26 +441,9 @@ function _M.check(conf, key)
   -- batch 先解析：batch=1 = 严格全局一致模式，完全绕开本地库存（D4）
   local batch = _M.resolve_batch(conf)
 
-  -- 1) fast path：本地库存直接扣减，零网络 IO（batch>1 才有库存语义）
+  -- 1) Lease 路径：单规则 batch>1 ⇒ Worker 本地 TAKE / GRANT_LEASE（Phase 6）
   if batch > 1 then
-    local ok, remaining = store.take(key)
-    if ok then
-      kong.log.notice(
-      "[RL-DEBUG] local_hit key=", key,
-      " remaining=", remaining
-      )
-      local reset
-      if remaining > 0 then
-        reset = math.floor(now)          -- 下一令牌已可用
-      else
-        reset = math.floor(now + next_tick) -- 刚取走最后一个，保守近似
-      end
-      return {
-        allowed   = true,
-        remaining = math.max(0, remaining),
-        reset     = reset,
-      }
-    end
+    return _M.check_lease(conf, key)
   end
 
   -- 2) slow path：向全局桶领一批（batch=1 时每请求必经此路径）
