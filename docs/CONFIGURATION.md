@@ -9,11 +9,11 @@
 |---|---|---|---|---|
 | `limit` | integer | **必填** | 每 window 秒允许的请求数（桶速率 rate=limit/window） | > 0 |
 | `window` | number | 60 | 窗口长度（秒） | > 0 |
-| `burst` | integer | 0 | 桶容量；0 = 跟随 limit（允许一个窗口内完整突发） | 0 ≤ burst ≤ 100000000；`≤0 归一化为 limit`（参与策略指纹） |
+| `burst` | integer | 0 | 桶容量；0 = 跟随 limit（允许一个窗口内完整突发） | 0 ≤ burst ≤ 100000000；`0 归一化为 limit`（参与策略指纹） |
 | `batch` | integer | 0 | 每次 Redis 领取的令牌数；**0 = auto（clamp(limit/50, 1, 50)）；1 = 严格全局一致；>1 = Lease 预授权** | 0 ≤ batch ≤ 100000000；**不参与策略指纹**；rules 模式下必须 0/1 |
-| `limit_by` | array of string | ["ip"] | 限流维度，可组合 | 每元素 ∈ {consumer, ip, path, method, header, route, service}；len≥1；**与 rules 互斥**（rules 非空时显式设置即 400）；含 `header` 时 `header_name` 必填 |
+| `limit_by` | array of string | ["ip"] | 限流维度，可组合 | 每元素 ∈ {consumer, ip, path, method, header, route, service}；len≥1；**rules 模式下应省略**（Schema 以默认值比较实现互斥检查：非默认 limit_by 会被拒绝；默认 `["ip"]` 与未设置无法区分，可能作为默认值存在并被忽略）；含 `header` 时 `header_name` 必填 |
 | `header_name` | string | 无 | `limit_by` 含 "header" 时的取值头名 | 条件必填（缺失 ⇒ 下发 400） |
-| `rules` | array of record | 无 | 多规则联合判定（α 强一致） | ≤ 8 条；与 `limit_by` 互斥；每条规则独立 limit/window/burst/limit_by/header_name |
+| `rules` | array of record | 无 | 多规则联合判定（α 强一致） | ≤ 8 条；rules 模式下应省略顶层 `limit_by`（互斥检查口径见上）；每条规则独立 limit/window/burst/limit_by/header_name |
 | `namespace` | string | "rl" | 命名空间（隔离不同配置的全局桶） | — |
 | `hide_client_headers` | boolean | false | 不回 X-RateLimit-* 头 | — |
 | `fault_tolerant` | boolean | false | Redis 故障策略：false=Fail-close（503）；true=降级放行（X-RateLimit-Status: degraded） | — |
@@ -64,7 +64,7 @@
 
 | 组合 | 结果 |
 |---|---|
-| `rules` 非空 + 显式 `limit_by` | 下发 400（互斥；rules 模式下省略 limit_by 即可） |
+| `rules` 非空 + 非默认 `limit_by` | 下发 400（Schema 以默认值 `["ip"]` 比较实现互斥检查；rules 模式下省略 limit_by 即可。注意：显式 `["ip"]` 与默认值无法区分，会通过该检查并作为默认值被忽略） |
 | `rules` 非空 + `batch > 1` | 下发 400（强一致模式无 Lease） |
 | `rules` 长度 > 8 | 下发 400 |
 | `limit_by` 含 `header` 而 `header_name` 缺失 | 下发 400（顶层与每条规则同语义） |

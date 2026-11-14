@@ -87,7 +87,7 @@ done
 
 ```bash
 docker compose exec -T redis redis-cli --scan --pattern 'kong:rl:*'   # 桶键/Lease 记录
-docker compose exec -T redis redis-cli HGET "<桶键>" tokens ts        # 桶状态
+docker compose exec -T redis redis-cli HMGET "<桶键>" tokens ts        # 桶状态
 docker compose exec -T redis redis-cli INFO commandstats | grep evalsha   # 授权命令计数
 ```
 
@@ -111,7 +111,7 @@ docker compose logs -f kong1 kong2 kong3 --tail 100
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
-| `failed to bind host port 0.0.0.0:8000` | Windows iphlpsvc 占 8000（WSL mirrored） | 已用 8030；占用则改 compose 并同步 bench/common.sh PROXY_NODES 与 k6 NODES |
+| 代理端口被占用（8030/8010/8020） | 宿主机已有进程占用对应端口 | 按报错定位端口；更换 compose 映射并同步 bench/common.sh 的 PROXY_NODES 与 k6 NODES |
 | `failed to bind host port 6379` | 宿主机已有 redis-server | 已映射 6380（容器内 6379） |
 | 容器起不来，`unknown directive` | env 注入指令不被该 Kong 版本接受 | 按日志定位指令；本插件不依赖 shared dict |
 | `POST /config` 400 | JSON body 兼容差异 | 改 `-d "config=$(cat kong/kong.yml)"` form 形式 |
@@ -122,13 +122,21 @@ docker compose logs -f kong1 kong2 kong3 --tail 100
 
 ## 10. 环境清理
 
+两个独立方案：
+
 ```bash
-docker compose down -v               # 停止并删卷
-docker compose exec -T redis redis-cli FLUSHDB    # 仅清 Redis 数据（注意：同时清掉本地池依赖的全局桶）
+# 方案一：仅清空 Redis 数据（容器必须处于运行状态）
+docker compose exec -T redis redis-cli FLUSHDB
 ```
 
-> 注意：只清 Redis 不重启 Kong 时，Worker 本地已确认库存仍可继续消费（冻结语义，V1 不回收）；
-> 需要"完全重置"时建议 `down -v` 后重新 `up -d`。
+```bash
+# 方案二：完整重置 Compose 环境
+docker compose down -v
+docker compose up -d
+```
+
+> 注意：只清 Redis 不重启 Kong 时，Worker 本地已确认的 Lease 库存仍可能继续消费（冻结语义，V1 不回收）；
+> 需要"完全重置"时应采用方案二重建 Kong Worker。
 
 ## 11. 边界重申
 
