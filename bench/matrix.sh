@@ -270,7 +270,7 @@ run_case_checked() { # run_case_checked <label> <kind> <batch> <rate>
 }
 
 # ---------- 执行全部组 ----------
-log "Phase 4 第一组基线：Legacy EVAL + Shared Inventory（Worker=$WORKERS, log=$LOGLEVEL, DUR=${DUR}s, RPS=$RATES）"
+log "性能矩阵（当前实现）：M0/batch=1/batch=N/多规则 × RPS 档（Worker=$WORKERS, log=$LOGLEVEL, DUR=${DUR}s, RPS=$RATES）"
 # 目标形态与 compose 默认（2/notice）不同时先切换
 if [ "$WORKERS" != "2" ] || [ "$LOGLEVEL" != "notice" ]; then
     switch_workers "$WORKERS" "$LOGLEVEL"
@@ -290,7 +290,7 @@ for rate in "${RATE_ARR[@]}"; do run_case_checked "C-multi" multi 0 "$rate"; don
 OUT_FILE="$PROJECT_ROOT/bench/out/results-${TAG}-w${WORKERS}-${LOGLEVEL}-${RHOST}.md"
 mkdir -p "$(dirname "$OUT_FILE")"
 {
-    echo "# Phase 4 性能矩阵 —— Legacy EVAL + Shared Inventory（标签=$TAG, Worker=$WORKERS, log=$LOGLEVEL, redisHost=$RHOST_ARG, echoHost=$EHOST_ARG）"
+    echo "# 性能矩阵（当前实现实测；标签=$TAG, Worker=$WORKERS, log=$LOGLEVEL, redisHost=$RHOST_ARG, echoHost=$EHOST_ARG；limit=$LIMIT window=${WINDOW}s 时长=${DUR}s RPS=$RATES batch=$BATCHES）"
     echo
     echo "生成时间：$(date '+%F %T')　limit=$LIMIT window=${WINDOW}s 时长=${DUR}s RPS=$RATES batch=$BATCHES"
     echo
