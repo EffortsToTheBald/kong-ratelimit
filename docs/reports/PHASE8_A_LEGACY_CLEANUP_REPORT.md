@@ -40,16 +40,16 @@
 | 配置隔离单测 | `bash test/config-isolation-unit.sh` | 15 | 0 |
 | 配置隔离 E2E | `bash test/config-isolation-e2e.sh` | 14 | 0 |
 | handler 故障双路径 | `bash test/handler-fault-e2e.sh` | 26 | 0 |
-| quota batch=1 | `bash bench/quota.sh -b 1` | 100/350/0 严格 | 0 |
-| quota batch=20 | `bash bench/quota.sh -b 20` | 99/351 ∈[40,100] | 0 |
+| quota batch=1 | `bash bench/quota.sh -b 1` | 实际 450 请求（allowed=100 / limited=350 / other=0）；验收条件：放行严格等于配额 100 ⇒ 通过 | 0 |
+| quota batch=20 | `bash bench/quota.sh -b 20` | 实际 450 请求（allowed=99 / limited=351 / other=0）；验收条件：放行落在 [40,100] 区间 ⇒ 通过 | 0 |
 | dims 维度回归 | `bash bench/dims.sh` | 8 | 0 |
 | rules 多规则 | `bash bench/rules.sh` | 14 | 0 |
-| 6.5 并发 | `bash test/concurrent-lease-e2e.sh` | 17（首轮 1 偶发失败，连跑 2 次全绿；与本次清理无关的环境波动） | 0 |
+| 6.5 并发 | `bash test/concurrent-lease-e2e.sh` | 17（首轮 1 偶发失败，随后两次连续全绿；与本次清理无关的环境波动） | 0 |
 | 6.5 耗尽重申请 | `bash test/lease-exhaustion-e2e.sh` | 11 | 0 |
 | 6.5 kill -9 账目 | `bash test/worker-crash-e2e.sh` | 16 | 0 |
 | 6.5 超时不确定 | `bash test/lease-timeout-uncertain-e2e.sh` | 22 | 0 |
 
-**合计 236 PASS / 0 FAIL / NOT RUN：无**（批次 A 清单全项执行）。
+**分项合计（断言口径）**：E2E/单测脚本断言 **200 PASS / 0 FAIL**（25+17+15+15+14+26+8+14+17+11+16+22）；quota 两项为请求级验收（450 请求 × 2，非断言计数），验收条件均满足；NOT RUN：无（批次 A 清单全项执行）。
 
 ## 6. Docker Compose 验证
 
@@ -81,7 +81,7 @@
 | b10 leaseGrant/请求数 | 2002/20001 | 2002/20000 | 一致（9.99:1） |
 | b10 localHit | 17998 | 17998 | 一致 |
 | EVAL / SCRIPT_LOAD | 0 / 0 | 0 / 0 | 一致 |
-| p50/p95（b10） | 0.50/1.16 | 0.48/1.09（r100 干净轮 1.09/1.91→@1000 0.48 量级一致） | 同量级 |
+| p50/p95（b10，@1000） | 0.50/1.16 | 0.45/1.04 | 同量级 |
 
 ## 9. 未验证事项
 

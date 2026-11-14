@@ -202,8 +202,9 @@ done | sort | uniq -c
 ## 8. 已知限制 / 生产化差距
 
 见 `docs/design.md` 第 8、9 节。要点：Redis 主从切换窗口内可能重复发放；单 key 热点；
-`limit_by=path` 的高基数风险；batch>1 为预授权模式（库存 Worker 私有 Lua table，不依赖 shared dict；
-Worker 崩溃损失未消费库存，Phase 5 恢复自动 RETURN）；默认已是 fail-closed（503）；
+`limit_by=path` 的高基数风险；batch>1 为预授权模式（库存 Worker 私有 Lua table，不依赖 shared dict）；
+Worker 崩溃可能导致未消费的 Lease 库存损失。自动 RETURN、Worker 接管和库存补偿属于 Deferred 能力，当前 V1 尚未实现。
+默认已是 fail-closed（503）；
 可用性敏感的场景可显式设 `fault_tolerant: true`，换取 degraded 放行。
 
 ## 9. 常见故障
