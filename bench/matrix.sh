@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# matrix.sh —— Phase 4 第一组性能基线（Legacy EVAL + Shared Inventory）
+# matrix.sh —— 性能矩阵框架（Phase 1 Legacy 基线沿用；Phase 7 Lease 实现复用，新增 leaseGrant 列）
 #
 # 用法：
 #   ./bench/matrix.sh -w 2      # Worker=2 全组（当前 compose 配置）
@@ -9,7 +9,7 @@
 # 组划分（不再全维度交叉）：
 #   M0  无插件对照
 #   A   单规则 batch=1（每请求 1 次 Redis EVAL）
-#   B   单规则 batch>1（显式 batch=10/50/100；本地命中 + slow path EVAL）
+#   B   单规则 batch>1（显式 batch；Phase 1 Legacy=shared dict，Phase 7=Lease 本地 TAKE + GRANT_LEASE）
 #   C   多规则 GRANT_MULTI（每请求 1 次 EVAL）
 #   RPS 档位：低 100 / 中 500 / 高 1000
 #
@@ -196,11 +196,12 @@ report_row() { # report_row <label> <batch> <rps_target> <elapsed> <summary_file
     evals=$(( SNAP[eval1] - SNAP[eval0] ))
     local eshas=$(( SNAP[esha1] - SNAP[esha0] ))
     local scpts=$(( SNAP[scpt1] - SNAP[scpt0] ))
-    hits=0; grants=0; multis=0
+    hits=0; grants=0; multis=0; lgrants=0
     for node in 1 2 3; do
         hits=$(( hits + $(kong_log_count_since "$node" "${SNAP[log0_$node]}" 'local_hit') ))
         grants=$(( grants + $(kong_log_count_since "$node" "${SNAP[log0_$node]}" 'redis_grant') ))
         multis=$(( multis + $(kong_log_count_since "$node" "${SNAP[log0_$node]}" 'multi_grant') ))
+        lgrants=$(( lgrants + $(kong_log_count_since "$node" "${SNAP[log0_$node]}" 'lease_grant') ))
     done
     kcpu=$(awk -v a1="${SNAP[kcpu0_1]}" -v b1="${SNAP[kcpu1_1]}" -v a2="${SNAP[kcpu0_2]}" -v b2="${SNAP[kcpu1_2]}" -v a3="${SNAP[kcpu0_3]}" -v b3="${SNAP[kcpu1_3]}" -v e="$elapsed" \
         'BEGIN{ if(e>0) printf "%.3f",((b1-a1)+(b2-a2)+(b3-a3))/1e6/e; else print 0 }')
@@ -208,7 +209,7 @@ report_row() { # report_row <label> <batch> <rps_target> <elapsed> <summary_file
     printf '    p50=%-7.2f p95=%-7.2f p99=%-7.2f rps=%-6.0f redisQPS=%-6s evals=%-6s localHit=%-6s grant=%-5s multi=%-5s redisCPU=%ss kongCPU=%s核\n' \
         "$p50" "$p95" "$p99" "$rps" "$qps" "$evals" "$hits" "$grants" "$multis" "$cpu_r" "$kcpu"
 
-    ROWS+=("$label|$batch|$rps_t|$(printf '%.0f' "$rps")|$(printf '%.2f' "$p50")|$(printf '%.2f' "$p95")|$(printf '%.2f' "$p99")|$okcnt|$limcnt|$qps|$evals|$eshas|$scpts|$hits|$grants|$multis|$cpu_r|$kcpu|$attempt")
+    ROWS+=("$label|$batch|$rps_t|$(printf '%.0f' "$rps")|$(printf '%.2f' "$p50")|$(printf '%.2f' "$p95")|$(printf '%.2f' "$p99")|$okcnt|$limcnt|$qps|$evals|$eshas|$scpts|$hits|$grants|$lgrants|$multis|$cpu_r|$kcpu|$attempt")
 }
 
 run_case_once() { # run_case_once <label> <kind> <batch> <rate> <attempt> → echo "p99 rps"；结果行写入 ROWS
@@ -293,18 +294,18 @@ mkdir -p "$(dirname "$OUT_FILE")"
     echo
     echo "生成时间：$(date '+%F %T')　limit=$LIMIT window=${WINDOW}s 时长=${DUR}s RPS=$RATES batch=$BATCHES"
     echo
-    echo "| 场景 | batch | RPS目标 | 实测RPS | p50 | p95 | p99 | 200 | 429 | RedisQPS | EVAL次数 | EVALSHA次数 | SCRIPT_LOAD次数 | 本地命中 | slowGrant | multiGrant | RedisCPU(s) | KongCPU(核) | 尝试 |"
-    echo "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+    echo "| 场景 | batch | RPS目标 | 实测RPS | p50 | p95 | p99 | 200 | 429 | RedisQPS | EVAL次数 | EVALSHA次数 | SCRIPT_LOAD次数 | 本地命中 | slowGrant | leaseGrant | multiGrant | RedisCPU(s) | KongCPU(核) | 尝试 |"
+    echo "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
     for row in "${ROWS[@]}"; do
         IFS='|' read -ra f <<< "$row"
-        echo "| ${f[0]} | ${f[1]} | ${f[2]} | ${f[3]} | ${f[4]} | ${f[5]} | ${f[6]} | ${f[7]} | ${f[8]} | ${f[9]} | ${f[10]} | ${f[11]} | ${f[12]} | ${f[13]} | ${f[14]} | ${f[15]} | ${f[16]} | ${f[17]} | ${f[18]} |"
+        echo "| ${f[0]} | ${f[1]} | ${f[2]} | ${f[3]} | ${f[4]} | ${f[5]} | ${f[6]} | ${f[7]} | ${f[8]} | ${f[9]} | ${f[10]} | ${f[11]} | ${f[12]} | ${f[13]} | ${f[14]} | ${f[15]} | ${f[16]} | ${f[17]} | ${f[18]} | ${f[19]} |"
     done
     cat <<'EOF'
 
 ## 读表口径
 
 - EVAL次数 = INFO commandstats cmdstat_eval 调用差值（组内单一脚本，可解释：A/C 每请求 1 次；B ≈ 请求数/batch）。
-- 本地命中 = 三节点 [RL-DEBUG] local_hit 日志行数差值；slowGrant = redis_grant；multiGrant = multi_grant。
+- 本地命中 = 三节点 [RL-DEBUG] local_hit 日志行数差值；slowGrant = redis_grant；leaseGrant = lease_grant（Lease 实现的 GRANT_LEASE 路径）；multiGrant = multi_grant。
 - RedisCPU(s) = INFO cpu used_cpu_sys+user 差值；KongCPU(核) = 容器 cgroup cpu.stat usage_usec 差值/时长/1e6（三节点合计）。
 - Redis QPS = total_commands_processed 差值/时长（含连接/脚本/读写全量命令）。
 EOF

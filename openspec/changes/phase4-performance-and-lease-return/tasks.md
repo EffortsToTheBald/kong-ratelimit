@@ -69,11 +69,11 @@
 
 ## Phase 7：核心正确性与性能验证（`test: add phase4 lease performance report`；V1 压缩版）
 
-- [ ] 7.1 正确性测试 11 项：①多 Worker 并发申请不超发 ②本地并发 TAKE 不重复消费 ③remaining≥0 ④耗尽重申请流程 ⑤kill -9 损失不重新发放 ⑥batch=1 无 Lease 记录 ⑦多规则无 Lease 记录 ⑧多规则全或无 ⑨Fail-close ⑩429+Retry-After ⑪quota/dims/rules 回归；验证：E2E 断言逐项
-- [ ] 7.2 性能三点：M0（复用 Phase 1 数据）+ batch=1 + batch=10（Worker 1/多 × 速率低中高）；采集 RPS/p50/p95/p99/Redis QPS；重点验证 batch=10 是否显著降低 Redis 请求次数且保持限流正确性；验证：与 Phase 1 同口径
-- [ ] 7.3 Phase 3 矩阵证据核对：确认 `test/lease-redis-matrix.sh` 50 项与当前最终代码版本对应（必要时仅跑 smoke：GRANT 正常/RETURN 幂等/TTL 校验抽测）；验证：核对记录
-- [ ] 7.4 报告体例：编号/目的/环境/配置/参数/实际量/时长/RPS/p50/p95/p99/Redis QPS/异常/结论；未执行项 NOT RUN；原始数据入库；验证：体例符合
-- [ ] 7.5 commit `test: add phase4 lease performance report`；验证：git log
+- [x] 7.1 正确性测试 11 项：①多 Worker 并发申请不超发 ②本地并发 TAKE 不重复消费 ③remaining≥0 ④耗尽重申请流程 ⑤kill -9 损失不重新发放 ⑥batch=1 无 Lease 记录 ⑦多规则无 Lease 记录 ⑧多规则全或无 ⑨Fail-close ⑩429+Retry-After ⑪quota/dims/rules 回归；验证：E2E 断言逐项
+- [x] 7.2 性能三点：M0（复用 Phase 1 数据）+ batch=1 + batch=10（Worker 1/多 × 速率低中高）；采集 RPS/p50/p95/p99/Redis QPS；重点验证 batch=10 是否显著降低 Redis 请求次数且保持限流正确性；验证：与 Phase 1 同口径
+- [x] 7.3 Phase 3 矩阵证据核对：确认 `test/lease-redis-matrix.sh` 50 项与当前最终代码版本对应（必要时仅跑 smoke：GRANT 正常/RETURN 幂等/TTL 校验抽测）；验证：核对记录
+- [x] 7.4 报告体例：编号/目的/环境/配置/参数/实际量/时长/RPS/p50/p95/p99/Redis QPS/异常/结论；未执行项 NOT RUN；原始数据入库；验证：体例符合
+- [x] 7.5 commit `test: add phase4 lease performance report`；验证：git log
 
 ## Phase 8：清理与最终交付（`refactor: remove legacy local inventory implementation`；仅当全部测试通过）
 
