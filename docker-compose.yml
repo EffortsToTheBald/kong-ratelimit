@@ -27,10 +27,8 @@ x-kong-common: &kong-common
     KONG_PROXY_ERROR_LOG: /dev/stderr
     KONG_ADMIN_ERROR_LOG: /dev/stderr
     KONG_ADMIN_LISTEN: "0.0.0.0:8001"
-    # 固定 worker 数，让 shared dict 的行为可复现（否则随机器核数变化）
+    # 固定 worker 数，让压测/诊断行为可复现（否则随机器核数变化）
     KONG_NGINX_WORKER_PROCESSES: "2"
-    # 插件用的本地库存。生产上应写进 kong.conf，这里用 env 注入到 http 块
-    KONG_NGINX_HTTP_LUA_SHARED_DICT: "kong_rl 32m"
   volumes:
     - ./kong/kong.yml:/kong/declarative/kong.yml:ro
     - ./kong/plugins/rate-limit-advanced:/usr/local/share/lua/5.1/kong/plugins/rate-limit-advanced:ro

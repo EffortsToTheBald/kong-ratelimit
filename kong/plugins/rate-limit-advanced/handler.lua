@@ -14,7 +14,7 @@ local _M = {
 -- V1 Lease 模型（Phase 6）：库存 = Worker 私有 Lua table（lease.lua），
 -- 不依赖 shared dict；本地 TAKE 零 IO，Redis 故障语义只由 GRANT 路径决定
 -- （Fail-close/Fail-open 分支保持 batch=1 时代原样，见 access 内 nil-decision 分支）。
--- Design D2：shared-dict 降级告警随 store.lua 废弃而删除（store 本体 Phase 8 清理）。
+-- Legacy shared-dict 聚合库存（store.lua）已随 Phase 8 批次 A 移除。
 function _M:init_worker()
   kong.log.notice("rate-limit-advanced: V1 lease mode (worker-private table, no shared dict)")
 end

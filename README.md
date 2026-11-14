@@ -22,9 +22,9 @@ kong-ratelimit/
 │       ├── schema.lua          # 配置模型 + 校验
 │       ├── handler.lua         # access 阶段：判定 / 响应头 / 429
 │       └── lib/
-│           ├── algorithm.lua   # key 构建 + 决策主流程
-│           ├── store.lua       # 本地库存（shared dict，降级为 worker 内存）
-│           └── redis.lua       # 连接池 + 内嵌 Lua 脚本（令牌桶，用 Redis TIME）
+│           ├── algorithm.lua   # key 构建 + 决策主流程（batch=1 逐请求 Redis；batch>1 Lease；多规则 GRANT_MULTI）
+│           ├── lease.lua       # Worker 私有 Lease Manager（batch>1 本地 TAKE/GRANT，不依赖 shared dict）
+│           └── redis.lua       # 连接池 + 内嵌 Lua 脚本（EVALSHA 令牌桶/GRANT_MULTI/GRANT_LEASE，用 Redis TIME）
 ├── k6/
 │   ├── quota.js                # 配额正确性：3 节点打超额，数 200 vs 429
 │   └── latency.js              # 延迟/吞吐：恒定到达率压测
@@ -202,8 +202,9 @@ done | sort | uniq -c
 ## 8. 已知限制 / 生产化差距
 
 见 `docs/design.md` 第 8、9 节。要点：Redis 主从切换窗口内可能重复发放；单 key 热点；
-`limit_by=path` 的高基数风险；shared dict 需要改 `kong.conf`（本项目用 `KONG_NGINX_HTTP_LUA_SHARED_DICT`）；
-默认已是 fail-closed（503）；可用性敏感的场景可显式设 `fault_tolerant: true`，换取 degraded 放行。
+`limit_by=path` 的高基数风险；batch>1 为预授权模式（库存 Worker 私有 Lua table，不依赖 shared dict；
+Worker 崩溃损失未消费库存，Phase 5 恢复自动 RETURN）；默认已是 fail-closed（503）；
+可用性敏感的场景可显式设 `fault_tolerant: true`，换取 degraded 放行。
 
 ## 9. 常见故障
 
@@ -211,7 +212,7 @@ done | sort | uniq -c
 |---|---|---|
 | `failed to bind host port 0.0.0.0:8000` | Windows 的 `iphlpsvc` 占 8000，且 WSL 是 mirrored 网络模式 | 已把 kong1 改到 8030；若 8030 也被占，改 `docker-compose.yml` 并同步改 `bench/common.sh` 与 k6 里的 NODES |
 | `failed to bind host port 6379` | 宿主机已有本地 redis-server | 已映射到 6380，容器内仍是 6379 |
-| 容器起不来，日志报 `unknown directive` | `KONG_NGINX_HTTP_LUA_SHARED_DICT` 没被接受 | 临时删掉该环境变量，插件会降级为 worker 内存表（精度下降但能跑） |
+| 容器起不来，日志报 `unknown directive` | Kong 对个别 env 注入指令不接受 | 检查日志中报错的指令；本插件 V1 不依赖 shared dict（库存为 Worker 私有 Lua table） |
 | `POST /config` 返回 400 | Kong 版本对 JSON body 的兼容差异 | 改用 `-d "config=$(cat kong/kong.yml)"` 提交 form 形式 |
 | 三个节点通过数加起来 > limit | 只有一个节点收到了新配置 | 检查 `apply_config` 的警告输出，或手动 `curl -X POST` 到 8011/8021 |
 | 压测时 Redis 端口耗尽 | 忘了 keepalive | 确认 `lib/redis.lua` 里的 `set_keepalive` 没被注释 |

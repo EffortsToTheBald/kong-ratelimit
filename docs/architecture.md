@@ -10,8 +10,8 @@
 |---|---|
 | 身份认证 | key-auth 插件（PRIORITY 1250，先于限流 1002 执行） |
 | 限流引擎 | handler（判定与响应）+ algorithm（限流键构造与决策主流程） |
-| 本地库存 | ngx.shared.kong_rl（32m，环境变量注入；跨 worker 共享，每副本一份） |
-| 远程批量租约 | resty.redis 连接池 + 内嵌 EVAL 令牌桶脚本 |
+| 本地库存（batch>1 单规则） | Worker 私有 Lua table（lease.lua；每 Worker 一份，跨 Worker 不共享，不依赖 shared dict） |
+| 远程批量租约 | resty.redis 连接池 + 内嵌 Lua 脚本（EVALSHA：token_bucket / GRANT_LEASE / GRANT_MULTI） |
 | 权威层 | Redis 7 单实例（宿主 6380→容器 6379），Hash tokens/ts + PEXPIRE |
 | 配置面 | Admin API `POST /config`（DB-less 逐节点下发） |
 | 验证面 | bench/*.sh + k6/*.js（配额、延迟、多维、XFF） |
@@ -62,14 +62,14 @@ flowchart TB
     classDef client fill:#ede7f6,stroke:#5e35b1,color:#311b92;
     classDef gw fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20;
     classDef gwsub fill:#f1f8e9,stroke:#66bb6a,color:#1b5e20;
-    classDef store fill:#e0f2f1,stroke:#00897b,color:#004d40;
+    classDef conn fill:#e0f2f1,stroke:#00897b,color:#004d40;
     classDef authz fill:#fff3e0,stroke:#ef6c00,color:#e65100;
     classDef out fill:#eceff1,stroke:#607d8b,color:#263238;
     classDef admin fill:#fafafa,stroke:#9e9e9e,stroke-dasharray:4 3,color:#424242;
     class C,PASS,BLOCK client;
     class GW gw;
     class REPL,AUTH,KEY,LEASE gwsub;
-    class POOL,REDIS store;
+    class POOL,REDIS conn;
     class UP out;
     class ADMIN,HARNESS admin;
 ```

@@ -7,7 +7,6 @@
 -- ============================================================
 local bit = require "bit"
 
-local store = require "kong.plugins.rate-limit-advanced.lib.store"
 local redis_mod = require "kong.plugins.rate-limit-advanced.lib.redis"
 local lease = require "kong.plugins.rate-limit-advanced.lib.lease"
 
@@ -474,14 +473,7 @@ function _M.check(conf, key)
       retry_after = wait,
     }
   end
-  -- 本次消耗 1 个，其余放进本地库存（batch=1 恒 granted=1，不产生库存）
-  if batch > 1 and granted.granted > 1 then
-    kong.log.notice(
-    "[RL-DEBUG] local_fill key=", key,
-    " fill=", math.max(0, granted.granted - 1)
-    )
-    store.fill(key, granted.granted - 1, ttl_s)
-  end
+  -- batch=1：本请求恰好消耗 granted=1 中的 1 个，无本地库存（batch>1 已在上方转 check_lease）
 
   -- slow path allowed：wait=0 ⇒ 下一令牌已可用；wait>0 ⇒ 部分授予后桶内 tokens<1
   return {
