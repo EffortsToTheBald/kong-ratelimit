@@ -1,4 +1,4 @@
-# Phase 4 性能矩阵 —— Legacy EVAL + Shared Inventory（标签=p7w1r3, Worker=1, log=notice, redisHost=redis, echoHost=echo）
+# Phase 7 性能矩阵 —— 当前 Lease 实现性能实测（标签=p7w1r3, Worker=1, log=notice, redisHost=redis, echoHost=echo）
 
 生成时间：2026-11-14 19:28:44　limit=1000000 window=60s 时长=20s RPS=100,500,1000 batch=10
 
