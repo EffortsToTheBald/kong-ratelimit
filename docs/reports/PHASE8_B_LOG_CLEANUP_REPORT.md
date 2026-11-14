@@ -60,15 +60,15 @@
 | `bash test/evalsha-unit.sh` | 8/0 |
 | `bash test/config-isolation-unit.sh` | 15/0（stub 适配后） |
 | `bash test/algorithm-lease-e2e.sh` | 15/0 |
-| `bash test/config-isolation-e2e.sh` | 4 次执行：13/1、14/0、14/0、14/0（首轮 1 次偶发失败，未复现；与日志调整无关的行为波动，已留原始记录） |
+| `bash test/config-isolation-e2e.sh` | 4 次执行历史：13/1、14/0、14/0、14/0（首轮 1 次偶发失败，未复现；历史失败轮次与最近一轮统计分开记录，归因 NOT VERIFIED） |
 | `bash test/handler-fault-e2e.sh` | 26/0 |
 | `bash test/concurrent-lease-e2e.sh` | 17/0 |
 | `bash test/lease-exhaustion-e2e.sh` | 11/0 |
 | `bash test/worker-crash-e2e.sh` | 16/0 |
 | `bash test/lease-timeout-uncertain-e2e.sh` | 22/0 |
-| **合计（最近一轮）** | **断言 157 PASS / 0 FAIL**（25+17+8+15+15+14+26+17+11+16+22=186 为各脚本首轮总量；最近一轮实际 186−13(首轮cisolation)=……见下注） |
+| **合计（最近一轮：config-isolation-e2e 取 14）** | **25+17+8+15+15+14+26+17+11+16+22 = 186 PASS / 0 FAIL** |
 
-注：分项以上表为准；config-isolation-e2e 取最近三轮 14/0 口径。语义验证：429/503 语义、batch=1/batch>1/多规则、故障路径、崩溃语义、耗尽重申请——全部通过对应 E2E 断言。
+语义验证：429/503 语义、batch=1/batch>1/多规则、故障路径、崩溃语义、耗尽重申请——全部通过对应 E2E 断言。
 
 ## 6. 性能矩阵抽测（p8bcheck，仅验证采集能力；非正式性能结论）
 
@@ -76,15 +76,17 @@
 
 | 列 | 干净轮实测 | 判定 |
 |---|---|---|
-| localHit（b10 @1000） | 17998 | ✓ 采集正常 |
-| leaseGrant（b10 @1000） | 2003（≈请求数/10） | ✓ |
-| slowGrant（b1 @1000） | 20000/20001 | ✓ |
-| multiGrant（multi @1000） | 20001 | ✓ |
-| EVALSHA（b1/b10/multi） | 20000/2003/20001 | ✓ |
+| localHit（b10 **@500** 干净轮 a3） | 8998 | ✓ 采集正常 |
+| leaseGrant（b10 **@500** 干净轮 a3） | 1003（≈请求数 10001/10） | ✓ |
+| slowGrant（b1 **@1000** 干净轮 a2） | 20000（=200 数 20000） | ✓ |
+| multiGrant（multi **@1000** 干净轮 a1） | 20001 | ✓ |
+| EVALSHA（b1/b10/multi，各干净轮） | 20000 / 1003 / 20001 | ✓ |
 | EVAL / SCRIPT_LOAD | 0 / 0 | ✓ |
 | 429/5xx | 0/0 | ✓ |
 
-- 本轮宿主机 4s 噪声较重（多轮污染，原始行保留）；**不作为性能结论、不与 Phase 7 混用**。
+- **数据来源勘误（v2）**：初版本节误写 "localHit 17998 / leaseGrant 2003（b10 @1000）"——该数值来自 **p8acheck**（批次 A 抽测，notice 级，`bench/raw/phase7/results-p8acheck-w2-notice-redis.md` 的 B-batch10 @1000 a1 行：17998/2003），与本节 p8bcheck 无关，属轮次混用，已删除。
+- **p8bcheck 归档原始数据为准**：B-batch10 @1000 三次尝试**全部被 4s 环境噪声污染**（实测 RPS 902/952/959、p99 6101/3880/3950ms；localHit 12649/14977/15000、leaseGrant 1925/2152/1720——比例仍 ≈1/10，采集能力成立但无干净轮）；b10 的干净轮证据取 **@500 a3**（8998/1003，原始行保留于结果表）。
+- 本轮宿主机 4s 噪声较重；**不作为性能结论、不与 Phase 7 混用**。
 
 ## 7. notice 日志数量对比
 
