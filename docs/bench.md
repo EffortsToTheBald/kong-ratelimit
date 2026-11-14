@@ -1,5 +1,11 @@
 # 实验协议：延迟 × 精度 × Redis 负载
 
+> **当前口径（Phase 7）**：正式性能数据见 `docs/reports/PHASE7_PERFORMANCE_REPORT.md`
+> （原始数据 `bench/raw/phase7/`）。本文保留实验设计原则；与当前 `bench/matrix.sh` 实际默认值的
+> 差异以脚本为准：`BATCHES=10,50,100`、`RATES=100,500,1000`、`DUR=20s`、`LIMIT=1000000`、
+> `LOGLEVEL=debug`（统计列依赖，Phase 8.2-B 起）。下文"shared dict""30s"等为 Legacy 时代
+> 历史表述，仅作设计原则参考。
+
 > 目标不是"跑出好看的数"，而是**用同一份代码、一个参数，画出三条单调曲线**，
 > 并给出取值的依据。评审看的不是你压到多少 QPS，而是你知不知道自己在上界附近哪里。
 

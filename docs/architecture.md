@@ -1,213 +1,198 @@
-# 架构图与问题状态总览
+# 架构：rate-limit-advanced（V1，Phase 0–8.2 冻结版）
 
-> 配套文档：`docs/design.md`（设计取舍与误差分析）、`reports/phase-1-correctness.md`（验收证据）、`test/first-commit.md`（人工剧本）。
-> 图示约定：**实线** = 已实现并验证的数据/控制流；**虚线** = 管理面/验证面；节点配色 = 分区（绿=已解决，黄=进行中/远期，红=生产边界）。
-> 图内不出现文件名，概念 → 实现的对照见「表 0」。
+> 配套：`docs/design.md`（冻结设计 D1–D9 与误差推导）、`docs/PHASE6_REQUEST_INTEGRATION_REPORT.md`（集成验收）、
+> `docs/reports/PHASE7_PERFORMANCE_REPORT.md`（性能）、历史报告见 `docs/reports/` 与 `docs/PHASE*_*.md`。
+> 术语约定：**Lease** = Worker 本地预授权库存；**GRANT_LEASE / GRANT_MULTI** = Redis Lua 脚本；
+> **CLOSED** = 本地耗尽态；**outstanding** = Worker 本地尚未消费的库存；**lost** = 已授权但无法继续使用的库存。
 
-## 图 0 · 模块对照（图外注释）
+## 1. 整体架构
 
-| 图中概念 | 对应实现 |
-|---|---|
-| 身份认证 | key-auth 插件（PRIORITY 1250，先于限流 1002 执行） |
-| 限流引擎 | handler（判定与响应）+ algorithm（限流键构造与决策主流程） |
-| 本地库存（batch>1 单规则） | Worker 私有 Lua table（lease.lua；每 Worker 一份，跨 Worker 不共享，不依赖 shared dict） |
-| 远程批量租约 | resty.redis 连接池 + 内嵌 Lua 脚本（EVALSHA：token_bucket / GRANT_LEASE / GRANT_MULTI） |
-| 权威层 | Redis 7 单实例（宿主 6380→容器 6379），Hash tokens/ts + PEXPIRE |
-| 配置面 | Admin API `POST /config`（DB-less 逐节点下发） |
-| 验证面 | bench/*.sh + k6/*.js（配额、延迟、多维、XFF） |
-
----
-
-## 图 1 · 总体架构
-
-```mermaid
-flowchart TB
-    C(("客户端<br/>curl · k6"))
-
-    subgraph GW["网关层 —— Kong ×3 副本 · DB-less · 结构相同"]
-        direction TB
-        subgraph REPL["任一副本（2 workers 共享同一份本地库存）"]
-            direction TB
-            AUTH["身份认证（可选）<br/>解析 consumer 身份"]
-            subgraph ENGINE["限流引擎 · access 阶段"]
-                direction LR
-                KEY["限流键构造<br/>7 维取值 + 策略指纹"]
-                POOL[("本地库存<br/>跨 worker 共享")]
-                LEASE["远程批量租约"]
-            end
-            AUTH --> KEY
-            KEY -->|"扣减 / 回填"| POOL
-            KEY -->|"库存不足"| LEASE
-        end
-    end
-
-    REDIS[("权威层 —— Redis 全局令牌桶<br/>唯一权威 · 原子授予")]
-    PASS(["放行 200 · 附额度响应头"])
-    BLOCK(["拦截 429 / 503 / 降级"])
-    UP["上游业务服务"]
-
-    POOL -->|"库存命中 · 零网络 I/O"| PASS
-    LEASE <-->|"租约申请 / 授予"| REDIS
-    LEASE -->|"租约 > 0"| PASS
-    LEASE -->|"租约 = 0 或 Redis 不可用"| BLOCK
-    PASS --> UP
-    BLOCK --> C
-    C --> AUTH
-
-    ADMIN["配置面 · Admin API（逐节点下发）"]
-    HARNESS["验证面 · 压测与断言脚本"]
-    ADMIN -.-> GW
-    HARNESS -.-> C
-
-    classDef client fill:#ede7f6,stroke:#5e35b1,color:#311b92;
-    classDef gw fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20;
-    classDef gwsub fill:#f1f8e9,stroke:#66bb6a,color:#1b5e20;
-    classDef conn fill:#e0f2f1,stroke:#00897b,color:#004d40;
-    classDef authz fill:#fff3e0,stroke:#ef6c00,color:#e65100;
-    classDef out fill:#eceff1,stroke:#607d8b,color:#263238;
-    classDef admin fill:#fafafa,stroke:#9e9e9e,stroke-dasharray:4 3,color:#424242;
-    class C,PASS,BLOCK client;
-    class GW gw;
-    class REPL,AUTH,KEY,LEASE gwsub;
-    class POOL,REDIS conn;
-    class UP out;
-    class ADMIN,HARNESS admin;
+```
+Client ──> Kong 副本 ×3（DB-less，每副本 2 Worker）
+             │  access 阶段：rate-limit-advanced（PRIORITY 1002）
+             │  限流键 = <key_prefix>:{<namespace>:p=<策略指纹>:<维度>=<值>...}
+             ├── batch=1      ──> Redis Lua（token_bucket，每请求一次）
+             ├── 单规则 batch>1 ──> Worker 本地 Lease（TAKE）
+             │                        └─ 库存不足 ──> Redis GRANT_LEASE
+             └── 多规则 ──> Redis GRANT_MULTI（多键原子，全或无）
+权威层：Redis 7（单实例，Hash tokens/ts + Lease 记录 + PEXPIRE）
 ```
 
-**核心不变量**：全局配额唯一权威在 Redis；本地库存只能来自 Redis 已授权的批量租约 ⇒ **只少发、不超发**，少发上界 ≈ 节点数 × batch。
-**限流键格式**：`kong:rl:{<namespace>:p=<策略指纹>:<维度>=<值>:…}` —— 策略一变即新键，旧桶/旧库存随 TTL 自然淘汰。
+- **Worker 隔离**：每个 Worker 拥有独立的本地 Lease Pool（Lua VM 按 Worker 隔离，`lease.lua` 的
+  `_pools`/`_counters` 为 Worker 私有）；Lease 只归属于创建它的 Worker；**不存在跨 Worker 共享同一份
+  本地库存**；Worker 之间通过 Redis 共享全局配额状态（唯一权威）。
+- **不依赖 Shared Dict**：Legacy shared-dict 聚合库存已随 Phase 8.2-A 移除。
+- **核心不变量**：全局配额唯一权威在 Redis；本地库存只能来自 Redis 已授权的 Lease ⇒ 只少发、不超发；
+  Worker 崩溃的未消费库存走损失方向（`granted = consumed + lost`），同样不超发。
 
----
+## 2. 三种限流路径
 
-## 图 2 · 单请求决策流程
+| 模式 | 授权方式 | Redis 操作 | 本地库存 |
+|---|---|---|---|
+| `batch=1` | 逐请求授权 | 每请求执行 Lua（token_bucket） | 无 |
+| 单规则 `batch>1` | Lease 预授权 | 库存不足时申请（实测约每 batch 个请求 1 次） | 有（Worker 私有） |
+| 多规则（`rules`） | 多键原子授权 | 每请求执行 GRANT_MULTI | 无 |
+
+实现位置：`lib/algorithm.lua` 的 `check()`（batch 解析分流）、`check_lease()`（Lease 路径）、
+`check_multi()`（多规则路径）。
+
+- **batch=1**：每请求一次 EVALSHA token_bucket；`X-RateLimit-Remaining` 恒为 0（授予的 1 个令牌被
+  当前请求立即消耗）。Phase 6.4/7 实证：EVALSHA 数恰=请求数、Redis 侧 Lease 记录为 0。
+- **单规则 batch>1**：预授权模式——配额以 batch 粒度预扣，本地消费零网络 I/O；**不提供与 batch=1
+  相同的逐请求时序精度**，本地消费可能形成短时突发。`X-RateLimit-Remaining` = 本地池余量
+  （fast path）或 granted−1（slow path）。
+- **多规则**：α 强一致——每请求一次 GRANT_MULTI（组内同 hash tag ⇒ 同 slot，单脚本全检-全扣/全不扣）；
+  响应为瓶颈规则口径；429 体含 `rule` 字段。多规则不使用 Lease。
+
+## 3. 单请求决策流程（与当前代码一致）
 
 ```mermaid
 flowchart TD
-    REQ(["请求进入限流"]) --> KEY["构造限流键<br/>维度取值 + 策略指纹"]
+    REQ["请求进入限流"] --> KEY["构造限流键<br/>维度取值 + 策略指纹 p="]
     KEY --> MODE{"配置形态"}
-    MODE -->|"rules 多规则<br/>α 强一致模式"| MKEY["组键构造<br/>组指纹 g= + r1..rN 各规则桶"]
-    MKEY --> MEVAL["多键原子申请<br/>全检-全扣/全不扣<br/>（组内同 slot 单脚本）"]
-    MEVAL -->|"全部桶 ≥1"| MUSE["各桶扣 1<br/>瓶颈口径响应头"]
-    MUSE --> PASS
-    MEVAL -->|"任一桶不足"| MREJ(["429 · 体含 rule 字段<br/>Retry-After=max(wait) 封顶"])
-    MEVAL -->|"不可用 / 畸形"| FT{"故障策略"}
-    MODE -->|"单规则 batch=1<br/>每请求原子授予"| GRANT["向权威桶申请"]
-    MODE -->|"单规则 batch=N<br/>租赁模式"| TAKE{"本地库存<br/>扣减 1"}
-    TAKE -->|"命中"| PASS(["放行 200<br/>附额度响应头"])
-    TAKE -->|"未命中"| GRANT["向权威桶申请<br/>一次租 batch 个"]
-    GRANT --> RES{"授予结果"}
-    RES -->|"> 0"| USE["本次消耗 1<br/>余量入本地池"]
+    MODE -->|"rules 多规则"| MGRANT["GRANT_MULTI<br/>全部桶 ≥1 ⇒ 各扣 1 放行<br/>任一不足 ⇒ 全部不扣 ⇒ 429(rule)"]
+    MGRANT -->|"不可用/不确定"| FT
+    MODE -->|"单规则 batch=1"| B1["EVALSHA token_bucket<br/>granted=1 消费 1"]
+    B1 -->|"> 0"| PASS
+    B1 -->|"granted=0"| REJ
+    B1 -->|"故障/不确定"| FT
+    MODE -->|"单规则 batch>1"| TAKE{"本地 Lease TAKE<br/>（非 yield 原子片段）"}
+    TAKE -->|"命中"| PASS["放行 200<br/>Remaining=本地池余量"]
+    TAKE -->|"NEED_GRANT"| G["GRANT_LEASE<br/>原子：参数校验→refill→部分授予→扣桶→建记录"]
+    G -->|"granted≥1"| USE["登记 Lease + TAKE 消费 1"]
     USE --> PASS
-    RES -->|"= 0"| REJ(["429 · Retry-After"])
-    RES -->|"不可用 / 畸形"| FT
-    FT -->|"默认 fail-closed"| S503(["503 · 拒绝"])
-    FT -->|"显式容错"| DEG(["放行 · 标记 degraded"])
+    G -->|"granted=0（桶令牌<1）"| REJ["429 · Retry-After<br/>（不建 Lease）"]
+    G -->|"explicit_error<br/>（确定零写入或已写入不可回滚）"| FT
+    G -->|"uncertain（超时/断连/畸形）"| FT["故障分支：Fail-close 503 或降级<br/>不重试 · 不登记本地库存"]
+    FT -->|"fault_tolerant=false（默认）"| S503["503"]
+    FT -->|"fault_tolerant=true"| DEG["放行 · X-RateLimit-Status: degraded"]
 
-    classDef start fill:#ede7f6,stroke:#5e35b1,color:#311b92;
-    classDef proc fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20;
-    classDef dec fill:#fffde7,stroke:#f9a825,color:#6d4c41;
-    classDef allow fill:#c8e6c9,stroke:#2e7d32,color:#1b5e20;
-    classDef reject fill:#ffe0b2,stroke:#ef6c00,color:#e65100;
-    classDef fail fill:#ffcdd2,stroke:#c62828,color:#b71c1c;
-    class REQ start;
-    class KEY,GRANT,USE,MKEY,MEVAL,MUSE proc;
-    class MODE,TAKE,RES,FT dec;
-    class PASS,DEG allow;
-    class REJ,MREJ reject;
-    class S503 fail;
+    REJ(["429 + Retry-After（封顶 window）"])
+    PASS --> UP["上游服务"]
 ```
 
----
+要点：**Redis 异常（含不确定结果）不会映射为 429**；granted=0 才是确定性限流拒绝。
 
-## 图 3 · 问题状态三区（已解决 / 未解决 / 生产边界）
+## 4. Token Bucket 模型
 
-```mermaid
-flowchart LR
-    subgraph SOLVED["✅ 已解决（Phase 1–3 验证闭环）"]
-        direction TB
-        s1["多副本共享配额<br/>450 请求恰好放行 100"]
-        s2["并发原子性<br/>Lua 原子授予 + 本地原子扣减<br/>全链路守恒核算通过"]
-        s3["策略变更继承旧状态<br/>策略指纹 ⇒ 新桶（116→100）"]
-        s4["时间回拨双计费<br/>补充时间戳单调不回退"]
-        s5["故障默认策略<br/>fail-closed 为默认 · 降级须显式"]
-        s6["故障路径崩溃<br/>500 → 503/降级 · 无异常栈"]
-        s7["测试不可控不可信<br/>每节点断言 · 每轮隔离"]
-        s8["伪造转发头绕过疑虑<br/>信任语义钉死 + 回归测试"]
-        s9["多维限流（Phase 2）<br/>7 维实测 · dims.sh 8 断言全绿<br/>Reset=下一令牌时刻 · Retry-After 封顶<br/>坏配置下发即 400 · 防御校验 · 降级告警"]
-        s10["多规则全或无原子（Phase 3）<br/>组键同 slot · 多键单脚本<br/>一空一有 ⇒ 429 且双桶不变<br/>瓶颈口径响应头 · rules.sh 14 断言全绿"]
-    end
+- `rate = limit / window`（每秒补充速率）；桶容量 `capacity = burst > 0 ? burst : limit`
+- refill 公式：`tokens = min(capacity, old_tokens + rate × elapsed)`；补充时间戳**只前进不后退**
+  （时钟回拨期间不补充、不覆盖 ts——防同一段时间二次计费）
+- 部分授予：`granted = min(batch, floor(tokens))`；`tokens < 1 ⇒ granted=0`（确定性不足，不建 Lease）
+- 状态存储：Redis Hash（`tokens`/`ts`）+ `PEXPIRE`（桶 TTL = 2×window）
 
-    subgraph OPEN["⏳ 未解决"]
-        direction TB
-        o2["🔵 远期（Phase 4）<br/>EVALSHA · batch×RPS 性能矩阵<br/>库存回收 / 租赁生命周期 L2"]
-        o3["🔵 远期（Phase 5）<br/>Prometheus 指标 · 结构化日志<br/>租约对账自愈 L3"]
-        o4["⚪ 明确不做（有意取舍）<br/>路径归一化 · 跨插件实例联合判定"]
-    end
+## 5. Redis Key 设计
 
-    subgraph PROD["⚠️ 生产边界须知（长期存在 / 有意取舍）"]
-        direction TB
-        p1["Redis 单实例<br/>主从切换窗口可能重复发放<br/>上界 ≈ 一个复制周期的发放量"]
-        p2["本地库存是租约不是配额<br/>副本下线/重启即丢失（少发方向）"]
-        p3["运维清库不同步<br/>只清 Redis 不重启副本<br/>旧租约仍然有效"]
-        p4["path 维度高基数<br/>未归一化，URL 空间无上界"]
-        p5["额度头是本节点视角<br/>batch=1 时 Remaining 恒为 0<br/>勿当作全局剩余"]
-        p6["多规则 = 单实例 α 强一致<br/>每请求 1 RTT · 改一条规则整组重置<br/>β 本地租约增强留后续"]
-        p7["调试日志为临时态<br/>高拒绝率下日志量放大"]
-    end
-
-    classDef solved fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20;
-    classDef open fill:#fff8e1,stroke:#f9a825,color:#6d4c41;
-    classDef prod fill:#ffebee,stroke:#c62828,color:#b71c1c;
-    class s1,s2,s3,s4,s5,s6,s7,s8,s9,s10 solved;
-    class o1,o2,o3,o4 open;
-    class p1,p2,p3,p4,p5,p6,p7 prod;
+```
+<kong:rl>:{<namespace>:p=<策略指纹>:<维度>=<值>...}     # 桶键（单规则）/ 多规则组内各规则桶
+<kong:rl>:lease:{<lease_id>}                            # Lease 元数据记录
 ```
 
----
+- **策略指纹**（FNV-1a 32 位）输入：`limit / window / burst（≤0 归一化为 limit）/ limit_by 顺序 /
+  header_name（仅含 header 维度时参与）`；**batch 不参与**（运输参数，调 batch 不清空桶）
+- **配置变化 ⇒ 新指纹 ⇒ 新 Pool Key**：新配置不复用旧库存；旧桶/旧 Lease 记录随 TTL 自然消亡；
+  **旧 Pool 生命周期回收尚未实现（Deferred）**
+- 多规则组键：组指纹 = 全部规则参数的指纹（`g=` 前缀语义），组内各桶同 hash tag ⇒ 同 slot
+- `key_prefix` 可配置（默认 `kong:rl`）
 
-## 表 1 · 已解决的问题（证据锚点）
+## 6. Redis Lua 原子操作（Phase 2–3 冻结协议）
 
-| 问题 | 解法 | 验证证据 |
+| 脚本 | 用途 | 要点 |
 |---|---|---|
-| 多副本共享配额 | Redis 单点原子授予 + 本地租约 | batch=1：450 请求恰好 100 放行 |
-| 并发扣减原子性 | Lua 单次 EVAL 读-算-扣-写；本地 incr 原子扣减/负值回滚 | 守恒核算：授出 600 = 消耗 90 + 本地 510，桶 400.005 分毫不差 |
-| 配置变更继承旧状态 | 策略指纹进 hash tag，策略变即新键 | 同 namespace 切 limit 1000→100 后恰放行 100（修复前实测 116 超发） |
-| 时间回拨重复计费 | 补充时间戳只前进不后退 | 预置未来 ts → 不补充、ts 不被覆盖 |
-| 故障默认放行（违背既定策略） | fail-closed 默认，degraded 显式选择 | 停 Redis：默认 503×3 不达上游；显式容错 200×3 + degraded |
-| 故障路径崩溃（500） | nil 判定前移 | 故障日志干净，traceback 计数 0 |
-| 测试不可控不可信 | 每节点请求数断言 + 每轮 namespace 隔离 + 双源脚本同步 | 断言 150×3 通过；VUS=2 破坏用例 exit 1；跨轮 namespace 段不同 |
-| 伪造 X-Forwarded-For 疑虑 | 信任语义文档化 + 语义钉死回归 | 20 个伪造 XFF → 1×200 + 19×429 同桶 |
-| 多维限流取值与键形（Phase 2） | 7 维实测进 dims.sh 回归 | route/service key 含 UUID；consumer 三身份独立；8 断言全绿 |
-| 伪窗口 Reset / 无界 Retry-After（Phase 2） | Reset=下一令牌 Unix 秒且与 Retry-After 同口径；Retry-After≤window | 429 时 Reset−now=36=Retry-After；极端配置封顶恰 3600 |
-| 坏配置运行时 500（Phase 2） | entity_checks 下发即 400 | header_name 缺失 → 400 带字段定位；合法配置 201 对照 |
-| Redis 畸形返回（Phase 2） | 纯函数防御校验 → 故障分支 | 10 类畸形全拒 + 2 合法样例 |
-| 多规则全或无原子（Phase 3） | α 强一致：组内同 slot 多键单脚本"全检-全扣/全不扣" | 一空一有 ⇒ 429 且双桶 tokens 均不变；全够 ⇒ 各扣 1 |
-| 组指纹换桶（Phase 3） | 组指纹=全部规则参数 FNV-1a | 仅改 r2.limit ⇒ g=3acf5710→4df638e4，旧桶不再命中 |
-| 多规则响应语义（Phase 3） | 瓶颈口径头 + 429 体 rule 字段 + 封顶 | Remaining=0/Reset≈+6（瓶颈 r2）；429 rule=rules[1]；封顶=3600 |
+| token_bucket | batch=1 逐请求授权 | refill + 扣 1 + TTL，TIME 单调 |
+| GRANT_MULTI | 多规则原子多键 | 全检-全扣/全不扣；组内同 slot 单脚本 |
+| GRANT_LEASE | batch>1 预授权 | 单脚本原子：参数校验→refill→部分授予→扣桶→建 Lease 记录（OPEN）→PEXPIRE |
+| RETURN_LEASE | 幂等归还 | **已实现但 V1 不接线**（Phase 5 Deferred，请求路径不调用） |
 
-## 表 2 · 未解决的问题
+脚本双源：`lib/redis.lua` 内嵌文本与 `redis/*.lua` 独立文件 diff 校验一致。
 
-| 问题 | 现状 | 计划 |
-|---|---|---|
-| 每次全量上传脚本文本 | EVAL 而非 EVALSHA | Phase 4 |
-| 性能矩阵 / 长稳 / 非均匀流量 | 仅正确性基线（多规则模式尚未进矩阵） | Phase 4（产出 bench/results.md） |
-| 指标与结构化日志 | 无 Prometheus；RL-DEBUG 调试态 | Phase 5 |
-| 库存回收 / 租赁生命周期 | FLUSHDB 残留、节点退出损失（仅单规则 batch>1 受影响；多规则模式无本地租约不受影响） | Phase 4 L2 优雅归还 / Phase 5 L3 对账 |
-| 多规则本地租约（β 增强） | 多规则恒强一致，每请求 1 RTT | 后续独立 change |
+## 7. Lease 生命周期（V1 冻结）
 
-## 表 3 · 生产边界须知（部署/运维前必读）
+```text
+本地无可用 Lease
+       │
+       v
+Redis GRANT_LEASE
+       ├── granted=0 ──────> 配额不足 ⇒ 429（确定性，不建 Lease）
+       ├── Redis 异常 ──────> 故障分支（Fail-close 503 / 显式降级）
+       ├── 结果不确定 ──────> Fail-close；不重试、不写入本地库存
+       │                     （Redis 可能已扣桶并建记录 ⇒ 库存损失方向，不补偿）
+       └── 授权成功（granted≥1）
+                │
+                v
+          Worker 本地 Lease（ACTIVE，登记于创建 Worker 的 _pools）
+                │
+                v
+             TAKE（每次消费 1，非 yield 原子）
+                │
+          ┌─────┴─────┐
+        有库存       耗尽（remaining=0）
+          │           │
+          v           v
+        放行        CLOSED：从可消费集合（active）摘除，
+                    保留在本地 leases 表仅作诊断（不删除、不可复活）
+                    └─ 后续请求触发新的 GRANT_LEASE
+```
 
-| 边界 | 影响 | 须知 / 缓解 |
-|---|---|---|
-| Redis 单实例 | 主从切换窗口可能重复发放（上界 ≈ 一个复制周期的发放量） | 需要强一致就上 Raft 类方案是过度设计；至少评估 Sentinel + 诚实告知业务 |
-| 本地库存 = 租约 | 副本下线/重启丢失已租未用额度（少发方向，不超发） | 容量规划时按"少发上界 N×batch"留裕量 |
-| 清库不同步 | 只清 Redis 不重启副本 → 旧租约继续放行（同策略下合法但绕过"重置配额"意图） | 运维"重置配额"必须重启副本或换 namespace |
-| path 维度基数 | `limit_by=[path]` 的 key 随 URL 空间无界增长 | 生产建议先归一化或避免 path 维度（当前明确不支持归一化） |
-| 额度头口径 | Remaining/Reset 均为本节点视角；batch=1 时 Remaining 恒 0 | 客户端勿将其当全局精确值；429 的 Retry-After 才是权威等待建议 |
-| 多规则强一致代价 | 每请求 1 RTT 无快路径；改任一条规则 = 整组配额重置 | 低 rate 关键接口适用；容量规划时知晓 RTT 成本；改规则前评估重置影响 |
-| 配置下发非原子 | DB-less 逐节点 POST，秒级不一致窗口 | 变更窗口内行为短暂不一致；先全部下发再恢复流量 |
-| 错误配置的爆炸半径 | 指纹使策略变更=新桶满血 | 改配置前评估"配额重置"业务影响；需继承余量用 namespace |
+- **CLOSED 不再参与消费**；V1 状态机单向 ACTIVE→CLOSED，无 CLOSING 归还态
+- **V1 不自动 RETURN**（RETURN_LEASE Lua 已实现、协议冻结，请求路径不调用）；无 idle scanner、
+  无 max_lifetime、无 Worker 接管、无库存补偿
+- **Redis Lease 元数据 TTL（`LEASE_TTL_MS=3600000`，内部常量，非用户配置）只约束 Redis 侧记录的
+  过期，不代表库存自动归还**
+- 守恒不变量：`remaining + consumed = granted`（lease-unit 25 断言守护，含无 yield 探针）
 
----
+## 8. 库存账目
 
-**一句话总结**：正确性地基已经打牢并全部验证（多副本共享配额、原子性、策略身份、故障策略）；**语义外皮与可观测性是下一刀**（Phase 2），**性能证据与库存生命周期是再下一刀**（Phase 4）；生产化之前必须带着"表 3"的每一条去和业务方对齐。
+- 正常 Worker：`granted = consumed + outstanding`
+- Worker 崩溃后：`granted = consumed + lost`（outstanding 在崩溃后归类 lost）
+- 实测样本（Phase 6.5 worker-crash-e2e）：崩溃前 `10 = 4 + 6`；崩溃后 `10 = 4 + lost 6`；
+  全局 `Σgranted=100 = HTTP 放行 94 + lost 6`（无接管/补偿/重新授权）
+- **注意**：不能把聚合的 `granted − consumed` 全部认定为 outstanding——其中可能混有
+  响应丢失等未确认部分；Phase 7 账目中该差额（7848/3.1%）按"未消费/未确认差额"口径报告。
+  V1 不实现精确实时 lost 审计（Deferred）。
+
+## 9. EVALSHA 脚本管理（Phase 2 冻结）
+
+- 懒加载：`init_worker` 零 Redis IO，首次调用触发 `SCRIPT LOAD`；Worker 级缓存 SHA
+- **仅明确 NOSCRIPT 触发 LOAD + 重试恰一次**；超时/断连/普通错误原样透传——**绝不当作 NOSCRIPT**
+  （防止重复执行已成功的扣减）；重试后仍 NOSCRIPT ⇒ 明确失败
+- 实证：Phase 7 全程 SCRIPT_LOAD=0（87 组）+ script-cache-selfheal-e2e（FLUSH 后三模式自愈）
+
+## 10. 故障处理
+
+| 场景 | 行为 |
+|---|---|
+| 连接拒绝/执行超时 | fault_tolerant=false（默认）⇒ 503 Fail-close；true ⇒ 降级放行 + `X-RateLimit-Status: degraded` |
+| 故障响应伪装 | **不允许**：Redis 异常走故障分支，绝不返回 429 |
+| GRANT 超时（不确定） | 不盲目重试、不登记本地库存；Redis 可能已执行 ⇒ 库存损失方向 |
+| 已确认本地库存在故障期 | 正常 TAKE（本地零 IO，与 Redis 无关）；耗尽后新 GRANT 进故障分支 |
+| 故障恢复后 | 独立请求正常申请；不重复授权（Phase 6.4 fault-recovery 实证记录增量恰 +1） |
+
+## 11. 配置指纹与 Pool 隔离
+
+见 §5。实测（Phase 6.3）：五维度（limit/window/burst/limit_by/header_name）各自变化 ⇒ 不同 Pool；
+batch 变化 ⇒ 同 Pool；真栈配置变更后新配置首请求不复用旧库存。
+
+## 12. 性能权衡（引用 Phase 7 正式报告，勿视为重测）
+
+- 收益（RPS=1000 干净轮均值，Worker=2）：授权命令 20001→2002（约 9.99:1，约减少 10 倍）、
+  Redis 总 QPS 4773→869（5.5×）、Redis CPU −73%、Kong CPU −23%；p50/p95 改善（0.66/1.41 → 0.50/1.16ms）
+- p99 未改善（80–104ms 尾部由共享宿主机环境噪声支配，因果归因 NOT VERIFIED）
+- 代价：库存留存敞口（Σgranted 255800 − 已消费 247952 = 7848 未消费/未确认差额，3.1%；崩溃时损失）、
+  batch 粒度时序精度、本地突发消费特征
+- 原始数据：`bench/raw/phase7/`；实验协议：`docs/bench.md`
+
+## 13. V1 限制与 Deferred
+
+| 类别 | 状态 |
+|---|---|
+| 自动 RETURN（RETURN_LEASE 接线）、idle scanner、max_lifetime、Worker 接管、库存补偿 | **Deferred（未实现）** |
+| 旧 Pool 生命周期回收 | **Deferred**（随 Phase 5 RETURN 一并处理） |
+| Redis Cluster（脚本缓存按节点、多键同 slot）与 HA/主从切换验证 | **未验证** |
+| Prometheus 指标导出 / Tracing（`_counters` 仅为内部基础） | **未实现** |
+| 长稳（>24h）与内存曲线 | **未执行** |
+| `LEASE_TTL_MS` 配置化 | V1 设计保留为常量（Phase 5 引入归还时再评估） |
+| K8s / 生产 HA 部署 | 本仓库仅为 Docker Compose 验证环境 |
+
+生产边界须知（Redis 单实例切换窗口、path 高基数、清库不同步、额度头本节点视角等）见
+`docs/design.md` 第 8、9 节与 `docs/DEPLOYMENT.md`。

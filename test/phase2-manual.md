@@ -236,3 +236,9 @@ docker compose restart kong1 kong2 kong3    # 恢复 kong.yml 初始配置（Cas
 | H | consumer 三身份独立 | ✅ |
 | I | route/service 进 key | ✅ |
 | J | dims.sh 一键全量 | ✅ |
+
+
+> **历史口径说明（Phase 8.2-C 加注）**：本剧本属 Phase 1 历史记录。当时 RL-DEBUG 日志为 notice 级
+>（local_fill/redis_grant 计数可直接 grep）；当前请求热路径 RL-DEBUG 已在 Phase 8.2-B 降级为 debug 级——
+> 需要采集对应调试日志时，请以 `KONG_LOG_LEVEL=debug` 运行（Kong 默认 notice 级不输出）。
+> 历史步骤与结论原样保留。
