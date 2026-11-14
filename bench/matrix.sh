@@ -27,7 +27,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
 
 WORKERS="${WORKERS:-2}"      # 目标 Worker 数（-w 覆盖）
-LOGLEVEL="${LOGLEVEL:-notice}" # KONG_LOG_LEVEL（-L 覆盖；error 组用于隔离调试日志背压因素）
+# Phase 8.2-B 起 RL-DEBUG 热路径日志已降级为 debug 级：统计列（localHit/slowGrant/
+# leaseGrant/multiGrant）依赖这些日志行，故本脚本默认以 debug 级运行（-L 覆盖）。
+# 性能对比需要 notice 级口径时显式传 -L notice（此时统计列为 0，见读表口径）。
+LOGLEVEL="${LOGLEVEL:-debug}"
 TAG="${TAG:-p1}"               # 输出标签（-T 覆盖；Phase 2 用 p2，避免覆盖 Phase 1 基线文件）
 RHOST="redis"                  # Redis host（-H <host>：传 IP 绕开容器 DNS 间歇阻塞——Phase 0 发现的现有缺陷）
 EHOST="echo"                   # 上游 echo host（-E <host>：传 IP；容器 DNS 缺陷影响 proxy 链路）
@@ -305,7 +308,7 @@ mkdir -p "$(dirname "$OUT_FILE")"
 ## 读表口径
 
 - EVAL次数 = INFO commandstats cmdstat_eval 调用差值（组内单一脚本，可解释：A/C 每请求 1 次；B ≈ 请求数/batch）。
-- 本地命中 = 三节点 [RL-DEBUG] local_hit 日志行数差值；slowGrant = redis_grant；leaseGrant = lease_grant（Lease 实现的 GRANT_LEASE 路径）；multiGrant = multi_grant。
+- 本地命中 = 三节点 [RL-DEBUG] local_hit 日志行数差值；slowGrant = redis_grant；leaseGrant = lease_grant（Lease 实现的 GRANT_LEASE 路径）；multiGrant = multi_grant。统计列依赖 KONG_LOG_LEVEL=debug（本脚本默认）；notice 级运行时统计列为 0（属预期，非请求丢失）。
 - RedisCPU(s) = INFO cpu used_cpu_sys+user 差值；KongCPU(核) = 容器 cgroup cpu.stat usage_usec 差值/时长/1e6（三节点合计）。
 - Redis QPS = total_commands_processed 差值/时长（含连接/脚本/读写全量命令）。
 EOF

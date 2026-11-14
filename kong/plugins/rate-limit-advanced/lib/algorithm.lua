@@ -284,7 +284,7 @@ function _M.check_multi(conf)
         min_tokens, min_i = b.tokens, i
       end
     end
-    kong.log.notice(
+    kong.log.debug(
       "[RL-DEBUG] multi_grant keys=", table.concat(keys, " | "),
       " remaining=", min_tokens, " bottleneck=r", min_i
     )
@@ -311,7 +311,7 @@ function _M.check_multi(conf)
     end
     rule_descs[#rule_descs + 1] = descs[rj.rule]
   end
-  kong.log.notice(
+  kong.log.debug(
     "[RL-DEBUG] multi_reject keys=", table.concat(keys, " | "),
     " reject=", table.concat(rule_descs, ","), " wait=", max_wait
   )
@@ -349,7 +349,7 @@ function _M.check_lease(conf, key)
   -- 1) fast path：Worker 本地 TAKE，零网络 IO
   local tok, remaining = lease.take(key)
   if tok then
-    kong.log.notice(
+    kong.log.debug(
     "[RL-DEBUG] local_hit key=", key,
     " remaining=", remaining
     )
@@ -376,7 +376,7 @@ function _M.check_lease(conf, key)
                  tostring(gerr.kind), "): ", tostring(gerr.err))
     return nil, gerr.err
   end
-  kong.log.notice(
+  kong.log.debug(
   "[RL-DEBUG] lease_grant key=", key,
   " lease_id=", res.lease_id,
   " granted=", res.granted,
@@ -405,7 +405,7 @@ function _M.check_lease(conf, key)
                  tostring(key))
     return nil, "lease take after grant returned NEED_GRANT"
   end
-  kong.log.notice(
+  kong.log.debug(
   "[RL-DEBUG] lease_take_after_grant key=", key,
   " remaining=", remaining2
   )
@@ -454,7 +454,7 @@ function _M.check(conf, key)
     kong.log.err("rate-limit-advanced: redis grant failed: ", tostring(err))
     return nil, err
   end
-  kong.log.notice(
+  kong.log.debug(
   "[RL-DEBUG] redis_grant key=", key,
   " granted=", granted.granted,
   " tokens=", granted.tokens,

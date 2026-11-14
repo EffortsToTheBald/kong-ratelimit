@@ -27,7 +27,7 @@ local lease = require("kong.plugins.rate-limit-advanced.lib.lease")
 
 -- ---- kong 全局 stub（build_key 的 ip 维度 + 日志） ----
 kong = {
-    log = { notice = function() end, err = function() end, warn = function() end },
+    log = { notice = function() end, err = function() end, warn = function() end, debug = function() end },
     client = { get_forwarded_ip = function() return "10.0.0.1" end,
                get_ip = function() return "10.0.0.1" end,
                get_consumer = function() return nil end },
