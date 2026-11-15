@@ -25,9 +25,13 @@ strip_code() {
         | sed '/^[[:space:]]*$/d'
 }
 
+# 临时目录：mktemp -d 创建独立目录，trap 清理（不依赖任何预先存在的目录）
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+
 check_pair() { # check_pair <lua文件名> <内嵌变量名>
-    local fname="$1" var="$2" tmp
-    tmp=$(mktemp /tmp/opencode/emb.XXXXXX.lua)
+    local fname="$1" var="$2" tmp ftmp norm
+    tmp="$WORK/emb.lua"
     # 提取 `local VAR = [[ ... ]]` 之间的内嵌文本
     awk -v var="$var" '
         $0 ~ ("local[[:space:]]+" var "[[:space:]]*=[[:space:]]*\\[\\[") { inblk=1; next }
@@ -36,12 +40,10 @@ check_pair() { # check_pair <lua文件名> <内嵌变量名>
     ' "$LIB" > "$tmp"
     if [ ! -s "$tmp" ]; then
         bad "内嵌脚本 $var 提取失败（lib/redis.lua 中未找到）"
-        rm -f "$tmp"
         return
     fi
-    local ftmp norm
-    ftmp=$(mktemp /tmp/opencode/fc.XXXXXX.lua)
-    norm=$(mktemp /tmp/opencode/nc.XXXXXX.lua)
+    ftmp="$WORK/file.lua"
+    norm="$WORK/embedded-norm.lua"
     strip_code "redis/$fname" > "$ftmp"
     strip_code "$tmp" > "$norm"
     if diff -q "$ftmp" "$norm" >/dev/null; then
@@ -51,7 +53,6 @@ check_pair() { # check_pair <lua文件名> <内嵌变量名>
         diff "$ftmp" "$norm" >&2 || true
         FAIL=$((FAIL+1))
     fi
-    rm -f "$tmp" "$ftmp" "$norm"
 }
 
 check_pair token_bucket.lua TOKEN_BUCKET
