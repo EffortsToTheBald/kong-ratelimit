@@ -188,8 +188,8 @@ N 个网关节点的时钟漂移通常是几十到几百毫秒；若各节点用
 | GRANT 结果不确定 uncertain（Redis 已扣、Worker 未登记） | 每次 ≤ k | **无封闭上界**（不重试、不登记是冻结语义，次数随故障率而定） | 估算 + NOT VERIFIED |
 
 **瞬时滞留 ≤ W_total × k 是推导上界，其前提为**：①每 Worker 每 Pool 任意时刻至多 1 个
-active Lease（关口三不变量：单 Pool 单在途 GRANT + 非_yield register/TAKE 片段，
-`invariants()` 断言守护）；②每个 Lease `granted ≤ k`；③无 RETURN（V1 不接线）。
+active Lease（关口三不变量：单 Pool 单在途 GRANT + 非_yield register/TAKE 片段；
+由 `invariants()` 测试校验守护，见 §4.9 三层区分）；②每个 Lease `granted ≤ k`；③无 RETURN（V1 不接线）。
 前提成立时该界成立；前提由代码不变量与断言维护，而非协议保证。
 
 **"每窗口累计少发 ≤ W_total × k" 不是严格上界**：discarded/lost/uncertain 的单次规模有界
@@ -301,20 +301,31 @@ kong:rl:{<ns>:g=<组指纹>:r<i>:<dim>=<val>:…}
 该请求退化为 batch=1 直连授权（不登记本地库存，不进 Lease 账目）；
 淘汰顺序 = 先淘汰无 ACTIVE Lease 的空池；TAKE 热路径 O(1)（每 Pool active Lease 数 ≤ 1）。
 
-**Lease 状态（本地）**：`ACTIVE → CLOSED`（耗尽，从可消费集合摘除，保留诊断不可复活）
-`/ EXPIRED`（`created_at + max_age/1000 < ngx.now()`，摘除）/ `EVICTED`（Pool 压力下
-整池淘汰，仅限无 ACTIVE Lease 的池）。过期/淘汰的未消费库存计入 **discarded**
-（一次计数，不归还 Redis，少发方向）。
+**Lease 状态（本地）**：`ACTIVE → CLOSED`（耗尽，从可消费集合摘除，保留诊断不可复活）/
+`EXPIRED`（`created_at + max_age/1000 < ngx.now()`，摘除）。**只有 EXPIRED 的未消费库存计入
+discarded**（一次计数，不归还 Redis，少发方向）。
 
-**清理**：TAKE/GRANT 路径惰性判定 + `init_worker` 低频 Timer（60s，每轮处理数有上限）
-兜底回收；Timer 回收跳过在途 GRANT（`_inflight` 保护，关口三）；回调异常隔离、
-Worker 退出兜底。**并发 GRANT（方案 B，冻结）**：单 Pool 同时只允许一笔在途 GRANT，
-期间的并发请求退化为 batch=1 直连 ⇒ 每 Pool active Lease 数上界 = 1，TAKE 最坏扫描 O(1)。
+**Pool 回收事件（不是 Lease 状态）**：`EVICTED` = Pool 被整池删除——MAX_POOLS 压力下
+**仅淘汰无 ACTIVE Lease 的空池**（CLOSED Lease remaining=0、EXPIRED 已计数入 discarded，
+⇒ **EVICTED 零库存损失**，不产生 discarded）；或 active 空且空闲超 max_age 由 60s Timer
+整池回收。清理路径：TAKE/GRANT 惰性判定 + 低频 Timer 兜底（每轮处理数有上限、跳过在途
+GRANT、回调异常隔离、Worker 退出兜底）。
+
+**并发 GRANT（方案 B，冻结）**：单 Pool 同时只允许一笔在途 GRANT，期间的并发请求退化为
+batch=1 直连 ⇒ 每 Pool active Lease 数上界 = 1，TAKE 最坏扫描 O(1)。
 
 **账目恒等式**：`confirmed_granted = consumed + outstanding + discarded`
 （confirmed_granted 只含 Worker 已收到并登记的 GRANT；GRANT 超时/响应丢失单列为
 uncertain，**不计入**该恒等式）；Worker 崩溃后 outstanding 归类 lost。
-不变量由 `lease.lua invariants()` 断言守护（每 Pool active 上界 + 恒等式）。
+
+**不变量的三层区分**：
+1. **生产代码控制路径**维护不变量——单在途 GRANT 标志 + 非 yield 的 register/TAKE/
+   状态翻转片段（`state` 先翻转、随即移出 active、计数同片段完成，无 yield 点）；
+2. **状态账目**（`_counters`：tokens_granted/consumed、discarded_tokens 等）随上述片段
+   同步维护，discarded 只计一次；
+3. **`invariants()` 是测试主动调用的校验函数**（lease-unit / algorithm-lease-unit /
+   smoke / 探针脚本调用），**不是生产运行时断言**——生产路径不调用它；
+   不变量在生产中由路径 1/2 的代码结构保证，在测试中由 invariants() 独立校验。
 
 ---
 
