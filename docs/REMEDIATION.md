@@ -480,4 +480,18 @@ confirmed_granted = consumed + outstanding + discarded
 
 **修正 2：兼容性窗口拆分**。原表述"窗口 = max(旧桶 TTL, 旧 Lease 记录 1h)"混用了两类 TTL：旧 Lease 元数据 1h TTL 只决定**对账记录清理时间**，与库存归还无关（V1 无 RETURN）、不代表限流授权状态收敛；授权状态由桶键承载。已改为两条独立描述：旧桶 TTL（2×window）= 放行上限叠加窗口的收敛时间；旧 Lease 1h TTL = 元数据记录可见窗口。仅文档改动。
 
+### 任务 A 复审收尾修正（2026-11-15，二处，仅 test/concurrent-lease-e2e.sh）
+
+**改了什么 / 为什么**：
+1. **旧代 PID 快照有效性核验（新增，配置下发前执行）**。原实现抓取 `PIDS_K1/K2/K3` 后直接进入 `wait_stable()` → `single_generation()`：空快照会把"旧代为空"误判为"旧代全部退出"（`single_generation` 对空 `$1` 返回 0），削弱账目断言证据强度。修正：前置检查循环记录各节点 Worker 数（`W_K1/K2/K3`），快照抓取后逐节点核验——**非空、`wc -w` ≥2、与前置核验数量一致**，三者任一不满足即 `bad` + `exit 1` 直接失败，不允许空集合进入代际判定；核验通过输出 `ok "快照有效：…"`（每节点 1 项 PASS）。
+2. **删除重复的"配置下发"ok()**。配置下发成功后连续两次输出同一 ok()（无新增信息），导致 PASS 计数虚高 1。删除其一，保持 PASS 计数准确。
+
+**测试命令与真实结果**（本轮实测）：
+- `bash -n test/concurrent-lease-e2e.sh` → 语法通过。
+- `bash test/concurrent-lease-e2e.sh` ×2 → **EXIT=0、PASS 22 / FAIL 0 / NOT_VERIFIED 0 ×2**（第 1 轮 Σgranted=92+直连 8=100、429=300、min remaining=0；第 2 轮 Σgranted=95+直连 5=100、429=300、min remaining=0）。PASS 数 20→22 系快照有效性核验新增 3 项 ok() 减去重复 ok() 1 项（20+3−1=22）。
+
+**对外行为影响**：无（测试脚本自身；生产代码、冻结设计、既有断言零改动）。
+
+**遗留问题**：无新增；既有遗留维持（脚本头注释旧 key 格式描述、N1、真实 Cluster 验证 Deferred）。
+
 ---

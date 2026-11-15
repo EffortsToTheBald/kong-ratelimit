@@ -30,6 +30,7 @@ RC PING >/dev/null || { bad "Redis 不可用"; exit 1; }
 for n in kong1 kong2 kong3; do
   w=$(docker compose exec -T "$n" sh -c 'ps -o pid,cmd | grep "nginx: worker" | grep -v grep | wc -l' </dev/null | tr -d ' ')
   report "$([ "$w" -ge 2 ] && echo true)" "$n Worker 数=$w（≥2）"
+  case $n in kong1) W_K1=$w;; kong2) W_K2=$w;; kong3) W_K3=$w;; esac
 done
 ok "前置：Redis PING + 3 节点 Worker 数核验"
 
@@ -73,6 +74,18 @@ wait_stable() { # wait_stable <container> <pre_pids> —— 代际单一且连�
 PIDS_K1=$(worker_pids kong1 | sort | tr '\n' ' ' | sed 's/ *$//')
 PIDS_K2=$(worker_pids kong2 | sort | tr '\n' ' ' | sed 's/ *$//')
 PIDS_K3=$(worker_pids kong3 | sort | tr '\n' ' ' | sed 's/ *$//')
+# ---- 快照有效性核验（复审收尾修正）：非空、Worker ≥2、与前置核验数量一致 ----
+# 空快照进入 single_generation() 会把"旧代为空"误判为"旧代全部退出"；
+# 快照无法确认时直接失败退出，不进入代际判定。
+for k in kong1 kong2 kong3; do
+  case $k in kong1) snap="$PIDS_K1"; pre_n="$W_K1";; kong2) snap="$PIDS_K2"; pre_n="$W_K2";; kong3) snap="$PIDS_K3"; pre_n="$W_K3";; esac
+  wc=$(printf '%s' "$snap" | wc -w | tr -d ' ')
+  if [ -z "$snap" ] || [ "$wc" -lt 2 ] || [ "$wc" != "$pre_n" ]; then
+    bad "$k 旧代 PID 快照无法确认（count=$wc pre核验=$pre_n；要求非空、≥2、与前置核验一致）——直接失败"
+    exit 1
+  fi
+  ok "快照有效：$k 旧代 Worker PID=$wc（非空、≥2、与前置核验一致）"
+done
 # ---- 配置下发 ----
 # （旧代 Worker PID 快照必须在配置下发**前**抓取——POST /config 可能触发 reload）
 cat <<EOF > /tmp/opencode/p65c-config.json
@@ -86,8 +99,6 @@ for n in 8031 8011 8021; do
        -H 'Content-Type: application/json' -d @/tmp/opencode/p65c-config.json >/dev/null \
     || { bad "节点 :$n 配置下发失败"; exit 1; }
 done
-ok "配置下发：limit=100 window=86400 batch=10 ns=$NS（3 节点）"
-
 ok "配置下发：limit=100 window=86400 batch=10 ns=$NS（3 节点）"
 
 for k in kong1 kong2 kong3; do
