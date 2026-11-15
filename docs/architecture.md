@@ -6,7 +6,8 @@
 > **CLOSED** = 本地耗尽态；**EXPIRED** = 过期摘除（**唯一产生 discarded 的状态**：未消费库存计入
 > discarded，不归还 Redis）；**EVICTED** = Pool 回收事件（整池删除，仅限无 ACTIVE Lease 的空池，
 > 零库存损失，**不是 Lease 状态**）；
-> **outstanding** = Worker 本地尚未消费的库存；**discarded** = 过期/淘汰丢弃的未消费库存（不归还 Redis）；
+> **outstanding** = Worker 本地尚未消费的库存；**discarded** = EXPIRED 丢弃的未消费库存（不归还 Redis；
+> 仅 EXPIRED 产生 discarded，EVICTED 空 Pool 回收零库存损失）；
 > **lost** = 已授权但无法继续使用的库存（Worker 崩溃等）；**uncertain** = Redis 可能已扣但 Worker 未登记（不重试不登记）。
 
 ## 1. 整体架构
@@ -46,7 +47,8 @@
 - **核心不变量**：全局配额唯一权威在 Redis；本地库存只能来自 Redis 已授权的 Lease。
   在 Redis 授权状态连续有效（无主从切换回滚、无数据重置）且统计口径一致的前提下，
   **累计放行量 ≤ Redis 已确认扣减的授权量**（推导，前提化表述，docs/design.md §4.2）；
-  少发多来源（Worker 崩溃 lost、GRANT 不确定、过期/淘汰 discarded），超发仅可能出现在
+  少发多来源（Worker 崩溃 lost、GRANT 不确定、EXPIRED discarded——EVICTED 空池回收零库存损失），
+  超发仅可能出现在
   故障回滚窗口；Worker 崩溃的未消费库存走损失方向（`granted = consumed + lost`）。
 
 ## 2. 三种限流路径
