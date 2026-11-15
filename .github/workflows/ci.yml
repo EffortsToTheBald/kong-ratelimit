@@ -1,0 +1,92 @@
+# 关口六任务 5：CI（.github/workflows/ci.yml）
+#
+# 设计原则（关口六约束）：
+# 1. 只覆盖仓库真实存在的测试入口（test/*.sh 与 bench/quota.sh），不虚构；
+# 2. 固定镜像版本（docker-compose.yml：kong:3.6 / redis:7-alpine / hashicorp/http-echo:1.0），
+#    不使用 docker-compose.mirror.yml（外部镜像站仅供国内网络手动排障，见 docs/docker-mirror.md）；
+# 3. 全部测试串行执行并聚合失败，不靠跳过核心测试制造绿色；
+# 4. 不跑完整性能矩阵 —— 原因：
+#    - bench/matrix.sh（Phase 7 口径）为长时压测（多组 × 20s+预热），共享 GitHub Runner
+#      的宿主机噪声使 p99 归因失效（Phase 7 已记录 ~4s 周期性噪声），数字不可信；
+#    - 长稳/内存曲线（>24h）与跨机器真实 RTT 验证需要专用环境（NOT VERIFIED 维持）；
+#    - k6 latency 压测同理。
+#    CI 中的 bench 覆盖为 quota.sh（配额正确性，秒级）。
+
+name: ci
+
+on:
+  push:
+    branches: [master, remediation/hardening]
+  pull_request:
+    branches: [master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start compose stack (fixed image versions from docker-compose.yml)
+        run: |
+          docker compose version
+          docker compose up -d
+          for i in $(seq 1 60); do
+            curl -fsS --max-time 2 http://localhost:8031/status >/dev/null 2>&1 && break
+            sleep 2
+          done
+          curl -fsS --max-time 5 http://localhost:8031/status
+          docker compose exec -T redis redis-cli ping
+
+      - name: Lua syntax check (luajit -bl, all plugin + script sources)
+        run: |
+          set -e
+          FILES=$(find kong/plugins/rate-limit-advanced redis -name '*.lua' | sort)
+          for f in $FILES; do
+            docker compose cp "$f" kong1:/tmp/syn.lua >/dev/null
+            docker compose exec -T kong1 luajit -bl /tmp/syn.lua >/dev/null
+            echo "syntax ok: $f"
+          done
+
+      - name: Script dual-source consistency check
+        run: bash test/script-consistency-check.sh
+
+      - name: Unit tests (resty protocol level)
+        run: |
+          set -e
+          for t in lease-unit algorithm-lease-unit config-isolation-unit evalsha-unit; do
+            echo "=== $t ==="; bash test/$t.sh
+          done
+
+      - name: Redis integration (bare redis-cli matrix + smoke)
+        run: |
+          set -e
+          bash test/lease-redis-matrix.sh
+          bash test/lease-grant-smoke.sh
+
+      - name: Kong E2E suite (real OpenResty workers, serial, fail-aggregated)
+        run: |
+          declare -A RESULT
+          for t in algorithm-lease-e2e lease-exhaustion-e2e config-isolation-e2e \
+                   lease-timeout-uncertain-e2e fault-recovery-e2e handler-fault-e2e \
+                   script-cache-selfheal-e2e worker-crash-e2e lease-isolation \
+                   concurrent-lease-e2e redis-password-e2e; do
+            echo "=== $t ==="
+            if bash "test/$t.sh"; then RESULT[$t]=PASS; else RESULT[$t]=FAIL; fi
+          done
+          echo "===== E2E 汇总 ====="
+          fail=0
+          for t in "${!RESULT[@]}"; do
+            echo "$t: ${RESULT[$t]}"
+            [ "${RESULT[$t]}" = "PASS" ] || fail=1
+          done
+          exit $fail
+
+      - name: bench/quota.sh (quota correctness, 3-node shared pool)
+        run: |
+          curl -sL -o /tmp/k6.tar.gz \
+            https://github.com/grafana/k6/releases/download/v0.50.0/k6-v0.50.0-linux-amd64.tar.gz
+          tar -C /tmp -xzf /tmp/k6.tar.gz
+          sudo install /tmp/k6-v0.50.0-linux-amd64/k6 /usr/local/bin/k6
+          k6 version
+          bash bench/quota.sh -l 100 -b 1 -p 150
