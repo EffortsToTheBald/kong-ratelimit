@@ -20,12 +20,22 @@
 -- ============================================================
 local algorithm = require("kong.plugins.rate-limit-advanced.lib.algorithm")
 local lease = require("kong.plugins.rate-limit-advanced.lib.lease")
+local redis_mod = require("kong.plugins.rate-limit-advanced.lib.redis")
 
 -- ---- kong 全局 stub（与 algorithm-lease-unit.lua 同手法）----
 kong = {
     log = { notice = function() end, err = function() end,
             warn = function() end, debug = function() end },
 }
+
+-- 关口三后：并发请求在单在途 GRANT 置位期间走 batch=1 直连（redis_mod.grant）
+-- ⇒ 探针必须同时计数直连 stub，否则直连会触到真 cosocket。
+local direct_calls = 0
+local orig_grant = redis_mod.grant
+redis_mod.grant = function(conf, key, want, ttl_ms, rate, burst)
+    direct_calls = direct_calls + 1
+    return { granted = 1, tokens = 99.5, wait = 0 }
+end
 
 local conf = {
     limit = 1000,
@@ -101,19 +111,22 @@ local function run(label, n, spawn_every)
 
     local pool = lease._pools[PK]
     local st = lease.stats()
-    local n_leases = pool and #pool.leases or 0
+    local n_leases = pool and #pool.active or 0
     local confirmed = st.granted
     local id_ok = (confirmed == st.consumed + st.local_remaining)
+    local bound_ok = (n_leases <= 1)
 
     print(string.format(
-        "[%s] N=%d spawn_every=%d ticks=%d grant_calls=%d max_inflight=%d leases=%d confirmed_granted=%d consumed=%d outstanding=%d discarded=0 identity_ok=%s",
-        label, n, spawn_every, TICKS, grant_calls, max_inflight,
-        n_leases, confirmed, st.consumed, st.local_remaining, tostring(id_ok)))
+        "[%s] N=%d spawn_every=%d ticks=%d grant_calls=%d direct_calls=%d max_inflight=%d leases=%d(<=1:%s) confirmed_granted=%d consumed=%d outstanding=%d discarded=0 identity_ok=%s",
+        label, n, spawn_every, TICKS, grant_calls, direct_calls, max_inflight,
+        n_leases, tostring(bound_ok), confirmed, st.consumed,
+        st.local_remaining, tostring(id_ok)))
     print(string.format(
-        "[%s] 账目: confirmed_granted(%d) = consumed(%d) + outstanding(%d) + discarded(0)；uncertain_lost=0（transport 恒成功）",
-        label, confirmed, st.consumed, st.local_remaining))
+        "[%s] 账目: confirmed_granted(%d) = consumed(%d) + outstanding(%d) + discarded(0)；直连授权 %d 笔不入 Lease 账目（batch=1 既有口径）；uncertain_lost=0",
+        label, confirmed, st.consumed, st.local_remaining, direct_calls))
 
     lease._transport = nil
+    direct_calls = 0
 end
 
 -- 场景 1：同时到达（burst）——所有请求在第一批调度即全部进入 transport

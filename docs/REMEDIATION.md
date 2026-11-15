@@ -83,8 +83,6 @@
 - 长稳（层次 3）：NOT RUN。
 - 并发真实环境探针（真实 cosocket + ngx.sleep 注入于 Kong Worker 内）：NOT VERIFIED。现有 resty 模型只能证明协程交错下的行为序，不能替代。
 
----
-
 ## 关口二最终冻结（2026-11-15，等待关口三实施）
 
 以下参数与方案**冻结**，关口三按此实施，不得单方面偏离：
@@ -343,3 +341,70 @@ confirmed_granted = consumed + outstanding + discarded
 - `4db584f` docs: remediation baseline evidence and frozen gate-2 design——本文件
 - 已推送 `origin/remediation/hardening`；工作区仅剩与本整改无关的未跟踪文件 `1113.json`、`1115.json`
 - 本轮收尾核对修正 3 处文档与实际的不一致：补测入口数 11→16、提交状态更新、§2 内存依据表述改为"单点实测 + 推导"
+
+---
+
+## 关口三：实施记录（2026-11-15，基于冻结设计 e0c3cf1）
+
+### 改了什么
+
+| 文件 | 内容 |
+|---|---|
+| `kong/plugins/rate-limit-advanced/lib/lease.lua` | ① Pool 生命周期：`active` 集合 + `last_used`（TAKE 一次赋值）+ `max_age` 毫秒快照（首次 GRANT 时取 `bucket_ttl_ms`=2×window）；诊断清单 `pool.leases` 取消，历史入计数器。② 计数器扩展：`expired/evicted/discarded_tokens`；`stats()` 输出 `outstanding/pools`。③ 过期：`created_at + max_age/1000 < ngx.now()` ⇒ EXPIRED，经唯一函数 `expire_lease_at` 摘除（state 翻转→计数→移出 active 同一非 yield 片段）；TAKE 候选逐个 O(1) 过期比较。④ 单在途 GRANT：`_inflight[pool_key]` 标志（grant 内置位/清除无 yield 间隙）；register 拒绝 ACTIVE 非空 Pool（`pool has active lease` ⇒ 生产不可达，触发按 uncertain 损失）。⑤ 容量：`MAX_POOLS=10000`（模块常量，测试可覆写）、`ensure_capacity()`（达上限先淘汰空池 ≤64，仍满 ⇒ false）、`evict_idle_pools`（只删无 ACTIVE Lease 的 Pool，零库存损失）、`timer_sweep_once`（空闲候选判定 + 过期摘除 + 删池，≤64/tick）、`start_sweep_timer`（`ngx.timer.every(60,…)`，模块级防重、pcall、exiting 检查；resty 无 timer 环境安全跳过）。⑥ `invariants()` 扩展：每 Pool `#active ≤ 1`；全局恒等式 `tokens_granted == tokens_consumed + Σactive.remaining + discarded_tokens`；租约数量闭环 `leases == closed + expired + active`。 |
+| `kong/plugins/rate-limit-advanced/lib/algorithm.lua` | `check_lease` 在 NEED_GRANT 后插入两类降级（冻结方案 B）：`ensure_capacity()` false ⇒ `pool_cap`；`grant_in_flight(key)` true ⇒ `inflight`。两者退化为 `redis_mod.grant(conf, key, 1, …)` 直连（不登记、复用 batch=1 既有 429/Fail-close 语义、不进 Lease 账目）；日志 `pool_cap_degraded`（warn，稀有）/`inflight_degraded`（debug）。 |
+| `kong/plugins/rate-limit-advanced/handler.lua` | `init_worker` 调用 `lease.start_sweep_timer()`；失败打 warn（容器实测无告警、Worker 正常注册）。 |
+| `test/lease-unit.lua` | 45 断言（原 25，意图保持）：诊断表断言改为计数器闭环；"多 Lease 并存"改为顺序纪元 + busy 拒绝；新增过期（含 discarded 一次计数/单位毫秒换算）、sweep_pool、Timer（空闲删池/活跃保留/上限 64/70 池两轮）、MAX_POOLS（含"含 ACTIVE Pool 不被驱逐"）。 |
+| `test/algorithm-lease-unit.lua` | 25 断言（原 17）：D 块计数器闭环改造；新增 K（pool_cap 降级直连 + 空池淘汰后恢复）、L（inflight 降级直连 + 不入账）、M（N=20 协程 burst：transport 恰 1 次、直连 19 次、`#active==1`、恒等式成立）。 |
+| `test/lease-iso.lua` | lease_id 输出改从 `pool.active` 取（诊断清单取消），隔离断言不变。 |
+| `test/lease-concurrent-grant-probe.lua` | 补 `redis_mod.grant` stub 计数（直连降级现为真路径）；输出增加 `direct_calls` 与 `leases<=1` 判定。 |
+
+**冻结项核对**：MAX_POOLS=10000 ✓；max_age=2×window 毫秒快照 ✓（`created_at + max_age/1000 < ngx.now()` 秒口径）✓；60s Timer ✓；方案 B ✓；达上限不驱逐 ACTIVE Pool ✓；EXPIRED remaining 计入 discarded、不归还 Redis ✓；账目 `confirmed_granted = consumed + outstanding + discarded`、uncertain 单列不混入 ✓。**未实现项**：§1 的 `sweep_seq` 字段——由"Timer 只碰空闲 Pool、请求路径只碰当前 Pool"的不相交集合论证替代，无重复回收窗口（实现时发现该字段无作用点，属设计冗余；如需补可后加）。
+
+### 测试命令与真实结果（全部本轮实测）
+
+| 命令 | 结果 |
+|---|---|
+| `bash test/lease-unit.sh` | **PASS 45 / FAIL 0**（含过期/Timer/容量/上界/账目新用例） |
+| `bash test/algorithm-lease-unit.sh` | **PASS 25 / FAIL 0**（含 K/L/M 新用例） |
+| `bash test/config-isolation-unit.sh` | PASS 15 / FAIL 0 |
+| `bash test/evalsha-unit.sh` | PASS 8 / FAIL 0 |
+| `bash test/lease-grant-smoke.sh` | PASS 4+7 / FAIL 0 |
+| `bash test/lease-isolation.sh` | PASS 7 / FAIL 0 |
+| `bash test/lease-redis-matrix.sh` | PASS 50 / FAIL 0 |
+| `bash test/concurrent-lease-e2e.sh`（真实 OpenResty 多 Worker） | **PASS 17 / FAIL 0 / NOT_VERIFIED 0**（GRANT=10、Σgranted=100、270 并发无堆积 ⇒ 降级路径未触发、行为与基线一致） |
+| `bash test/lease-exhaustion-e2e.sh` | PASS 11 / FAIL 0 |
+| `bash test/config-isolation-e2e.sh` | PASS 14 / FAIL 0 |
+| `bash test/algorithm-lease-e2e.sh` | PASS 15 / FAIL 0 |
+| `bash test/fault-recovery-e2e.sh` | PASS 12–14 / FAIL 0（断言数随恢复轮询次数时序浮动，两轮复测 14；非退化） |
+| `bash test/handler-fault-e2e.sh` | PASS 26 / FAIL 0 |
+| `bash test/lease-timeout-uncertain-e2e.sh` | PASS 22 / FAIL 0 / NOT_VERIFIED 0 |
+| `bash test/script-cache-selfheal-e2e.sh` | PASS 15 / FAIL 0 |
+| `bash test/worker-crash-e2e.sh` | PASS 16 / FAIL 0 |
+| `docker compose exec -T kong1 resty /tmp/lease-concurrent-grant-probe.lua`（协程模型） | 修复后：burst N=100 ⇒ transport=1、direct=99、`leases=1(<=1:true)`、outstanding=9（修复前：leases=100、outstanding=900）；steady 同样 `leases≤1`；全部 identity_ok=true。**真实 OpenResty 并发验证 NOT VERIFIED（维持）** |
+| `docker compose exec -T kong1 resty /tmp/lease-memory-baseline.lua` | 修复后：**600 B/pool（修复前 689，诊断清单移除后下降）**；GC 后可回收至 ~1.3MB；invariants=true；MAX_POOLS 估算更新：10000×600B ≈ **5.9 MB/Worker** |
+| `docker compose exec -T kong1 kong reload` + 流量验证 | 新 Worker（init_worker 日志 handler.lua:20）正常服务，200 + 正常限流头；无 `sweep timer not started`/`timer create failed` 告警 |
+
+### 账目 / 上界 / 并发验证证据（口径区分）
+
+- **账目恒等式**：lease-unit（accounting-identity、expire-discarded-once、expire-invariants、capacity-invariants）+ algorithm-lease-unit（M-ledger-identity、L-direct-out-of-ledger）+ 探针全部场景 identity_ok=true + invariants() 全局校验。uncertain 不入恒等式：既有 grant-uncertain-no-retry-no-register 断言保留且 PASS。
+- **active 上界**：register busy 拒绝（multi-lease-busy-reject）+ invariants() `#active ≤ 1` 校验 + M 用例 burst N=20 断言 `st.active == 1` + 探针 burst N=100 `leases=1(<=1:true)`。
+- **并发 GRANT（真实环境 vs 模型）**：真实 OpenResty 证据 = concurrent-lease-e2e.sh（270 并发，GRANT=10 无堆积，降级路径未触发——与基线一致）+ worker-crash/timeout 等 E2E 全绿；协程模型证据 = 探针与 M 用例（量化降级效果：库存 900→9）。**后者不得写成真实并发验证（NOT VERIFIED 维持）**。
+
+### 对外行为影响
+
+- 正常路径（无并发堆积、Pool 未达上限）：与基线**逐字节一致**（concurrent-lease-e2e 等 10 个 E2E 全绿即证据）；429/Retry-After/X-RateLimit-*/503 Fail-close/fault_tolerant/batch=1/多规则全或无语义未动。
+- 新增行为 1：同 Pool 在途 GRANT 期间的并发 miss ⇒ batch=1 直连放行（授权仍由 Redis 桶决定；空桶仍 429；Redis 故障仍 503/fail-open）。吞吐：热路径不变；直连路径每请求一次 Redis（与 batch=1 同成本）。
+- 新增行为 2：MAX_POOLS 达上限且无可淘汰空池 ⇒ 同上直连（罕见，仅高基数攻击场景）；空池淘汰零库存损失，不产生 429/503。
+- 新增行为 3：过期 Lease 在 TAKE 时被丢弃（discarded 计数）——慢速热 Pool 上不再跨桶纪元消费；时钟回拨时库存存活略久（§3 既有定性，方向保守）。
+- 语义风险点（已评估）：register busy 拒绝在"上界被破坏"时把请求归入 uncertain ⇒ Fail-close（保守方向，不会伪装放行）。
+
+### 遗留问题 / 风险
+
+- **真实 OpenResty 并发验证 NOT VERIFIED（维持）**：协程模型与真实 E2E 双证据已最强化，但"降级路径在真实 cosocket 交错的触发率"无现场数据（concurrent-lease-e2e 场景未触发）。可用 CLIENT PAUSE + 并发压测的专项 E2E 复核（待授权）。
+- **Worker RSS（层次 2）/ 长稳（层次 3）NOT RUN（维持）**；修复后 Lua 堆实测 600 B/pool。
+- **Timer 周期触发的现场观测 NOT VERIFIED**：注册无错 + 回调体逻辑经 timer_sweep_once 单测覆盖；60s 现场触发（含 worker exiting 分支）未直接观测。
+- `sweep_seq` 未实现（见上，设计冗余，无行为影响）。
+- N3（Cluster CROSSSLOT）**维持未授权**；N1/N2（维度值碰撞）未动（key 形态变更需确认）；N4–N8 维持记录。
+- 探针 steady 场景 grant_calls=8/direct=29：直连与 Lease 混合下的总账（lease 账 + 直连批）跨路径对账仍无手段（V1 无 Redis 对账接口），维持"允许损失、方向保守"表述。
+
+---
