@@ -801,3 +801,63 @@ discarded_tokens 唯一来源 expire_lease_at；淘汰仅删空池）。
 提示，非本仓库问题，维持观察即可）。
 
 ---
+
+---
+
+# 最终验收（Hardening 项目，基于 ee4c195，2026-11-15，只读审计）
+
+**审计基线核实（实测）**：HEAD=`ee4c195c4c00617220a5f82cafc932f1ebdd3b6e`；分支 `remediation/hardening`；
+与 origin 同步（rev-list 0/0）；基线提交自身 CI run 43711832556 ✓ success（2m16s）。
+**工作区异常（记录，非阻断）**：本地存在一处未提交 `.gitignore` 修改（新增 `11*.json` 忽略规则），
+非验收基线内容（不影响已提交状态与远端同步），未纳入验收、未自行处理，建议人工确认。
+
+## 逐项核对（12 项）
+
+| # | 项 | 结论 | 依据（代码/测试/日志，非文档自述） | 尚存风险 |
+|---|---|---|---|---|
+| 1 | 三路径 + 429/503/Retry-After | ✅ 保持 | handler.lua:50（503 Fail-close）、:82（Retry-After，封顶 window）；CI 实测：handler-fault 26/0、fault-recovery 12/0、exhaustion 11/0、quota.sh allowed=100/other=0 | 无 |
+| 2 | Worker 私有库存 / Lease 生命周期 / 崩溃处理 | ✅ 已实现并验证 | lease.lua `_pools` Worker 私有；状态机 ACTIVE→CLOSED/EXPIRED；worker-crash-e2e 16/0（样本 10=4+lost6，无接管/补偿） | 崩溃损失敞口（少发方向，Phase 7 口径 3.1%） |
+| 3 | 并发 GRANT 上界 / 单在途 | ✅ 已实现；上界为推导 | lease.lua `_inflight` 标志（:45）、方案 B 直连降级（algorithm.lua:383-408）；concurrent-lease-e2e 22/0（真实 OpenResty）；`W_total×k` 为推导上界（前提=每 Pool ≤1 active） | 协程模型量化数据 NOT VERIFIED（关口二声明维持） |
+| 4 | Pool 上限 / 回收 / 内存证据 | ✅ 已实现；内存部分实测 | MAX_POOLS=10000/Worker（lease.lua:49）、60s Timer、空池 EVICTED 零损失；元数据内存实测（关口四任务 B：1M 条 306.08MB，真实键长估算 330–350MB ±10%） | Worker RSS 与长稳内存曲线 NOT VERIFIED（关口二冻结保留） |
+| 5 | 账目关系 | ✅ 已实现并验证 | 恒等式 `confirmed_granted = consumed + outstanding + discarded`（lease.lua:23 注释与 invariants() 实现）；discarded 唯一来源 `expire_lease_at`；uncertain 单列不计入（冻结语义）；algorithm-lease-unit 37/0（N/O 组断言）守护 | 精确 lost 审计 Deferred |
+| 6 | Key 唯一性 / 编码 / hash tag | ✅ 已实现；Cluster 行为未验证 | keys.lua encode_value（4 字节转义）+ build_lease_key 同 tag；config-isolation-unit 24/0（8 项 key 断言含 CRC16 slot 等价） | Redis Cluster 实机 NOT VERIFIED（standalone 环境，CLUSTER KEYSLOT disabled） |
+| 7 | 脚本双源一致性 | ✅ 已实现并验证 | test/script-consistency-check.sh（剥离注释逐行 diff）；本地 4/0 + CI 干净 Runner 4/0（负向验证可检出代码差异） | 注释级差异允许（已定义口径） |
+| 8 | Lease 元数据字段/TTL/成本 | ✅ 已实现；成本已实测 | 脚本 HSET 5 字段 + PEXPIRE（redis.lua:274-280）；实测 PTTL=3,592,908ms（1h）；单键 280B、1M 条 306.08MB（关口四任务 B 实测）；TTL 过期≠库存归还（冻结口径） | Cluster 下内存/复制流量未验证 |
+| 9 | schema 与配置文档一致性 | ✅ 一致 | password 字段 schema.lua:149（encrypted+referenceable+len_min=0）↔ CONFIGURATION.md:22 逐字对应；全表此前已按 schema 核对（关口五） | 无 |
+| 10 | 五文档交叉一致性 | ✅ 一致（抽查） | MAX_POOLS/max_age=2×window/LEASE_TTL_MS/9.99:1/81.8%/−23%/−73%/NOT VERIFIED 归因在 README/design/architecture/CONFIGURATION/REMEDIATION 间口径一致（grep 逐项命中核对） | mermaid 渲染 NOT VERIFIED（人工核对） |
+| 11 | CI 与本地测试入口 | ✅ 一致 | 本地 18 个 test/*.sh 全部被 CI 覆盖（4 单测 + 2 Redis 集成 + 一致性 + 11 E2E + quota.sh）；基线 CI run 43711832556 逐项日志核对全 PASS | 探针（lease-memory-baseline/lease-concurrent-grant-probe.lua）与 manual md 不入 CI——属关口一审计工具/人工剧本，按需运行（原因已记录）；CI 首次全绿为 43711556576 |
+| 12 | 冻结数据完整性 | ✅ 完整 | `git diff c9e05fc..ee4c195` 对 bench/raw/、docs/reports/、openspec/、redis/ 改动文件数=0（schema.lua 属任务 2 授权）；phase7 原始 97 文件、docs/reports 9 文件、reports/ 3 文件、两份 Phase 0 review 与 docs/archive/rule.md 均在位 | 无 |
+
+## 五类最终结论
+
+**1. 已实现并验证（真实测试/CI 日志背书）**：batch=1 逐请求授权与三路径语义；多规则全或无；
+429/503/Retry-After；Fail-close/显式降级；EVALSHA+NOSCRIPT 恰一次重试；Worker 私有 Lease 与
+崩溃损失账目（worker-crash-e2e）；并发安全（concurrent-lease-e2e 真实环境）；单在途 GRANT +
+Pool 上限降级（不 429/不 503）；Pool 过期/回收 + discarded 单次计数 + 账目恒等式；
+Key 编码与 Lease 键同 tag（单元 8 断言 + CRC16 等价验证）；脚本双源一致性（自动检查 + CI）；
+Lease 元数据 TTL/成本（实测）；quota.sh 严格配额（CI allowed=100）。
+
+**2. 已实现但未充分验证（有实现与单元/E2E 证据，缺指定环境验证）**：
+W_total×k 并发上界的协程量化（真实环境有 concurrent-e2e 行为级证据，量化 NOT VERIFIED）；
+Redis Cluster 实机行为（键层同 slot 已修，per-node 脚本缓存/重定向未验证）；
+vault 引用轮换（TTL update 机制）；Worker RSS 与长稳内存曲线。
+
+**3. 已知限制（如实声明，维持记录）**：自动 RETURN 未接线（RETURN_LEASE 协议冻结未用）；
+Worker 接管/库存补偿无；GRANT 不确定不重试不登记（库存损失敞口，单次 ≤k）；指纹变化新旧桶
+并存（升级窗口 2×window）；匿名 consumer 共享配额（`anon`，关口六决策）；N1 维度值 256 截断
+碰撞（未修）；path 高基数无归一化；`LEASE_TTL_MS` 不可配置。
+
+**4. Production Ready 前仍需完成**：Redis HA（Sentinel/Cluster 部署验证）；跨机器真实 RTT
+压测与干净环境 p99 归因；长稳（>24h）与内存曲线；Worker RSS 采集；监控接入（Prometheus）；
+精确 lost 对账；热点 key 打散。**本整改达成的是"工程验证级 + 关口冻结"，不是 Production Ready。**
+
+**5. 本次未涉及**：控制面/配置分发、多租户计费、全局公平排队、μs 级窗口对齐（design.md §1.2
+边界，从未在范围内）；会话导出文件（1113/1115/1115-2.json，本地未跟踪）与本地未提交的
+.gitignore 修改（建议人工处理）。
+
+**问题清单（非阻断）**：仅一项——工作区本地未提交 `.gitignore` 修改（`11*.json`），证据见基线
+核实节；不影响 HEAD/远端/CI；建议人工确认后提交或回滚。
+
+**总体结论**：Hardening 整改（关口一至六）按冻结设计完成并通过全量回归（本地 341/0 全量 +
+CI 全绿），验收**通过**；不宣称 Production Ready（第 4 类清单为进入生产的前置工作）。
+
