@@ -485,6 +485,44 @@ do -- Timer 数量上限：70 个空闲池，单次 ≤64，剩余下次处理
        "n1=" .. n1 .. " n2=" .. n2)
 end
 
+do -- Timer 跳过在途 GRANT 的 Pool（关口三审查修复：防回收后 register 重建超上限）
+    lease.reset()
+    local now = ngx_now()
+    local pk = PK .. "t-inflight"
+    lease.register(pk, "id-ti", 3, ngx_now(), 5000)
+    for _ = 1, 3 do lease.take(pk) end          -- 空池（可回收形态）
+    lease._pools[pk].last_used = now - 1000
+    lease._inflight[pk] = true                  -- 模拟在途 GRANT
+    local n = lease.timer_sweep_once(64)
+    ok("timer-skip-inflight",
+       n == 0 and lease._pools[pk] ~= nil and lease.pool_count() == 1,
+       "evicted=" .. n .. " count=" .. lease.pool_count())
+    lease._inflight[pk] = nil                   -- 清除后可正常回收
+    local n2 = lease.timer_sweep_once(64)
+    ok("timer-evict-after-inflight-clear",
+       n2 == 1 and lease._pools[pk] == nil and lease.pool_count() == 0,
+       "evicted=" .. n2)
+    ok("timer-skip-inflight-invariants", lease.invariants())
+end
+
+do -- Timer 跳过 evict_idle_pools 同口径：在途 Pool 不被容量淘汰（ensure_capacity 路径）
+    lease.reset()
+    local pk = PK .. "e-inflight"
+    lease.register(pk, "id-ei", 3)
+    for _ = 1, 3 do lease.take(pk) end          -- 空池
+    lease._inflight[pk] = true
+    local removed = lease.evict_idle_pools(64)
+    ok("evict-skip-inflight",
+       removed == 0 and lease._pools[pk] ~= nil and lease.pool_count() == 1,
+       "removed=" .. removed)
+    lease._inflight[pk] = nil
+    lease.evict_idle_pools(64)
+    ok("evict-after-inflight-clear",
+       lease._pools[pk] == nil and lease.pool_count() == 0
+       and lease.invariants(),
+       "count=" .. lease.pool_count())
+end
+
 -- ============================================================
 -- 关口三新增：MAX_POOLS 容量与淘汰（只删空池，零库存损失）
 -- ============================================================

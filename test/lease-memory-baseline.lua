@@ -33,6 +33,7 @@ local base = gc()
 print(string.format("baseline_heap_kb=%.1f", base))
 
 lease.reset()
+lease.MAX_POOLS = N   -- 探针直建 N 个池（生产路径经 ensure_capacity；测试直改上限以匹配规模）
 
 -- 建 10 万个独立 pool，每 pool 1 个 Lease 并消耗一部分（模拟真实混合状态）
 for i = 1, N do

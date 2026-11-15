@@ -407,4 +407,21 @@ confirmed_granted = consumed + outstanding + discarded
 - N3（Cluster CROSSSLOT）**维持未授权**；N1/N2（维度值碰撞）未动（key 形态变更需确认）；N4–N8 维持记录。
 - 探针 steady 场景 grant_calls=8/direct=29：直连与 Lease 混合下的总账（lease 账 + 直连批）跨路径对账仍无手段（V1 无 Redis 对账接口），维持"允许损失、方向保守"表述。
 
+### 关口三审查修复：容量边界（inflight Pool 回收排除 + 在途 GRANT 占位）
+
+**改了什么 / 为什么**：审查发现 `evict_idle_pools()` 与 `timer_sweep_once()` 只判 `active` 空，不排除在途 GRANT 的 Pool——GRANT yield 期间 Pool 被回收、返回后 `register()` 重建 ⇒ `_pool_count` 超 MAX_POOLS。修复（`lib/lease.lua`）：① 两处回收逻辑跳过 `_inflight[key]==true` 的 Pool；② 推演发现同族问题——跨 Pool 并发 GRANT 各自通过 ensure_capacity 后才 register，同样超上限 ⇒ `ensure_capacity()` 改为在途 GRANT **占用池位**口径：`_pool_count + inflight_count() ≥ MAX` 即视为达容量（不改变"不驱逐 ACTIVE Pool / 不 429 不 503"冻结行为，仅使降级判定覆盖在途占位）；③ `invariants()` 新增容量上限不变量 `_pool_count ≤ MAX_POOLS`（测试直改 MAX 的人工态除外——既有 capacity 用例先恢复 MAX 再断言，无需改动）。
+
+**测试命令与真实结果**（全部实测）：
+- `bash test/lease-unit.sh` → **PASS 50 / FAIL 0**（新增 timer-skip-inflight、timer-evict-after-inflight-clear、evict-skip-inflight、evict-after-inflight-clear 4 用例）
+- `bash test/algorithm-lease-unit.sh` → **PASS 32 / FAIL 0**（新增 N 用例：确定性协程——A 的 GRANT yield 期间 B 触发容量回收，断言 A 的 Pool 对象不被回收/重建（同 table 引用）、空池 C 被正常淘汰、B 降级直连、恢复后 `pool_count ≤ MAX_POOLS`、恒等式成立）
+- `bash test/concurrent-lease-e2e.sh` ×3 → **PASS 18 / FAIL 0 / NOT_VERIFIED 0** ×3。断言适配（方案 B 设计行为，非降级）：原 `allowed == Σgranted(Lease)` 在直连降级触发时不再成立；改为 **授权总账 = Lease Σgranted + 直连批 == limit=100**，直连批以 Redis `INFO commandstats` 的 EVALSHA 增量实证（增量 − Lease 记录数 − denied-GRANT 数）。第 1 轮真实环境实测：Σgranted=96 + 直连=4 = 放行 100，账目精确闭合——**降级路径在真实 OpenResty 环境触发并被账目闭环验证**（协程模型的量化结论仍维持 NOT VERIFIED 口径不变）。
+- `docker compose exec -T kong1 resty /tmp/lease-memory-baseline.lua` → PASS（invariants 含新容量不变量；探针以 `lease.MAX_POOLS = N` 匹配直建规模）
+- `bash test/algorithm-lease-e2e.sh` PASS 15/0；`bash test/worker-crash-e2e.sh` PASS 16/0；`bash test/lease-exhaustion-e2e.sh` PASS 11/0；`bash test/config-isolation-unit.sh` PASS 15/0；`bash test/lease-grant-smoke.sh` PASS 7/0；`bash test/evalsha-unit.sh` PASS 8/0。
+
+**对外行为影响**：仅容量判定口径收紧（在途 GRANT 占位）——正常流量（Pool 数 ≪ 10000）行为逐字节不变；高基数攻击场景下降级判定更保守（在途窗口内提前降级直连），仍不 429/不 503。
+
+**遗留问题**：
+- `config-isolation-e2e.sh` 存在**与本修复无关的既有偶发**（"B 桶键 ≠ A 桶键"在配置传播时序下偶现同指纹；历史报告 PHASE8_B 已记录同类偶发）。本轮 5 轮：3×14/0、2×13/1（偶发轮），复跑即恢复全绿；未改动该脚本。
+- 直连批的 Redis 侧计数仅为本 E2E 的 commandstats 推导（delta − records − denied）；常规运行期无该对账口径（维持 V1 无对账接口的表述）。
+
 ---

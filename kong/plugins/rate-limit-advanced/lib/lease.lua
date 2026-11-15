@@ -324,22 +324,37 @@ end
 
 -- ------------------------------------------------------------
 -- Pool 容量（MAX_POOLS，冻结：10000/Worker）。
--- ensure_capacity：未达上限 ⇒ true；达上限 ⇒ 先淘汰无 ACTIVE Lease 的
--- Pool（≤64 个，零库存损失），仍满 ⇒ false（调用方降级 batch=1 直连）。
+-- 在途 GRANT 占用池位（关口三审查修复）：跨 Pool 并发 GRANT 各自通过
+-- ensure_capacity 后才 register，若不预留，登记完成时 _pool_count 可超上限
+-- ⇒ count + inflight 数 ≥ MAX 即视为达容量。
+-- ensure_capacity：未达上限 ⇒ true；达上限 ⇒ 先淘汰无 ACTIVE Lease 且非
+-- 在途的 Pool（≤64 个，零库存损失），仍满 ⇒ false（调用方降级 batch=1 直连）。
 -- ------------------------------------------------------------
 function _M.pool_count()
   return _M._pool_count
 end
 
+local function inflight_count()
+  local n = 0
+  for _, v in pairs(_M._inflight) do
+    if v == true then
+      n = n + 1
+    end
+  end
+  return n
+end
+
 function _M.ensure_capacity()
-  if _M._pool_count < _M.MAX_POOLS then
+  if _M._pool_count + inflight_count() < _M.MAX_POOLS then
     return true
   end
   _M.evict_idle_pools(TIMER_POOL_CAP)
-  return _M._pool_count < _M.MAX_POOLS
+  return _M._pool_count + inflight_count() < _M.MAX_POOLS
 end
 
--- 只淘汰没有 ACTIVE Lease 的 Pool（冻结：不驱逐含 ACTIVE Lease 的 Pool）。
+-- 只淘汰没有 ACTIVE Lease 的 Pool（冻结：不驱逐含 ACTIVE Lease 的 Pool）；
+-- 并跳过在途 GRANT 的 Pool（关口三审查修复：inflight Pool 的 GRANT 返回后
+-- register 会重建 Pool ⇒ _pool_count 超 MAX_POOLS）。
 -- 纯 table 操作，非 yield；键集合扫描 O(P) 有界于 MAX_POOLS。
 function _M.evict_idle_pools(cap)
   cap = cap or TIMER_POOL_CAP
@@ -348,7 +363,7 @@ function _M.evict_idle_pools(cap)
     if removed >= cap then
       break
     end
-    if #pool.active == 0 then
+    if _M._inflight[key] ~= true and #pool.active == 0 then
       _M._pools[key] = nil
       _M._pool_count = _M._pool_count - 1
       _M._counters.evicted = _M._counters.evicted + 1
@@ -377,7 +392,9 @@ function _M.timer_sweep_once(cap)
     local max_age_s = pool.max_age and pool.max_age / 1000
     if max_age_s then
       local idle_for = now - (pool.last_used or 0)
-      if idle_for >= max_age_s then
+      if idle_for >= max_age_s and _M._inflight[key] ~= true then
+        -- 关口三审查修复：在途 GRANT 的 Pool 跳过（GRANT 返回后 register
+        -- 会重建 Pool ⇒ _pool_count 超 MAX_POOLS）。
         local i = 1
         while i <= #pool.active do
           local l = pool.active[i]
@@ -502,6 +519,12 @@ function _M.invariants()
     end
   end
   local c = _M._counters
+  -- 容量上限不变量（关口三审查补充）：生产路径每次 register 前均经
+  -- ensure_capacity 放行 ⇒ count 不会超 MAX_POOLS（测试直改 MAX 属人工态）
+  if _M._pool_count > _M.MAX_POOLS then
+    return false, "pool count exceeds MAX_POOLS: " .. _M._pool_count
+      .. " > " .. _M.MAX_POOLS
+  end
   -- 终态对象已释放，逐对象求和仅覆盖 active；全局口径以恒等式与数量闭环校验：
   --   granted = consumed + outstanding + discarded（逐对象守恒在摘除瞬间转移）
   if c.tokens_granted ~= c.tokens_consumed + sum_remaining + c.discarded_tokens then

@@ -47,6 +47,11 @@ for n in 8031 8011 8021; do
 done
 ok "配置下发：limit=100 window=86400 batch=10 ns=$NS（3 节点）"
 
+# ---- EVALSHA 计数快照（关口三方案 B：直连降级授权经 TOKEN_BUCKET EVALSHA，
+#      不产生 Lease 记录 ⇒ 账目断言须计入；以 Redis commandstats 计数实证） ----
+evalsha_before=$(RC INFO commandstats </dev/null | tr -d '\r' | sed -n 's/^cmdstat_evalsha:calls=//p' | cut -d, -f1)
+[ -n "$evalsha_before" ] || evalsha_before=0
+
 # ---- Phase A：30 并发请求（三节点轮转，采样 X-RateLimit-Remaining） ----
 mkdir -p /tmp/opencode/p65c-h
 seq 1 30 | awk -v c=$$ '{print $1}' | while read i; do echo "$i"; done >/dev/null
@@ -108,8 +113,19 @@ while IFS= read -r k; do
 done < <(RC --scan --pattern 'kong:rl:lease:*' </dev/null)
 ndistinct=$(echo "$workers_seen" | tr ',' '\n' | grep -c . || true)
 echo "GRANT 记录: count=$records Σgranted=$sum_granted distinct(host,worker)=$ndistinct [$workers_seen]"
-report "$(eq "$sum_granted" 100)" "Redis GRANT 授权总量=$sum_granted（恰等于 limit=100，不超发）"
-report "$(eq "$records" 10)" "GRANT 记录数=$records（10 次×batch=10，每池 10）"
+
+# ---- 断言 3（关口三方案 B 适配）：Lease Σgranted + 直连批 == 100（Redis EVALSHA 计数实证） ----
+# EVALSHA 增量 = Lease GRANT 调用（成功建记录=records + denied-GRANT 返回 granted=0=denied）
+#             + 直连降级的 batch=1 TOKEN_BUCKET 调用（不产生 Lease 记录）。
+# ⇒ direct = 增量 − records − denied。授权总账 = Σgranted + direct，仍恰等于 limit=100。
+evalsha_after=$(RC INFO commandstats </dev/null | tr -d '\r' | sed -n 's/^cmdstat_evalsha:calls=//p' | cut -d, -f1)
+[ -n "$evalsha_after" ] || evalsha_after=0
+denied_total=$((denied_a + denied_b + denied_c))
+direct=$((evalsha_after - evalsha_before - records - denied_total))
+report "$([ "$direct" -ge 0 ] && echo true)" "直连批=$direct（EVALSHA 增量=$((evalsha_after - evalsha_before)) − Lease 记录=$records − denied-GRANT=$denied_total；≥0）"
+total_granted=$((sum_granted + direct))
+report "$(eq "$total_granted" 100)" "Redis 授权总账=$total_granted（Lease Σgranted=$sum_granted + 直连=$direct；恰等于 limit=100，不超发）"
+report "$([ "$sum_granted" -le 100 ] && echo true)" "Lease Σgranted=$sum_granted ≤ limit=100（Lease 账目不超发）"
 
 # ---- 断言 4：请求分布到多个 Worker ----
 report "$([ "$ndistinct" -ge 3 ] && echo true)" "请求分布到 $ndistinct 个不同 (host,worker) ≥3（lease_id host:worker 段实证）"
@@ -123,8 +139,10 @@ for f in /tmp/opencode/p65c-h/h* /tmp/opencode/p65c-lasthdr; do
 done
 report "$([ "$minrem" -ge 0 ] && echo true)" "全部采样 X-RateLimit-Remaining ≥ 0（min=$minrem；本地池无负库存/无重复消费）"
 
-# ---- 断言 6：TAKE 消费量口径 == HTTP 放行（每 200 恰一次成功 TAKE） ----
-report "$(eq "$allowed" "$sum_granted")" "本地 TAKE 消费总量=$allowed == Σgranted=$sum_granted（每个授予令牌恰被消费一次，无丢失无重复）"
+# ---- 断言 6（关口三方案 B 适配）：TAKE 消费量 + 直连放行 == HTTP 放行 ----
+# 每个 200 恰好对应一次库存消耗：Lease TAKE 消费 == Σgranted（Lease 部分守恒），
+# 直连批每笔恰消费 1 个 Redis 令牌（batch=1 既有路径），两账合计 == allowed。
+report "$(eq "$((sum_granted + direct))" "$allowed")" "授权消耗总账=$((sum_granted + direct)) == HTTP 放行=$allowed（Lease TAKE 消费=Σgranted=$sum_granted + 直连=$direct；无丢失无重复）"
 
 # ---- 断言 7：耗尽后新 GRANT 语义（denied-GRANT ⇒ 429，不伪装 503） ----
 report "$([ $((denied_a+denied_b+denied_c)) -gt 0 ] && echo true)" "超额请求返回 429=$((denied_a+denied_b+denied_c))（耗尽后 denied-GRANT granted=0 既有语义）"

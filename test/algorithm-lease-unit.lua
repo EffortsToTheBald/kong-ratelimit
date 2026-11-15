@@ -361,6 +361,90 @@ do -- M：并发 burst（Lua 协程交错模型，yield 点=transport 内部；�
        "g=" .. st.granted .. " c=" .. st.consumed .. " o=" .. st.local_remaining)
 end
 
+do -- N：确定性并发（关口三审查修复验证）——A 的 GRANT yield 期间 B 触发容量回收：
+    -- A 不被回收、在途 GRANT 占用池位 ⇒ 最终 Pool 数量不超上限
+    lease.reset()
+    local saved = lease.MAX_POOLS
+    lease.MAX_POOLS = 2
+    transport_ret = { granted = 10, tokens = 90, wait = 0 }
+    local confA = base_conf()
+    local keyA = algorithm.build_key(confA)
+
+    -- 两阶段 stub：park=false 直返（纪元 1）；park=true 先 yield（模拟 cosocket 挂起）
+    local transport_calls_N = 0
+    local park = false
+    lease._transport = function(...)
+        transport_calls_N = transport_calls_N + 1
+        if park then
+            coroutine.yield("grant_inflight")
+        end
+        return transport_ret, transport_err
+    end
+
+    -- 纪元 1：A 正常 GRANT 建池（count=1 < MAX=2）后耗尽成空池
+    local dA1 = algorithm.check(confA, keyA)
+    for _ = 1, 10 do lease.take(keyA) end
+    ok("N-epoch1-empty-pool",
+       dA1 ~= nil and dA1.allowed == true and lease.pool_count() == 1
+       and #lease._pools[keyA].active == 0,
+       "count=" .. lease.pool_count())
+
+    -- A 重新 GRANT：count(1) < MAX(2) ⇒ 不触发淘汰 ⇒ Pool A 存在、inflight 置位、挂起
+    park = true
+    local coA = coroutine.create(function()
+        return algorithm.check(confA, keyA)
+    end)
+    coroutine.resume(coA)
+    local poolA_ref = lease._pools[keyA]
+    ok("N-parked-inflight",
+       coroutine.status(coA) == "suspended"
+       and lease.grant_in_flight(keyA) == true
+       and poolA_ref ~= nil and #poolA_ref.active == 0,
+       "status=" .. coroutine.status(coA)
+       .. " inflight=" .. tostring(lease.grant_in_flight(keyA)))
+
+    -- 直建空池 C（测试用 register 原语；count=2=MAX）
+    local keyC = "kong:rl:{n:c:ip=10.0.0.1}"
+    lease.register(keyC, "id-c", 5)
+    for _ = 1, 5 do lease.take(keyC) end
+    ok("N-pool-c-created", lease.pool_count() == 2, "count=" .. lease.pool_count())
+
+    -- B 触发容量回收：count(2)+inflight(1) ≥ MAX(2) ⇒ 淘汰 C（跳过在途 A）⇒ 仍满 ⇒ 降级直连
+    local confB = base_conf(); confB.limit = 200
+    local keyB = algorithm.build_key(confB)
+    calls.grant, calls.warn = 0, 0
+    local dB = algorithm.check(confB, keyB)
+    ok("N-b-degrade-and-evict-skip-inflight",
+       dB ~= nil and dB.allowed == true and dB.remaining == 0
+       and calls.grant == 1 and transport_calls_N == 2
+       and lease._pools[keyC] == nil and lease._pools[keyA] == poolA_ref
+       and lease.pool_count() == 1 and lease.stats().evicted == 1
+       and calls.warn == 1,
+       "grant=" .. calls.grant .. " transport=" .. transport_calls_N
+       .. " count=" .. lease.pool_count()
+       .. " evicted=" .. lease.stats().evicted)
+
+    -- A 恢复：GRANT 返回 ⇒ register 复用原 Pool（不重建）⇒ 总数仍 ≤ 上限
+    park = false
+    local okr, dA2 = coroutine.resume(coA)
+    lease._transport = nil
+    local st = lease.stats()
+    ok("N-register-reuses-pool",
+       okr and dA2 ~= nil and dA2.allowed == true and dA2.remaining == 9
+       and lease._pools[keyA] == poolA_ref
+       and lease.pool_count() == 1
+       and lease.pool_count() <= lease.MAX_POOLS,
+       "dA2=" .. tostring(dA2 and dA2.allowed)
+       .. " count=" .. lease.pool_count())
+    ok("N-invariants-with-bound", lease.invariants(),
+       tostring(lease.invariants()))
+    ok("N-ledger-identity",
+       st.granted == st.consumed + st.local_remaining + st.discarded_tokens,
+       "g=" .. st.granted .. " c=" .. st.consumed
+       .. " o=" .. st.local_remaining .. " d=" .. st.discarded_tokens)
+    lease.MAX_POOLS = saved
+end
+
 redis_mod.grant, redis_mod.grant_multi = orig_grant, orig_grant_multi
 
 print("===== 汇总: PASS=" .. pass .. " FAIL=" .. fail .. " =====")
