@@ -366,7 +366,51 @@ function _M.check_lease(conf, key)
     }
   end
 
-  -- 2) 本地无库存 ⇒ GRANT_LEASE 申请新 Lease（D4 四分类）
+  -- 2) 本地无库存 ⇒ GRANT 前的两类降级判定（关口二冻结：方案 B / MAX_POOLS）：
+  --    * MAX_POOLS 达上限且无可淘汰空池 ⇒ 不驱逐 ACTIVE Pool，该请求
+  --      退化为不登记本地库存的 batch=1 直连（不 429/不 503，攻击性高基数
+  --      无法把正常用户打到拒绝）；
+  --    * 该 Pool 已有在途 GRANT ⇒ 并发请求同样走 batch=1 直连（不登记），
+  --      保证每 Pool active Lease ≤ 1。
+  --    直连路径复用 batch=1 既有语义（429/Fail-close），不进 Lease 账目。
+  local capacity_ok = lease.ensure_capacity()
+  local direct_reason
+  if not capacity_ok then
+    direct_reason = "pool_cap"
+  elseif lease.grant_in_flight(key) then
+    direct_reason = "inflight"
+  end
+  if direct_reason then
+    local granted, derr = redis_mod.grant(conf, key, 1, ttl_ms, rate, burst)
+    if not granted then
+      kong.log.err("rate-limit-advanced: direct degrade grant failed (",
+                   direct_reason, "): ", tostring(derr))
+      return nil, derr
+    end
+    if granted.granted <= 0 then
+      local wait = granted.wait
+      if not wait or wait <= 0 then
+        wait = 1
+      end
+      return {
+        allowed     = false,
+        remaining   = 0,
+        retry_after = wait,
+      }
+    end
+    if direct_reason == "pool_cap" then
+      kong.log.warn("rate-limit-advanced: pool_cap_degraded reason=pool_cap key=", key)
+    else
+      kong.log.debug("rate-limit-advanced: inflight_degraded key=", key)
+    end
+    return {
+      allowed   = true,
+      remaining = math.max(0, granted.granted - 1),
+      reset     = math.floor(now + (granted.wait or 0)),
+    }
+  end
+
+  -- 3) 正常 GRANT_LEASE 申请新 Lease（D4 四分类）
   local res, gerr = lease.grant(conf, key, key, batch, LEASE_TTL_MS,
                                 rate, burst, ttl_ms)
   if not res then
@@ -383,7 +427,7 @@ function _M.check_lease(conf, key)
   " wait=", res.wait
   )
 
-  -- 3) 明确不足（granted=0，桶令牌数不足 1）⇒ 429（既有语义，不建 Lease）
+  -- 4) 明确不足（granted=0，桶令牌数不足 1）⇒ 429（既有语义，不建 Lease）
   if res.ok == false then
     local wait = res.wait
     if not wait or wait <= 0 then
@@ -396,7 +440,7 @@ function _M.check_lease(conf, key)
     }
   end
 
-  -- 4) 明确授予（granted>=1，Lease 已登记）⇒ 本次请求必须恰好消费 1 个，
+  -- 5) 明确授予（granted>=1，Lease 已登记）⇒ 本次请求必须恰好消费 1 个，
   --    不得只登记库存却漏掉当前请求（granted>=1 ⇒ active 非空 ⇒ TAKE 必成功；
   --    防御分支按故障处理，绝不放行未授权库存）
   local tok2, remaining2 = lease.take(key)

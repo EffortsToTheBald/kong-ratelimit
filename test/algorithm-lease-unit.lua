@@ -39,7 +39,7 @@ kong = {
 }
 
 -- ---- spies ----
-local calls = { grant = 0, grant_multi = 0, transport = 0 }
+local calls = { grant = 0, grant_multi = 0, transport = 0, warn = 0 }
 local grant_ret       -- batch=1 stub 返回
 local grant_multi_ret -- 多规则 stub 返回
 local transport_ret   -- GRANT_LEASE stub 返回 {parsed} 或 nil, err
@@ -64,6 +64,10 @@ lease._transport = function(conf, bucket_key, lease_id, pool_key, batch,
                   rate = rate, capacity = capacity, bucket_ttl = bucket_ttl_ms }
     return transport_ret, transport_err
 end
+
+-- kong stub 补充：warn 计数（pool_cap_degraded 取证）
+local _warn = kong.log.warn
+kong.log.warn = function(...) calls.warn = calls.warn + 1 end
 
 local function base_conf()
     return {
@@ -150,12 +154,15 @@ do
        and calls.transport == 1 and st.leases == 2 and st.closed == 1
        and st.active == 1 and st.local_remaining == 4,
        "rem=" .. tostring(d and d.remaining) .. " leases=" .. st.leases)
-    -- 旧 Lease 保留诊断记录：闭 Lease 对象仍在全量表中
-    local pool = lease._pools[key]
-    ok("D-closed-retained", #pool.leases == 2 and #pool.active == 1
-       and pool.leases[1].state == "CLOSED" and pool.leases[1].remaining == 0
-       and pool.leases[2].state == "ACTIVE",
-       "leases=" .. #pool.leases .. " active=" .. #pool.active)
+    -- 关口三改造：终态对象即释放（诊断表取消）⇒ 原"闭 Lease 对象仍在全量表"
+    -- 断言改为计数器闭环（closed=1、租约数量闭环、恒等式成立）
+    ok("D-closed-counted",
+       st.leases == st.closed + st.expired + st.active
+       and st.granted == st.consumed + st.local_remaining + st.discarded_tokens
+       and #lease._pools[key].active == 1
+       and lease._pools[key].active[1].lease_id ~= nil,
+       "leases=" .. st.leases .. " closed=" .. st.closed
+       .. " active=" .. #lease._pools[key].active)
 end
 
 -- ============================================================
@@ -238,6 +245,120 @@ do
        and calls.grant_multi == 1 and calls.transport == 0
        and lease.stats().leases == 0,
        tostring(d and d.allowed) .. "/multi=" .. calls.grant_multi)
+end
+
+-- ============================================================
+-- K/L/M. 关口三新增：MAX_POOLS 降级 / 单在途降级 / 并发 burst（协程模型）
+-- ============================================================
+do -- K：MAX_POOLS 达上限且无可淘汰空池 ⇒ pool_cap 降级直连（不 429/不 503、不登记）
+    lease.reset()
+    transport_ret = { granted = 10, tokens = 90, wait = 0 }
+    local saved = lease.MAX_POOLS
+    lease.MAX_POOLS = 1
+    local c1 = base_conf()
+    local k1 = algorithm.build_key(c1)
+    algorithm.check(c1, k1)                        -- k1 建 Pool（ACTIVE）
+    local c2 = base_conf(); c2.limit = 200         -- 不同 key ⇒ 第二个 Pool
+    local k2 = algorithm.build_key(c2)
+    calls.grant, calls.transport, calls.warn = 0, 0, 0
+    local d = algorithm.check(c2, k2)              -- NEED_GRANT ⇒ 达上限 ⇒ 降级
+    ok("K-poolcap-direct-degrade",
+       d ~= nil and d.allowed == true and d.remaining == 0
+       and calls.grant == 1 and calls.transport == 0
+       and calls.warn == 1 and lease.stats().leases == 1,
+       "d=" .. tostring(d and d.allowed) .. " grant=" .. calls.grant
+       .. " warn=" .. calls.warn .. " leases=" .. lease.stats().leases)
+    -- k1 池耗尽成空池后，ensure_capacity 淘汰空池恢复容量（零库存损失）
+    local k1pool = lease._pools[k1]
+    for _ = 1, 10 do lease.take(k1) end            -- 耗尽 k1 的 Lease
+    lease.MAX_POOLS = 1
+    local d2 = algorithm.check(c2, k2)             -- k1 空池被淘汰 ⇒ k2 正常 GRANT
+    ok("K-poolcap-evict-then-grant",
+       d2 ~= nil and d2.allowed == true and lease._pools[k1] == nil
+       and lease._pools[k2] ~= nil and lease.stats().evicted == 1
+       and calls.transport == 1,
+       "d2=" .. tostring(d2 and d2.allowed) .. " transport=" .. calls.transport)
+    lease.MAX_POOLS = saved
+end
+
+do -- L：单在途标志置位 ⇒ 并发请求降级直连（不登记，方案 B）
+    lease.reset()
+    calls.grant, calls.transport = 0, 0
+    local conf = base_conf()
+    local key = algorithm.build_key(conf)
+    lease._inflight[key] = true                    -- 模拟在途 GRANT（不 yield 场景）
+    local d = algorithm.check(conf, key)
+    lease._inflight[key] = nil
+    ok("L-inflight-direct-degrade",
+       d ~= nil and d.allowed == true and d.remaining == 0
+       and calls.grant == 1 and calls.transport == 0
+       and lease.stats().leases == 0,
+       "d=" .. tostring(d and d.allowed) .. " grant=" .. calls.grant)
+    -- 直连请求不进 Lease 账目：恒等式与数量闭环仍成立
+    ok("L-direct-out-of-ledger", lease.invariants())
+end
+
+do -- M：并发 burst（Lua 协程交错模型，yield 点=transport 内部；非真实 OpenResty 验证）
+    lease.reset()
+    calls.grant, calls.transport = 0, 0
+    local conf = base_conf()
+    local key = algorithm.build_key(conf)
+    transport_ret = { granted = 10, tokens = 90, wait = 0 }
+
+    local N = 20
+    local TICKS = 5
+    lease._transport = function(...)
+        coroutine.yield("grant_inflight")          -- 模拟 cosocket yield ×TICKS
+        coroutine.yield("grant_inflight")
+        coroutine.yield("grant_inflight")
+        coroutine.yield("grant_inflight")
+        coroutine.yield("grant_inflight")
+        calls.transport = calls.transport + 1
+        return transport_ret, transport_err
+    end
+
+    local cos = {}
+    for i = 1, N do
+        cos[i] = coroutine.create(function()
+            return algorithm.check(conf, key)
+        end)
+    end
+    local live, decisions = N, {}
+    while live > 0 do
+        for i = 1, N do
+            if coroutine.status(cos[i]) ~= "dead" then
+                local okr, d = coroutine.resume(cos[i])
+                if not okr then
+                    decisions[#decisions + 1] = { err = tostring(d) }
+                    live = live - 1
+                elseif coroutine.status(cos[i]) == "dead" then
+                    decisions[#decisions + 1] = d
+                    live = live - 1
+                end
+            end
+        end
+    end
+    lease._transport = nil
+
+    local st = lease.stats()
+    local all_allowed, n_direct_expected = true, true
+    for i = 1, N do
+        local d = decisions[i]
+        if not (d and d.allowed == true) then all_allowed = false end
+    end
+    ok("M-concurrent-all-allowed", all_allowed,
+       "allowed=" .. tostring(all_allowed))
+    ok("M-single-inflight-grant",
+       calls.transport == 1 and calls.grant == N - 1,
+       "transport=" .. calls.transport .. " direct=" .. calls.grant)
+    ok("M-active-bound-one",
+       st.active == 1 and st.leases == 1 and st.local_remaining == 9,
+       "active=" .. st.active .. " leases=" .. st.leases
+       .. " rem=" .. st.local_remaining)
+    ok("M-ledger-identity",
+       st.granted == st.consumed + st.local_remaining + st.discarded_tokens
+       and lease.invariants(),
+       "g=" .. st.granted .. " c=" .. st.consumed .. " o=" .. st.local_remaining)
 end
 
 redis_mod.grant, redis_mod.grant_multi = orig_grant, orig_grant_multi

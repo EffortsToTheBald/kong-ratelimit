@@ -3,6 +3,7 @@
 -- access 阶段：判定是否放行。放在 access 意味着超限请求根本不会打到上游。
 -- ============================================================
 local algorithm = require "kong.plugins.rate-limit-advanced.lib.algorithm"
+local lease = require "kong.plugins.rate-limit-advanced.lib.lease"
 
 local _M = {
   -- 高于大部分业务插件，保证限流先于业务逻辑执行（key-auth 是 1250，这里低于它，
@@ -17,6 +18,12 @@ local _M = {
 -- Legacy shared-dict 聚合库存（store.lua）已随 Phase 8 批次 A 移除。
 function _M:init_worker()
   kong.log.notice("rate-limit-advanced: V1 lease mode (worker-private table, no shared dict)")
+  -- 关口三（冻结 §4）：init_worker 低频兜底 Timer（60s，模块级防重复注册）；
+  -- 只处理空闲 Pool（last_used 老于 max_age），与请求路径集合不相交。
+  local tok, terr = lease.start_sweep_timer()
+  if not tok then
+    kong.log.warn("rate-limit-advanced: sweep timer not started: ", tostring(terr))
+  end
 end
 
 function _M:access(conf)

@@ -19,10 +19,11 @@ local g = lease.register(PK, "lease-" .. iso, 3)
 lease.take(PK)
 
 -- 输出：本进程可见的 Lease 清单与 stats
+-- （关口三：终态对象即释放，诊断清单取消 ⇒ 从 active 集合取 lease_id）
 local lines = {}
 local pool = lease._pools[PK]
-for i = 1, #pool.leases do
-    lines[#lines + 1] = pool.leases[i].lease_id
+for i = 1, #pool.active do
+    lines[#lines + 1] = pool.active[i].lease_id
 end
 local st = lease.stats()
 print(string.format("VM=%s leases=%s active=%d granted=%d consumed=%d remaining=%d",
