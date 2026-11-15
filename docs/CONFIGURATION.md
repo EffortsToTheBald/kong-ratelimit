@@ -19,7 +19,7 @@
 | `fault_tolerant` | boolean | false | Redis 故障策略：false=Fail-close（503）；true=降级放行（X-RateLimit-Status: degraded） | — |
 | `redis.host` | string | "127.0.0.1" | Redis 地址 | — |
 | `redis.port` | integer | 6379 | Redis 端口 | 1–65535 |
-| `redis.password` | string | 无 | 认证密码 | — |
+| `redis.password` | string | 无 | 认证密码（连接时 AUTH；Kong 3.6 OSS 支持 secrets 管理：`referenceable` 可用 `{vault://...}` 引用，`encrypted` 支持落库加密——DB-less 下无落库不影响本仓库；新增 E2E：test/redis-password-e2e.sh） | 密码错误 ⇒ 既有 Fail-close 语义（503） |
 | `redis.database` | integer | 0 | 逻辑库 | 0–15 |
 | `redis.timeout` | integer | 1000 | 连接/读写超时（ms）；超时的 GRANT 视为**不确定结果** | 1–60000 |
 | `redis.key_prefix` | string | "kong:rl" | Redis Key 前缀 | — |

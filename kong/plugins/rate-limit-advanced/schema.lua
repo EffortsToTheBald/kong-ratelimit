@@ -143,7 +143,10 @@ return {
               fields = {
                 { host = { type = "string", default = "127.0.0.1" } },
                 { port = { type = "integer", default = 6379, between = { 1, 65535 } } },
-                { password = { type = "string" } },
+                -- 关口六：对齐 Kong 3.6 官方 redis schema（kong.tools.redis.schema）——
+                -- password 支持 secrets 管理（{vault://...} 引用，referenceable）与落库加密
+                -- （encrypted；DB-less 下无落库，不影响本仓库运行方式）
+                { password = { type = "string", encrypted = true, referenceable = true, len_min = 0 } },
                 { database = { type = "integer", default = 0, between = { 0, 15 } } },
                 { timeout = { type = "integer", default = 1000, between = { 1, 60000 } } },
                 { key_prefix = { type = "string", default = "kong:rl" } },
