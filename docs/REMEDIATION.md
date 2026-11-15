@@ -450,8 +450,11 @@ confirmed_granted = consumed + outstanding + discarded
 - 测试同步（同次提交）：9 个 E2E 的 SCAN 模式 `'kong:rl:lease:*'` → `'kong:rl:*:lease:*'`（worker-crash、algorithm-lease-e2e、concurrent、config-isolation、fault-recovery、handler-fault、lease-exhaustion、lease-timeout-uncertain）；`lease-redis-matrix.sh` 96 处字面量 `kong:rl:lease:<id>` → `kong:rl:{p3g:m}:lease:<id>`；`lease-grant-smoke.lua` 的 keys 模式与 lkey 构造改为桶键派生；`config-isolation-unit.lua` 新增 8 项 key 断言（CRC16-XMODEM 已知向量 0x31C3 自校验、`:{}%` 转义、同输入稳定、多维不碰撞、hash tag 结构 `{}` 仅在骨架边界、Lease/桶键 slot 一致（等价算法）、lease_id 输入规范）；`concurrent-lease-e2e.sh` 的 tokens 终态采样排除 `:lease:` 键并补 SIGPIPE/混合期两条教训修复（见下）。
 - `docs/architecture.md` §5 键格式行同步（维度编码 + Lease 键同 tag + 旧格式废弃）。
 
-**兼容性（按审查要求展开）**：
-1. **滚动升级并存（不可简单表述为"一次性额外放行"）**：新旧版本 Worker 同时运行期间，两套 key 各自成账——同一逻辑维度实例同时占用**旧桶（存量水平）与新桶（满血初始配额）**，实际放行上限 = 两者之和 ⇒ **总放行可超单版本配额**（最坏 2×，随旧桶 TTL/旧记录 1h 消退而收敛）；新 Key 首次使用即重新获得初始满配额，且每个新维度实例（新 ip/header/path 值）都如此。运营含义：升级窗口内限流偏松，窗口 = max(旧桶 TTL=2×window, 旧 Lease 记录 1h)。
+**兼容性（按审查要求展开，含修正 2 的窗口拆分）**：
+1. **滚动升级并存（不可简单表述为"一次性额外放行"）**：新旧版本 Worker 同时运行期间，两套 key 各自成账——同一逻辑维度实例同时占用**旧桶（存量水平）与新桶（满血初始配额）**，实际放行上限 = 两者之和 ⇒ **总放行可超单版本配额**（最坏 2×）。新 Key 首次使用即重新获得初始满配额，且每个新维度实例（新 ip/header/path 值）都如此。
+   **两类 TTL 的影响必须分开（修正 2）**：
+   - **旧桶 TTL（2×window）**：决定**旧桶限流授权状态（tokens/ts）何时消失**——即放行上限叠加窗口的收敛时间；窗口内新旧桶并存、总放行可超单版本配额，窗口过后旧桶键自然过期、只剩新桶记账。
+   - **旧 Lease 元数据 1h TTL**：**只**决定元数据记录（对账/取证用）何时被清理；与库存归还无关（V1 无 RETURN），**不代表限流授权状态收敛**——授权状态由桶键承载，不受该 TTL 影响。
 2. 旧 key 不再复用；指纹不变（同策略新旧指纹段相同，仅值编码不同 ⇒ 旧桶不可被新代码命中）。
 3. 旧格式 Lease 记录由 1h TTL 自然消失；新 SCAN 模式不匹配旧格式（测试环境为全新 key 空间，无混合）。
 
@@ -465,5 +468,16 @@ confirmed_granted = consumed + outstanding + discarded
 **NOT VERIFIED（如实声明）**：真实 Redis Cluster 环境下的 GRANT_LEASE/RETURN_LEASE/EVALSHA/NOSCRIPT 行为未验证（本环境 standalone，`CLUSTER KEYSLOT` 返回 cluster support disabled）；slot 一致性由测试侧 CRC16-XMODEM 等价算法验证。**解决 CROSSSLOT 不等于完整支持 Redis Cluster**——Cluster 部署仍需独立的按节点脚本缓存、重定向等验证（维持既有 Deferred 记录）。
 
 **遗留问题**：① `redis/grant_lease.lua:20`、`redis/return_lease.lua:11` 及 `lib/redis.lua` 内嵌脚本头注释中的旧 key 格式描述未更新（脚本文件本关口冻结不动，待协议关口）；② N1（维度值 256 截断碰撞）不在本任务范围，维持记录；③ 全量 percent 编码（非 ASCII 字节原样）为本关决策，若未来要求 key 全 ASCII 可再评估（会再次全量换 key）。
+
+### 任务 A 审查修正（2026-11-15，二处，不扩范围）
+
+**修正 1：wait_stable() 可靠性**。原实现 `pgrep -f 'nginx: worker process'` 会误匹配执行命令的 shell（其 cmdline 含该模式串），且"进程数连续两次相同"无法证明旧 Worker 退出（新旧各 2 个时计数恒为 4）。重写（test/concurrent-lease-e2e.sh）：
+- 枚举：`/proc/[0-9]*/cmdline` **前缀**精确匹配 `"nginx: worker process "`（shell 自身 cmdline 以 `sh -c` 开头 ⇒ 不匹配；head/tr 子进程同理）⇒ 输出 Worker PID 集合。
+- 代际判定：配置下发**前**抓取旧代 PID 集合（POST /config 可能触发 reload）；收敛 = 代际单一——无 reload（当前集合 == 旧代集合）或旧代 PID 全部退出（两集合无交集）；任一不可证 ⇒ 30s 超时以"无法证明旧 Worker 全部退出"失败退出，不降低账目断言证据强度。
+- 函数定义前移至 PID 快照之前（原顺序存在使用先于定义的缺陷，本轮已修）。
+- 结论措辞同步收敛为"Worker 代际单一（PID 集合实证：无 reload 同集合，或旧代 PID 全部退出）"，不宣称超出实证的内容。
+**验证**：`bash -n` 语法通过；`bash test/concurrent-lease-e2e.sh` ×3 → **EXIT=0、PASS 20 / FAIL 0 / NOT_VERIFIED 0 ×3**（第 2/3 轮总账 90+10=100、97+3=100 精确闭合；既有断言零改动，PASS 数 19→20 系代际判定自身的 ok() 新增 1 项）。
+
+**修正 2：兼容性窗口拆分**。原表述"窗口 = max(旧桶 TTL, 旧 Lease 记录 1h)"混用了两类 TTL：旧 Lease 元数据 1h TTL 只决定**对账记录清理时间**，与库存归还无关（V1 无 RETURN）、不代表限流授权状态收敛；授权状态由桶键承载。已改为两条独立描述：旧桶 TTL（2×window）= 放行上限叠加窗口的收敛时间；旧 Lease 1h TTL = 元数据记录可见窗口。仅文档改动。
 
 ---

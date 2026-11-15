@@ -33,7 +33,48 @@ for n in kong1 kong2 kong3; do
 done
 ok "前置：Redis PING + 3 节点 Worker 数核验"
 
+# ---- 等待 reload 混合期结束（关口四教训 + 审查修正）：
+# kong reload 后旧 Worker 短暂共存，其旧格式 Lease 记录与 EVALSHA 计数会让
+# 账目断言出现伪差值。
+# 审查修正 1：pgrep -f 会误匹配执行命令的 shell，且"连续两次进程数相同"不能
+# 证明旧 Worker 退出。改为：/proc cmdline **前缀**精确匹配枚举 Worker PID
+# （shell 自身 cmdline 以 "sh -c" 开头 ⇒ 不会误匹配），并在配置下发**前**记录
+# PID 集合（旧代）；判定收敛 = 代际单一：
+#   * 无 reload ⇒ 当前集合 == 旧代集合（同集合）；
+#   * 有 reload ⇒ 旧代 PID 全部退出（两集合无交集）。
+# 两者皆不可证 ⇒ 判定失败并以"无法证明旧 Worker 全部退出"收敛失败退出，
+# 不降低账目断言的证据强度。
+worker_pids() { # worker_pids <container> —— 枚举 Worker PID（/proc cmdline 前缀匹配）
+    docker compose exec -T "$1" sh -c 'for d in /proc/[0-9]*/cmdline; do
+        c=$(head -c 80 "$d" 2>/dev/null | tr "\0" " ")
+        case "$c" in "nginx: worker process "*) p=${d%/cmdline}; echo "${p#/proc/}" ;; esac
+    done' 2>/dev/null
+}
+single_generation() { # single_generation <pre_pids 空格串> <cur_pids 空格串>
+    [ "$1" = "$2" ] && return 0          # 无 reload：同集合
+    local p mixed=0
+    for p in $1; do                       # 有 reload：旧代 PID 仍在 ⇒ 混合期
+        case " $2 " in *" $p "*) mixed=1 ;; esac
+    done
+    [ "$mixed" = "0" ]
+}
+wait_stable() { # wait_stable <container> <pre_pids> —— 代际单一且连续两次采样一致
+    local k="$1" pre="$2" prev="" cur
+    for _ in $(seq 1 30); do
+        cur=$(worker_pids "$k" | sort | tr '\n' ' ' | sed 's/ *$//')
+        if [ -n "$cur" ] && [ "$cur" = "$prev" ] && single_generation "$pre" "$cur"; then
+            return 0
+        fi
+        prev=$cur
+        sleep 1
+    done
+    return 1
+}
+PIDS_K1=$(worker_pids kong1 | sort | tr '\n' ' ' | sed 's/ *$//')
+PIDS_K2=$(worker_pids kong2 | sort | tr '\n' ' ' | sed 's/ *$//')
+PIDS_K3=$(worker_pids kong3 | sort | tr '\n' ' ' | sed 's/ *$//')
 # ---- 配置下发 ----
+# （旧代 Worker PID 快照必须在配置下发**前**抓取——POST /config 可能触发 reload）
 cat <<EOF > /tmp/opencode/p65c-config.json
 {"_format_version":"3.0","services":[{"name":"echo","url":"http://echo:5678",
  "routes":[{"name":"conc","paths":["/conc"],"strip_path":false,
@@ -47,24 +88,13 @@ for n in 8031 8011 8021; do
 done
 ok "配置下发：limit=100 window=86400 batch=10 ns=$NS（3 节点）"
 
-# ---- 等待 reload 混合期结束（关口四教训）：
-# kong reload 后旧 Worker 短暂共存，其旧格式 Lease 记录与 EVALSHA 计数会让
-# 账目断言出现伪差值；等待各节点旧 Worker 全部退出（进程数连续两轮一致）再开始。
-wait_stable() { # wait_stable <container> —— worker 数连续两次采样一致且 >0
-    local prev=0 cur
-    for _ in $(seq 1 30); do
-        cur=$(docker compose exec -T "$1" sh -c "pgrep -f 'nginx: worker process' | wc -l" 2>/dev/null || echo 0)
-        cur=$(echo "$cur" | tr -d '[:space:]')
-        [ "$cur" -gt 0 ] && [ "$cur" = "$prev" ] && return 0
-        prev=$cur
-        sleep 1
-    done
-    return 1
-}
+ok "配置下发：limit=100 window=86400 batch=10 ns=$NS（3 节点）"
+
 for k in kong1 kong2 kong3; do
-  wait_stable "$k" || { bad "$k reload 混合期未收敛"; exit 1; }
+  case $k in kong1) pre="$PIDS_K1";; kong2) pre="$PIDS_K2";; kong3) pre="$PIDS_K3";; esac
+  wait_stable "$k" "$pre" || { bad "$k Worker 代际未收敛（无法证明旧 Worker 全部退出，PID 集合：pre=[$pre]）"; exit 1; }
 done
-ok "reload 混合期已收敛（3 节点旧 Worker 全部退出）"
+ok "Worker 代际单一（PID 集合实证：无 reload 同集合，或旧代 PID 全部退出）"
 
 # ---- EVALSHA 计数快照（关口三方案 B：直连降级授权经 TOKEN_BUCKET EVALSHA，
 #      不产生 Lease 记录 ⇒ 账目断言须计入；以 Redis commandstats 计数实证） ----
