@@ -1,22 +1,26 @@
 -- ============================================================
 -- rate-limit-advanced / lib/lease.lua
--- Worker 本地 Lease 管理器（Phase 4，V1：不接扫描器/生命周期）。
+-- Worker 本地 Lease 管理器（关口三整改：Pool 生命周期 + 过期 + 账目）。
+-- 设计依据：docs/REMEDIATION.md 关口二冻结版（e0c3cf1）。
 --
--- 所有权模型（design D2/D3/D4）：
---   * 每 Worker 一份模块状态（OpenResty 每 Worker 独立 Lua VM），
---     其他 Worker 结构性不可见 ⇒ 无共享、无跨 Worker 接管。
---   * TAKE 在不含 yield 点的同步片段内完成查找/检查/递减
---     （OpenResty 协程只在 yield 点切换 ⇒ 片段内无交错，
---     这是原子性的完整证明，不需要任何补偿路径）。
---   * V1 状态机 ACTIVE → CLOSED 单向：库存耗尽（remaining=0）⇒ CLOSED，
---     从可消费集合摘除；对象保留在本地 table 仅作诊断记录（不删除）；
---     无 CLOSING 归还态、无 Redis RETURN 调用、不清理 Redis 记录、
---     不做库存补偿（Phase 5 恢复自动归还时才引入，见 tasks.md Phase 5 DEFERRED）。
---   * 多 Lease 并存：同 pool_key 可并存多个 Lease（独立 lease_id），
---     GRANT 确定成功后在本非 yield 段登记（追加不覆盖）；
---     Redis 侧 GRANT_LEASE 已原子扣桶 ⇒ 并存不会重复分配全局库存。
---   * GRANT 结果不明确（超时/断开/畸形）⇒ 不重试、不登记本地库存，
---     允许库存损失（D4；Redis 可能已执行：桶已扣、记录已建）。
+-- 所有权模型（不变）：
+--   * 每 Worker 一份模块状态（OpenResty 每 Worker 独立 Lua VM）。
+--   * TAKE / 摘除 / 登记 / 计数全部在不含 yield 点的同步片段内完成。
+--   * GRANT 结果不明确 ⇒ 不重试、不登记本地库存（D4，不变）。
+--
+-- 关口三新增（冻结设计逐条落地）：
+--   * Pool 生命周期：register 创建；active 空且空闲超 max_age 由 Timer 回收；
+--     MAX_POOLS 压力下只淘汰无 ACTIVE Lease 的 Pool（零库存损失）。
+--   * 过期：created_at + pool.max_age/1000 < ngx.now()（秒/毫秒约定）⇒ EXPIRED，
+--     remaining 计入 discarded_tokens（唯一来源），不归还 Redis。
+--   * TAKE 过期判定：候选 O(1) 比较，过期即摘除；方案 B 下 #active ≤ 1
+--     ⇒ 最坏扫描严格 O(1)。
+--   * 单一摘除函数 expire_lease：TAKE / GRANT 清扫 / Timer 三路径共用，
+--     计数逻辑仅一份 ⇒ discarded 不重复计数。
+--   * 单在途 GRANT：_inflight[pool_key] 标志；置位期间的并发 GRANT 由
+--     algorithm 层降级为 batch=1 直连（不登记）。
+--   * 账目恒等式：confirmed_granted = consumed + outstanding + discarded
+--     （tokens_granted == tokens_consumed + Σactive.remaining + discarded_tokens）。
 -- ============================================================
 local ngx_now = ngx.now
 local ngx_worker_id = ngx.worker.id
@@ -26,23 +30,36 @@ local redis_mod = require "kong.plugins.rate-limit-advanced.lib.redis"
 local _M = {}
 
 -- ------------------------------------------------------------
--- Worker 级状态（design D2 数据结构；每 Worker 一份）
---   pools[pool_key] = { leases = {lease_obj,...}  全量（诊断记录，只增不删）
---                       active = {lease_obj,...}  可消费集合（插入序，同一对象的引用）}
+-- Worker 级状态
+--   pools[pool_key] = { active = {lease_obj,...}   可消费集合（方案 B 下 ≤1）
+--                       last_used = 秒            TAKE/登记时一次赋值
+--                       max_age  = 毫秒           首次 GRANT 的配置快照（=2×window）}
 --   lease_obj = { lease_id, pool_key, granted, remaining, consumed,
---                 created_at, state }  -- state: "ACTIVE" | "CLOSED"（D2 冻结字段名）
---   V1 无 idle_threshold / max_lifetime / last_used_at（Phase 5 恢复时引入）
---   不变量：remaining + consumed = granted；0 ≤ remaining ≤ granted
+--                 created_at(秒), state }  -- ACTIVE | CLOSED | EXPIRED
+--   inflight[pool_key] = true                    单在途 GRANT 标志
+--   终态对象（CLOSED/EXPIRED）立即解除引用，由 GC 回收；历史由计数器承载。
+--   不变量：remaining + consumed = granted；0 ≤ remaining ≤ granted；
+--           每对象至多在 active 出现一次；#active ≤ 1（方案 B 上界）。
 -- ------------------------------------------------------------
 _M._pools = {}
+_M._inflight = {}
+_M._pool_count = 0
 
--- 进程内生命周期计数（D8 指标的本地口径）
-_M._counters = { leases = 0, tokens_granted = 0, tokens_consumed = 0, closed = 0 }
+-- MAX_POOLS：每 Worker Pool 数上限（关口二冻结：10000；测试可覆写）
+_M.MAX_POOLS = 10000
+
+-- 进程内生命周期计数（历史统计；number 自身有界）
+_M._counters = {
+  leases = 0, tokens_granted = 0, tokens_consumed = 0, closed = 0,
+  expired = 0, evicted = 0, discarded_tokens = 0,
+}
+
+-- GRANT 路径惰性清扫 / Timer 每次处理的数量上限（冻结：32 / 64）
+local SWEEP_CAP = 32
+local TIMER_POOL_CAP = 64
 
 -- ------------------------------------------------------------
--- lease_id 生成（D4）：<hostname>:<worker_id>:<进程内单调计数器>:<随机 hex>
--- 冲突由 Redis 侧 EXISTS 检查兜底（LEASE_EXISTS → 故障分支）；
--- 生成规则使冲突概率≈0。
+-- lease_id 生成（不变）
 -- ------------------------------------------------------------
 local lease_seq = 0
 
@@ -51,7 +68,6 @@ local function host_name()
   if ok and type(v) == "string" and v ~= "" then
     return v
   end
-  -- resty 单测 / 无请求上下文：容器 HOSTNAME 兜底（仅诊断标识，唯一性靠计数器+随机）
   return os.getenv("HOSTNAME") or "unknown"
 end
 
@@ -61,9 +77,6 @@ local function ensure_random_seed()
   if seeded then
     return
   end
-  -- 每 VM 首次生成前播种：LuaJIT math.random 不播种时在每个新 VM 输出相同序列，
-  -- 跨 Worker 重启会生成确定性碰撞的 lease_id（Redis EXISTS 兜底正确拒绝，
-  -- 但违反 D4"生成规则使冲突概率≈0"）。熵源 = 毫秒时间 + Worker PID。
   local pid = 0
   pcall(function() pid = ngx.worker.pid() or 0 end)
   math.randomseed(math.floor(ngx_now() * 1000) + pid)
@@ -83,22 +96,33 @@ function _M.new_lease_id()
     math.random(0, 0xffffff))
 end
 
-local function pool_of(pool_key)
-  local pool = _M._pools[pool_key]
-  if not pool then
-    pool = { leases = {}, active = {} }
-    _M._pools[pool_key] = pool
-  end
-  return pool
+-- ------------------------------------------------------------
+-- 过期判定与摘除（唯一入口；非 yield 片段）
+-- 单位约定（冻结）：created_at / ngx.now() 秒；pool.max_age 毫秒。
+-- ------------------------------------------------------------
+local function is_expired(l, pool, now)
+  return pool.max_age ~= nil
+     and (l.created_at + pool.max_age / 1000) < now
+end
+
+-- discarded 只计一次的机制保证：state 先翻转、随即移出 active、计数同片段完成。
+-- 任何路径（TAKE / GRANT 清扫 / Timer）摘除都必须经此函数。
+local function expire_lease_at(pool, i)
+  local l = pool.active[i]
+  l.state = "EXPIRED"
+  _M._counters.discarded_tokens = _M._counters.discarded_tokens + l.remaining
+  _M._counters.expired = _M._counters.expired + 1
+  table.remove(pool.active, i)
 end
 
 -- ------------------------------------------------------------
--- 登记一个已授予的 Lease（任务 4.1/4.4）。
--- GRANT 确定成功（classify=success）后调用；非 yield 同步片段；
--- 追加不覆盖（D2 多 Lease 并存约束）。
--- @return lease 对象（诊断/测试用），或 nil, err（参数非法）
+-- 登记一个已授予的 Lease。
+-- 方案 B 上界：pool 已有 ACTIVE Lease ⇒ 拒绝（生产路径不可达；
+-- 触发即说明在途闸门失效，按 uncertain 损失处理，方向保守）。
+-- max_age_ms：该 Pool 首次 GRANT 的配置快照（= 2×window 毫秒）；仅首次生效。
+-- @return lease 对象，或 nil, err（参数非法 / pool busy）
 -- ------------------------------------------------------------
-function _M.register(pool_key, lease_id, granted, created_at)
+function _M.register(pool_key, lease_id, granted, created_at, max_age_ms)
   if type(pool_key) ~= "string" or pool_key == "" then
     return nil, "pool_key required"
   end
@@ -111,7 +135,23 @@ function _M.register(pool_key, lease_id, granted, created_at)
     return nil, "granted must be a positive integer: " .. tostring(granted)
   end
 
-  local pool = pool_of(pool_key)
+  local pool = _M._pools[pool_key]
+  if pool and #pool.active > 0 then
+    return nil, "pool has active lease: " .. pool_key
+  end
+  if not pool then
+    pool = { active = {}, last_used = nil, max_age = nil }
+    _M._pools[pool_key] = pool
+    _M._pool_count = _M._pool_count + 1
+  end
+  if pool.max_age == nil and max_age_ms ~= nil then
+    if type(max_age_ms) ~= "number" or max_age_ms ~= max_age_ms
+       or max_age_ms <= 0 or max_age_ms >= 2^53 then
+      return nil, "max_age_ms must be a positive number: " .. tostring(max_age_ms)
+    end
+    pool.max_age = max_age_ms
+  end
+
   local lease = {
     lease_id   = lease_id,
     pool_key   = pool_key,
@@ -121,21 +161,18 @@ function _M.register(pool_key, lease_id, granted, created_at)
     created_at = created_at or ngx_now(),
     state      = "ACTIVE",
   }
-  pool.leases[#pool.leases + 1] = lease
   pool.active[#pool.active + 1] = lease
+  pool.last_used = lease.created_at
   _M._counters.leases = _M._counters.leases + 1
   _M._counters.tokens_granted = _M._counters.tokens_granted + granted
   return lease
 end
 
 -- ------------------------------------------------------------
--- TAKE：原子消耗 1 个本地库存令牌（任务 4.2）。
--- 本函数整体是一个非 yield 同步片段：不得出现 cosocket / ngx.sleep /
--- timer 等 yield 点（协程探针测试断言）；不访问 Redis、无等待、无补偿路径。
---
--- D2 TAKE 顺序：按插入序遍历可消费集合（active），取首个有存量者。
--- 耗尽（remaining=0）⇒ 同片段标记 CLOSED 并从 active 摘除（D3 V1 耗尽处理）；
--- 对象保留在 leases 列表仅作诊断。
+-- TAKE：原子消耗 1 个本地库存令牌。
+-- 整体为非 yield 同步片段：ngx.now() 非 yield 点；无 cosocket / ngx.sleep。
+-- 热路径：last_used 一次赋值 + 至多 1 个候选的过期比较（方案 B 上界 ⇒ 严格 O(1)）。
+-- 候选过期 ⇒ expire_lease_at 摘除（discarded 一次计数）后继续；无候选 ⇒ NEED_GRANT。
 -- @return true, remaining(扣减后), lease_id | false, "NEED_GRANT"
 -- ------------------------------------------------------------
 function _M.take(pool_key)
@@ -144,11 +181,17 @@ function _M.take(pool_key)
     return false, "NEED_GRANT"
   end
 
+  local now = ngx_now()
+  pool.last_used = now             -- TAKE 全路径唯一写点（一次赋值）
   local active = pool.active
-  for i = 1, #active do
+  local i = 1
+  while i <= #active do
     local l = active[i]
-    -- active 集合内恒为 ACTIVE 且 remaining>0（耗尽即摘除）；防御性保持该结构
-    if l.state == "ACTIVE" and l.remaining > 0 then
+    if l.state ~= "ACTIVE" then
+      table.remove(active, i)      -- 防御：active 集合内不应出现非 ACTIVE
+    elseif is_expired(l, pool, now) then
+      expire_lease_at(pool, i)
+    else
       l.remaining = l.remaining - 1
       l.consumed = l.consumed + 1
       _M._counters.tokens_consumed = _M._counters.tokens_consumed + 1
@@ -164,16 +207,7 @@ function _M.take(pool_key)
 end
 
 -- ------------------------------------------------------------
--- GRANT_LEASE 结果分类（任务 4.4，design D4；纯函数）。
--- 输入为 redis.grant_lease 的返回（已过 parse_grant_response 防御校验）：
---   parsed = { granted, tokens, wait }  或  nil, err
--- @return class, data
---   "success"        data = parsed（granted ≥ 1，可登记本地库存）
---   "insufficient"   data = parsed（granted = 0，tokens<1，未建记录）
---   "explicit_error" data = err（确定未执行、零写入：LEASE_EXISTS/参数非法/
---                                脚本装载失败——NOSCRIPT 为执行前错误）
---   "uncertain"      data = err（结果不明确：超时/断开/畸形返回——
---                                Redis 可能已执行 ⇒ 不重试、不登记，允许损失）
+-- GRANT 结果分类（不变，D4 四分类；纯函数）。
 -- ------------------------------------------------------------
 local EXPLICIT_ERR_MARKS = {
   "LEASE_EXISTS",
@@ -198,7 +232,6 @@ function _M.classify_grant(parsed, err)
   if parsed ~= nil then
     if type(parsed) ~= "table" or parsed.granted == nil
        or parsed.granted < 0 then
-      -- 防御：不应到达（redis 层已校验）；按"可能已执行"保守处理
       return "uncertain", err or "malformed grant_lease response"
     end
     if parsed.granted >= 1 then
@@ -213,33 +246,65 @@ function _M.classify_grant(parsed, err)
 end
 
 -- ------------------------------------------------------------
--- 申请一个 Lease（任务 4.4 GRANT 调用接线）。
--- 传输层可注入（测试 stub）；默认走 lib/redis.grant_lease（EVALSHA）。
--- 结果不明确 ⇒ 不重试、不登记本地库存（D4）。
--- cosocket yield 只发生在传输层调用内部；登记/分类不含等待点。
--- @return
---   成功     { ok = true, granted, tokens, wait, lease_id, lease }
---   不足     { ok = false, reason = "insufficient", tokens, wait }
---            （granted=0：调用方按既有 429 语义处理，不建 Lease）
---   明确错误 nil, { kind = "explicit_error", err = ... }（调用方走既有故障分支）
---   不确定   nil, { kind = "uncertain", err = ... }（同上，且不重试）
+-- GRANT 路径惰性清扫：摘除当前 Pool 内已过期 Lease（上限 32/次）。
+-- 由 grant() 在传输层调用前执行；纯 table 操作，非 yield。
+-- ------------------------------------------------------------
+function _M.sweep_pool(pool_key, cap)
+  local pool = _M._pools[pool_key]
+  if not pool then
+    return 0
+  end
+  cap = cap or SWEEP_CAP
+  local now = ngx_now()
+  local removed = 0
+  local i = 1
+  while i <= #pool.active and removed < cap do
+    local l = pool.active[i]
+    if l.state ~= "ACTIVE" then
+      table.remove(pool.active, i)
+    elseif is_expired(l, pool, now) then
+      expire_lease_at(pool, i)
+      removed = removed + 1
+    else
+      i = i + 1
+    end
+  end
+  return removed
+end
+
+-- ------------------------------------------------------------
+-- 单在途 GRANT 标志（方案 B）。置位/清除均在 grant() 内的非 yield 片段：
+-- algorithm 层在调用 grant() 前先查 grant_in_flight()（检查与置位之间
+-- 无 yield 点 ⇒ 协程调度保证原子），置位期间的并发请求降级直连。
+-- ------------------------------------------------------------
+function _M.grant_in_flight(pool_key)
+  return _M._inflight[pool_key] == true
+end
+
+-- ------------------------------------------------------------
+-- 申请一个 Lease。
+--   * GRANT 前惰性清扫当前 Pool（冻结 §4）。
+--   * max_age 快照 = bucket_ttl_ms（= 2×window 毫秒，与桶 TTL 同源）。
+--   * 结果不明确 ⇒ 不重试、不登记（D4，不变）。
+-- @return 同既有四分类约定
 -- ------------------------------------------------------------
 _M._transport = nil  -- 测试注入点；nil ⇒ redis_mod.grant_lease
 
 function _M.grant(conf, pool_key, bucket_key, batch, lease_ttl_ms,
-                  rate, capacity, bucket_ttl_ms)
+                   rate, capacity, bucket_ttl_ms)
   local transport = _M._transport or redis_mod.grant_lease
   local lease_id = _M.new_lease_id()
 
+  _M.sweep_pool(pool_key)
+  _M._inflight[pool_key] = true
   local parsed, err = transport(conf, bucket_key, lease_id, pool_key,
                                 batch, lease_ttl_ms, rate, capacity, bucket_ttl_ms)
   local class, data = _M.classify_grant(parsed, err)
+  _M._inflight[pool_key] = nil     -- 清除与 classify/register 之间无 yield 点
 
   if class == "success" then
-    local lease, rerr = _M.register(pool_key, lease_id, data.granted)
+    local lease, rerr = _M.register(pool_key, lease_id, data.granted, nil, bucket_ttl_ms)
     if not lease then
-      -- 登记失败（理论上不可能：granted 已过两层校验）⇒ 按不确定损失处理，
-      -- 不得把未登记的库存当作可用
       return nil, { kind = "uncertain", err = "register failed: " .. tostring(rerr) }
     end
     return {
@@ -258,11 +323,119 @@ function _M.grant(conf, pool_key, bucket_key, batch, lease_ttl_ms,
 end
 
 -- ------------------------------------------------------------
--- D8 指标（V1 口径）：lease.stats() 供测试与报告取证。
---   leases / tokens_granted / tokens_consumed / closed：进程内生命周期累计
---   active：当前可消费 Lease 数；local_remaining：Σ 本地 remaining
---   outstanding（= local_remaining）；V1 账目：granted = consumed + outstanding
---   （无丢失时恒等成立；崩溃/超时损失不入该恒等式——见 design D8）
+-- Pool 容量（MAX_POOLS，冻结：10000/Worker）。
+-- ensure_capacity：未达上限 ⇒ true；达上限 ⇒ 先淘汰无 ACTIVE Lease 的
+-- Pool（≤64 个，零库存损失），仍满 ⇒ false（调用方降级 batch=1 直连）。
+-- ------------------------------------------------------------
+function _M.pool_count()
+  return _M._pool_count
+end
+
+function _M.ensure_capacity()
+  if _M._pool_count < _M.MAX_POOLS then
+    return true
+  end
+  _M.evict_idle_pools(TIMER_POOL_CAP)
+  return _M._pool_count < _M.MAX_POOLS
+end
+
+-- 只淘汰没有 ACTIVE Lease 的 Pool（冻结：不驱逐含 ACTIVE Lease 的 Pool）。
+-- 纯 table 操作，非 yield；键集合扫描 O(P) 有界于 MAX_POOLS。
+function _M.evict_idle_pools(cap)
+  cap = cap or TIMER_POOL_CAP
+  local removed = 0
+  for key, pool in pairs(_M._pools) do
+    if removed >= cap then
+      break
+    end
+    if #pool.active == 0 then
+      _M._pools[key] = nil
+      _M._pool_count = _M._pool_count - 1
+      _M._counters.evicted = _M._counters.evicted + 1
+      removed = removed + 1
+    end
+  end
+  return removed
+end
+
+-- ------------------------------------------------------------
+-- Timer 兜底清扫（init_worker 每 60s 调一次；可被单测直接调用）。
+-- 只处理"空闲候选"：last_used 距今 ≥ max_age/1000（秒口径）的 Pool；
+-- 每 tick 处理 ≤ cap 个（冻结 64）。对空闲 Pool：先摘除其中已过期 Lease
+--（经 expire_lease_at，discarded 一次计数），active 清空后整池删除。
+-- 键集合扫描 O(P) 有界于 MAX_POOLS；纯 table 操作，非 yield。
+-- @return 本次删除的 Pool 数
+-- ------------------------------------------------------------
+function _M.timer_sweep_once(cap)
+  cap = cap or TIMER_POOL_CAP
+  local now = ngx_now()
+  local evicted = 0
+  for key, pool in pairs(_M._pools) do
+    if evicted >= cap then
+      break
+    end
+    local max_age_s = pool.max_age and pool.max_age / 1000
+    if max_age_s then
+      local idle_for = now - (pool.last_used or 0)
+      if idle_for >= max_age_s then
+        local i = 1
+        while i <= #pool.active do
+          local l = pool.active[i]
+          if l.state ~= "ACTIVE" then
+            table.remove(pool.active, i)
+          elseif is_expired(l, pool, now) then
+            expire_lease_at(pool, i)
+          else
+            i = i + 1
+          end
+        end
+        if #pool.active == 0 then
+          _M._pools[key] = nil
+          _M._pool_count = _M._pool_count - 1
+          _M._counters.evicted = _M._counters.evicted + 1
+          evicted = evicted + 1
+        end
+      end
+    end
+  end
+  return evicted
+end
+
+-- ------------------------------------------------------------
+-- init_worker 兜底 Timer（冻结：60s 间隔）。模块级防重复注册
+--（多插件实例共享同一 Worker VM）；resty 单测环境无 ngx.timer ⇒ 跳过。
+-- ------------------------------------------------------------
+local timer_started = false
+
+function _M.start_sweep_timer()
+  if timer_started then
+    return true
+  end
+  timer_started = true
+  if not (ngx and ngx.timer and ngx.timer.every) then
+    return false, "ngx.timer.every unavailable"
+  end
+  local ok, err = pcall(ngx.timer.every, 60, function(premature)
+    if premature then
+      return
+    end
+    local exiting = false
+    pcall(function() exiting = ngx.worker.exiting() end)
+    if exiting then
+      return
+    end
+    pcall(_M.timer_sweep_once, TIMER_POOL_CAP)
+  end)
+  if not ok then
+    timer_started = false
+    return nil, "timer create failed: " .. tostring(err)
+  end
+  return true
+end
+
+-- ------------------------------------------------------------
+-- D8 指标（整改口径）：outstanding = local_remaining；
+-- discarded_tokens 由 expire_lease_at 维护；恒等式见 invariants()。
 -- ------------------------------------------------------------
 function _M.stats()
   local active, remaining = 0, 0
@@ -274,31 +447,46 @@ function _M.stats()
   end
   local c = _M._counters
   return {
-    leases          = c.leases,
-    granted         = c.tokens_granted,
-    consumed        = c.tokens_consumed,
-    closed          = c.closed,
-    active          = active,
-    local_remaining = remaining,
+    leases           = c.leases,
+    granted          = c.tokens_granted,
+    consumed         = c.tokens_consumed,
+    closed           = c.closed,
+    expired          = c.expired,
+    evicted          = c.evicted,
+    discarded_tokens = c.discarded_tokens,
+    active           = active,
+    local_remaining  = remaining,
+    outstanding      = remaining,
+    pools            = _M._pool_count,
   }
 end
 
 -- ------------------------------------------------------------
--- 结构不变量校验（任务 4.2/4.4 的"结构断言"；测试/诊断用）：
---   * remaining + consumed = granted（守恒）
---   * 0 ≤ remaining ≤ granted（无负库存、不超发本地）
---   * state ∈ { ACTIVE, CLOSED }；CLOSED ⇒ remaining = 0
---   * active 集合内均为 ACTIVE 且 remaining > 0，且每对象至多出现一次
---   * 计数器与逐对象求和无漂移
+-- 结构不变量校验（整改口径）：
+--   * 每 Pool #active ≤ 1（方案 B 上界）
+--   * active 对象：state=ACTIVE、0 < remaining ≤ granted、守恒
+--   * 全局账目：tokens_granted == tokens_consumed + Σactive.remaining
+--               + discarded_tokens
+--   * 租约数量闭环：leases == closed + expired + active_total
 -- @return true | false, reason
 -- ------------------------------------------------------------
 function _M.invariants()
-  local n_leases = 0
-  local sum_granted, sum_consumed = 0, 0
+  local n_active = 0
+  local sum_remaining = 0
   for _, pool in pairs(_M._pools) do
-    local seen_active = {}
-    for i = 1, #pool.leases do
-      local l = pool.leases[i]
+    if #pool.active > 1 then
+      return false, "active lease bound broken: " .. tostring(#pool.active)
+    end
+    local seen = {}
+    for i = 1, #pool.active do
+      local l = pool.active[i]
+      if seen[l] then
+        return false, "duplicate object in active set"
+      end
+      seen[l] = true
+      if l.state ~= "ACTIVE" then
+        return false, "active contains non-ACTIVE lease: " .. l.lease_id
+      end
       if type(l.granted) ~= "number" or l.granted < 1 or l.granted >= 2^53 then
         return false, "granted invalid: " .. tostring(l.granted)
       end
@@ -309,32 +497,23 @@ function _M.invariants()
       if l.remaining + l.consumed ~= l.granted then
         return false, "conservation broken: " .. l.lease_id
       end
-      if l.state ~= "ACTIVE" and l.state ~= "CLOSED" then
-        return false, "bad state: " .. tostring(l.state)
-      end
-      if l.state == "CLOSED" and l.remaining ~= 0 then
-        return false, "closed with remaining: " .. l.lease_id
-      end
-      n_leases = n_leases + 1
-      sum_granted = sum_granted + l.granted
-      sum_consumed = sum_consumed + l.consumed
-    end
-    for i = 1, #pool.active do
-      local l = pool.active[i]
-      if l.state ~= "ACTIVE" or l.remaining <= 0 then
-        return false, "active contains non-consumable lease"
-      end
-      if seen_active[l] then
-        return false, "duplicate object in active set"
-      end
-      seen_active[l] = true
+      n_active = n_active + 1
+      sum_remaining = sum_remaining + l.remaining
     end
   end
   local c = _M._counters
-  if c.leases ~= n_leases
-     or c.tokens_granted ~= sum_granted
-     or c.tokens_consumed ~= sum_consumed then
-    return false, "counter drift"
+  -- 终态对象已释放，逐对象求和仅覆盖 active；全局口径以恒等式与数量闭环校验：
+  --   granted = consumed + outstanding + discarded（逐对象守恒在摘除瞬间转移）
+  if c.tokens_granted ~= c.tokens_consumed + sum_remaining + c.discarded_tokens then
+    return false, "accounting identity broken: granted=" .. c.tokens_granted
+      .. " consumed=" .. c.tokens_consumed
+      .. " outstanding=" .. sum_remaining
+      .. " discarded=" .. c.discarded_tokens
+  end
+  if c.leases ~= c.closed + c.expired + n_active then
+    return false, "lease count not closed: leases=" .. c.leases
+      .. " closed=" .. c.closed .. " expired=" .. c.expired
+      .. " active=" .. n_active
   end
   return true
 end
@@ -344,7 +523,12 @@ end
 -- ------------------------------------------------------------
 function _M.reset()
   _M._pools = {}
-  _M._counters = { leases = 0, tokens_granted = 0, tokens_consumed = 0, closed = 0 }
+  _M._inflight = {}
+  _M._pool_count = 0
+  _M._counters = {
+    leases = 0, tokens_granted = 0, tokens_consumed = 0, closed = 0,
+    expired = 0, evicted = 0, discarded_tokens = 0,
+  }
   lease_seq = 0
 end
 
