@@ -95,6 +95,19 @@ do
 end
 
 -- ============================================================
+-- A2. consumer 维度匿名回落（关口六守护测试：未认证 ⇒ 固定 "anon"，匿名共享配额）
+-- ============================================================
+do
+    local conf = base_conf()
+    conf.batch = 1
+    conf.limit_by = { "consumer" }
+    local key = algorithm.build_key(conf)
+    ok("A2-consumer-anon-fallback",
+       type(key) == "string" and key:find(":consumer=anon}", 1, true) ~= nil,
+       tostring(key))
+end
+
+-- ============================================================
 -- B. batch>1 首请求：GRANT_LEASE + 登记后恰好消费 1
 -- ============================================================
 do

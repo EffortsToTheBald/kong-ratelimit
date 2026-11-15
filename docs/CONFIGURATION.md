@@ -50,7 +50,21 @@
   `fault_tolerant`/`hide_client_headers`/`redis.*`（连接与呈现参数）
 - **配置变更语义**：任何参与指纹的字段变化 ⇒ 新 Pool Key（全局桶从满额开始，旧桶/旧 Lease 记录随
   TTL 自然消亡）。改配置前评估"配额重置"的业务影响；需要继承余量请换 `namespace`。
-- **旧 Pool 生命周期回收尚未实现（Deferred）**
+- **旧 Pool 生命周期回收已实现**（关口二/三：MAX_POOLS=10000/Worker、max_age=2×window 过期、
+  空闲 60s Timer 回收，EXPIRED 未消费库存计 discarded 不归还；自动 RETURN 仍 Deferred）
+
+## 3.1 维度语义：consumer 的匿名回落（Current V1）
+
+- 未认证请求（无 consumer）在 `consumer` 维度回落到固定值 **`anon`** ⇒ **全部匿名用户共享同一配额**。
+- **评估过改为 `anon:<client_ip>`（关口六），保留原行为**。原因：
+  ① IP 取法与 `ip` 维度同口径（`kong.client.get_forwarded_ip()`，Kong 3.6 存在该 API，
+  遵守 `trusted_ips` 配置），但**可信性取决于部署的 `trusted_ips` 配置**——反代场景下默认不可信，
+  伪造头会产生攻击者可控的 key 基数；
+  ② 改为分 IP 后 `consumer` 配额实际变成 consumer×ip 双维配额，**语义与 consumer 维度定义不一致**；
+  ③ 需要按 IP 区分匿名流量时，应显式在 `limit_by` 中加 `ip`（现有能力，语义无歧义）；
+  ④ 改变维度值会导致既有匿名桶不可命中（配额重置）。
+- 新增守护测试：`algorithm-lease-unit` A2 断言未认证请求的 consumer 维度取值为固定 `"anon"`
+  （key 形如 `:consumer=anon}`），守护"匿名共享配额"行为不被无意改变。
 
 ## 4. 故障处理相关
 
