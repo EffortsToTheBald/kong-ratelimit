@@ -1,0 +1,51 @@
+[32mPASS: normal grant: granted=5, bucket=95 (100−5), OPEN record[0m
+[32mPASS: Lease TTL: PTTL=59567 ∈ [55000,60000] (input 60000; execution latency before the assertion is legitimate)[0m
+[32mPASS: Lease record fields: pool_key/lease_id correct[0m
+[32mPASS: second GRANT with the same ID ⇒ LEASE_EXISTS (zero writes)[0m
+[32mPASS: partial grant: floor(2.5)=2[0m
+[32mPASS: tokens<1 ⇒ granted=0, no record created, bucket unchanged[0m
+[32mPASS: batch=0 ⇒ INVALID_ARGUMENT, zero writes[0m
+[32mPASS: batch=1.5 ⇒ INVALID_ARGUMENT[0m
+[32mPASS: rate=-1 ⇒ INVALID_ARGUMENT[0m
+[32mPASS: invalid bucket fields ⇒ INVALID_ARGUMENT, zero writes[0m
+[32mPASS: tokens=-5 (negative) ⇒ rejected and data unchanged (no silent correction)[0m
+[32mPASS: tokens=200 > capacity=100 ⇒ rejected and data unchanged[0m
+[32mPASS: ts=-1 (negative) ⇒ rejected and data unchanged[0m
+[32mPASS: RETURN tokens=-5 ⇒ rejected and data unchanged (consistent with GRANT rules)[0m
+[32mPASS: RETURN tokens=200 > capacity ⇒ rejected and data unchanged[0m
+[32mPASS: RETURN ts=-1 ⇒ rejected and data unchanged[0m
+[32mPASS: granted=-5 ⇒ INVALID_LEASE_STATE granted[0m
+[32mPASS: granted=0 ⇒ INVALID_LEASE_STATE granted[0m
+[32mPASS: insufficient branch: granted=0, no Lease created[0m
+[32mPASS: insufficient branch: ts only moves forward (1794550880.2287 >= 1794550874)[0m
+[32mPASS: insufficient branch: bucket TTL written back (PTTL=119589 ≈ 120000)[0m
+[32mPASS: insufficient branch: tokens/ts consistent with the unified semantics (ts=1794550880.2287 ∈ [now0−1, now1+1]; tokens=0.5996594543457 <1 after refill and written back)[0m
+[32mPASS: wait contract: partial grant granted=2, tokens≈0.5, wait≈31.25s (computed from tokens after deduction, true value=31.25)[0m
+[32mPASS: normal return: applied=5, bucket 95→100, OPEN→RETURNED, return_requested=5[0m
+[32mPASS: duplicate with the same args ⇒ ALREADY_RETURNED, bucket unchanged[0m
+[32mPASS: same ID with different args ⇒ RETURN_CONFLICT[0m
+[32mPASS: requested=0 ⇒ bucket update skipped, OPEN→RETURNED (accounts balanced)[0m
+[32mPASS: requested>granted ⇒ INVALID_REQUESTED, zero writes[0m
+[32mPASS: pool_key mismatch ⇒ POOL_MISMATCH, zero writes[0m
+[32mPASS: Lease expired ⇒ LEASE_NOT_FOUND (must not guess a return)[0m
+[32mPASS: Bucket missing ⇒ BUCKET_NOT_FOUND, no new bucket created, zero writes[0m
+[32mPASS: requested=1.5 (fractional) ⇒ INVALID_ARGUMENT, zero writes[0m
+[32mPASS: two concurrent RETURNs: one succeeds (applied=5), one ALREADY_RETURNED, bucket incremented only once[0m
+[32mPASS: fault injection after the commit point: Lease already RETURNED, bucket not incremented (empirical proof that the idempotent commit point comes first)[0m
+[32mPASS: same-args retry after injection: ALREADY_RETURNED, bucket not double-incremented (the difference is booked as loss)[0m
+[32mPASS: lease_ttl_ms=0 ⇒ rejected, zero writes[0m
+[32mPASS: lease_ttl_ms=-1 ⇒ rejected[0m
+[32mPASS: lease_ttl_ms=1.5 ⇒ rejected[0m
+[32mPASS: lease_ttl_ms=1e20 ⇒ rejected (>=2^53)[0m
+[32mPASS: GRANT bucket_ttl_ms=0 ⇒ rejected[0m
+[32mPASS: GRANT bucket_ttl_ms=1e20 ⇒ rejected[0m
+[32mPASS: RETURN bucket_ttl_ms=0 ⇒ rejected, zero writes (Lease still OPEN)[0m
+[32mPASS: RETURN bucket_ttl_ms=-1 ⇒ rejected (Lease still OPEN, not marked RETURNED)[0m
+[32mPASS: RETURN bucket_ttl_ms=1.5 ⇒ rejected[0m
+[32mPASS: RETURN bucket_ttl_ms=1e20 ⇒ rejected (no intermediate state of "marked RETURNED but later step failed")[0m
+[32mPASS: refill vector GRANT_LEASE(batch=1, deduct granted=1): tokens=109.99026799202 ≈ 109 (rate×10s refill; the interval includes the exec gap)[0m
+[32mPASS: refill vector RETURN_LEASE(requested=1, add applied=1): tokens=111.67679905891 ≈ 111 (rate×10s refill; the interval includes the exec gap)[0m
+[32mPASS: refill vector TOKEN_BUCKET(want=1, deduct granted=1): tokens=109.31017708778 ≈ 109 (rate×10s refill; the interval includes the exec gap)[0m
+[32mPASS: refill vector GRANT_MULTI(batch=1, deduct granted=1): tokens=109.89400696754 ≈ 109 (rate×10s refill; the interval includes the exec gap)[0m
+[32mPASS: refill consistency: max normalized deviation across the four scripts <3s (109.99026799202/111.67679905891/109.31017708778/109.89400696754)[0m
+===== Summary: PASS=50 FAIL=0 =====

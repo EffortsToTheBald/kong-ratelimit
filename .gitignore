@@ -1,0 +1,9 @@
+# Load-test artifacts (regenerated each run, not committed)
+bench/out/
+
+# OpenCode agent local data
+.opencode/
+rl.json
+*.pdf
+# Exam assignment original (privacy, not committed)
+Kong 3-Take home assignment.pdf

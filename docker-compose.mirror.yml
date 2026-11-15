@@ -1,0 +1,22 @@
+# Domestic-network-only override: swap images to mirror registry paths.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.mirror.yml up -d
+#
+# If you already retagged via scripts/pull-images.sh, this file is not needed.
+# When the mirror goes down, replace docker.m.daocloud.io with another one (see docs/docker-mirror.md).
+
+services:
+  redis:
+    image: docker.m.daocloud.io/library/redis:7-alpine
+
+  echo:
+    image: docker.m.daocloud.io/hashicorp/http-echo:1.0
+
+  kong1:
+    image: docker.m.daocloud.io/library/kong:3.6
+
+  kong2:
+    image: docker.m.daocloud.io/library/kong:3.6
+
+  kong3:
+    image: docker.m.daocloud.io/library/kong:3.6

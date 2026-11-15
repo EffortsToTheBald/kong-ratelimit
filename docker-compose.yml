@@ -1,0 +1,87 @@
+# 3 Kong replicas (DB-less) + Redis + a minimal upstream, to verify "multiple replicas sharing the quota"
+#
+# Port plan:
+#   kong1  proxy 8030  admin 8031
+#   kong2  proxy 8010  admin 8011
+#   kong3  proxy 8020  admin 8021
+#   redis  6380 (host) → 6379 (in container)
+#   echo   5678
+#
+# Why kong1 is not 8000: the Windows-side IP Helper (iphlpsvc) occupies 0.0.0.0:8000,
+# and when WSL uses mirrored network mode (networkingMode=mirrored in .wslconfig),
+# the port space is shared with Windows, so the container cannot bind 8000. Using 8030 instead does not affect inter-container communication.
+#
+# No frontend load balancer: clients round-robin the three ports, so "which node a request hits" is deterministic,
+# making it easy to tell a node problem from a quota problem when something goes wrong.
+
+x-kong-common: &kong-common
+  image: kong:3.6
+  restart: unless-stopped
+  environment:
+    KONG_DATABASE: "off"
+    KONG_DECLARATIVE_CONFIG: /kong/declarative/kong.yml
+    KONG_PLUGINS: "bundled,rate-limit-advanced"
+    KONG_LOG_LEVEL: notice
+    KONG_PROXY_ACCESS_LOG: /dev/stdout
+    KONG_ADMIN_ACCESS_LOG: /dev/stdout
+    KONG_PROXY_ERROR_LOG: /dev/stderr
+    KONG_ADMIN_ERROR_LOG: /dev/stderr
+    KONG_ADMIN_LISTEN: "0.0.0.0:8001"
+    # Pin the worker count so load-test/diagnosis behavior is reproducible (otherwise it varies with machine core count)
+    KONG_NGINX_WORKER_PROCESSES: "2"
+  volumes:
+    - ./kong/kong.yml:/kong/declarative/kong.yml:ro
+    - ./kong/plugins/rate-limit-advanced:/usr/local/share/lua/5.1/kong/plugins/rate-limit-advanced:ro
+  depends_on:
+    redis:
+      condition: service_healthy
+    echo:
+      condition: service_started
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+    ports:
+      # Host port 6379 is often taken by a local redis-server, hence mapped to 6380;
+      # containers still communicate via the service name redis:6379, unaffected.
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  echo:
+    image: hashicorp/http-echo:1.0
+    restart: unless-stopped
+    command: ["-listen=:5678", "-text=ok"]
+    ports:
+      - "5678:5678"
+
+  kong1:
+    <<: *kong-common
+    container_name: kong1
+    ports:
+      - "8030:8000"
+      - "8031:8001"
+
+  kong2:
+    <<: *kong-common
+    container_name: kong2
+    ports:
+      - "8010:8000"
+      - "8011:8001"
+
+  kong3:
+    <<: *kong-common
+    container_name: kong3
+    ports:
+      - "8020:8000"
+      - "8021:8001"
