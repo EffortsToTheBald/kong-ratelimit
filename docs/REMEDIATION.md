@@ -1,8 +1,8 @@
 # REMEDIATION 记录（rate-limit-advanced）
 
 - 基线：`c9e05fc9fb8079d96c797f069e4aeb068ee7e2ce`（tag `baseline-c9e05fc` 已打）
-- 分支：`remediation/hardening`（已从基线创建；`docs/REMEDIATION.md` 未提交，等待审查）
-- 关口一状态：**补测完成**（本文档"关口一补测证据"节）。基线回归 11 个入口全部 PASS；内存探针已跑（实测）；并发探针已跑（Lua 协程交错模型，真实 OpenResty 并发验证 NOT VERIFIED）；Worker RSS NOT RUN。
+- 分支：`remediation/hardening`（已从基线创建；本文件与两个探针脚本已提交并推送 origin，提交号见文末"提交状态"）
+- 关口一状态：**补测完成**（本文档"关口一补测证据"节）。基线回归 16 个入口全部 PASS；内存探针已跑（实测）；并发探针已跑（Lua 协程交错模型，真实 OpenResty 并发验证 NOT VERIFIED）；Worker RSS NOT RUN。
 - 关口二状态：**最终冻结**（见"关口二最终冻结"节；MAX_POOLS=10000、max_age=2×window、60s Timer 清理、方案 B 均已固化）。
 - N3（Cluster CROSSSLOT）：**未获授权，保持只记录不修改**。
 
@@ -172,7 +172,7 @@ confirmed_granted = consumed + outstanding + discarded
 
 ### 2. Pool 上限与淘汰
 
-**MAX_POOLS = 10000 / Worker（Lua 常量，不改 schema 字段）**，依据（推导/估算，非实测）：
+**MAX_POOLS = 10000 / Worker（Lua 常量，不改 schema 字段）**，依据（单点实测 + 推导，校准数据见"关口一补测证据"探针 1）：
 
 - 单 Pool 固定成本：**实测校准**——1 个 ACTIVE Lease 的 pool 全成本 689 B/pool（探针 1），每追加 1 个 Lease +323 B（推导，inline 实测）。
 - 上限内存（推导，基于实测单点）：10000 Pool × 平均 1 ACTIVE Lease ≈ 10000 × 689 B ≈ **6.9 MB/Worker**；最坏（每 Pool 2 Lease）≈ 10000 × 1012 B ≈ **10.1 MB/Worker**。与此前估算（7/14 MB）一致，取实测校准值。
@@ -309,4 +309,10 @@ confirmed_granted = consumed + outstanding + discarded
 - N3（Cluster CROSSSLOT）**未获授权（冻结轮再次确认）**：保持已确认的条件性兼容性问题记录，不改 `redis/*.lua`、`lib/redis.lua` 内嵌脚本、Redis Lua 协议；等待单独批准。
 - N1/N2 的修复会改变 Redis key 形态（存量桶/Lease 全部失效一次），需你确认可接受。
 - Worker RSS（层次 2）与长稳（层次 3）：NOT RUN（冻结轮保持，关口三修复后补真实验证）。
-- 本文件与两个探针脚本均未提交（暂不提交，等待审查）。
+
+### 提交状态（2026-11-15 收尾核对）
+
+- `bd8804d` test: add lease memory and concurrent-grant probes (gate-1 evidence)——两个探针脚本
+- `4db584f` docs: remediation baseline evidence and frozen gate-2 design——本文件
+- 已推送 `origin/remediation/hardening`；工作区仅剩与本整改无关的未跟踪文件 `1113.json`、`1115.json`
+- 本轮收尾核对修正 3 处文档与实际的不一致：补测入口数 11→16、提交状态更新、§2 内存依据表述改为"单点实测 + 推导"
