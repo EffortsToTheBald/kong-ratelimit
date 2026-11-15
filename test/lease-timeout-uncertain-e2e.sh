@@ -70,7 +70,7 @@ http_req() { # $1=fd $2=path ⇒ "status remaining"
   echo "$status ${rem:-NA}"
 }
 lease_count() { # $1=ns ⇒ 记录数
-  RC --scan --pattern 'kong:rl:lease:*' </dev/null | while IFS= read -r k; do
+  RC --scan --pattern 'kong:rl:*:lease:*' </dev/null | while IFS= read -r k; do
     [ -n "$k" ] || continue
     pk=$(RC HGET "$k" pool_key </dev/null)
     case "$pk" in *"$1"*) echo x;; esac

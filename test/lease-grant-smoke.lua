@@ -35,7 +35,7 @@ assert(rc:connect("redis", 6379))
 
 -- 清场
 rc:del(BK)
-local before_keys = rc:keys("kong:rl:lease:*") or {}
+local before_keys = rc:keys("kong:rl:*:lease:*") or {}
 local seen_before = {}
 for _, k in ipairs(before_keys) do seen_before[k] = true end
 
@@ -48,7 +48,7 @@ do
        res ~= nil and err == nil and res.ok == true and res.granted == 5,
        tostring(res) .. "/" .. tostring(err))
 
-    local lkey = "kong:rl:lease:" .. res.lease_id
+    local lkey = PK .. ":lease:" .. res.lease_id
     local status = rc:hget(lkey, "status")
     local granted = num(rc:hget(lkey, "granted"))
     ok("smoke-redis-record", status == "OPEN" and granted == 5,
@@ -94,7 +94,7 @@ if os.getenv("PAUSE") == "1" then
                                            1, 60000, 1, 100, 120000)
     ok("pause-warmup-loaded", wparsed ~= nil and wparsed.granted == 1,
        tostring(wparsed) .. "/" .. tostring(werr))
-    rc:del(wk2, "kong:rl:lease:" .. wid)
+    rc:del(wk2, wk2 .. ":lease:" .. wid)
 
     -- 2) 轮询探测 pause 生效（独立短超时连接；ping 阻塞超时 ⇒ pause 已生效）
     local rc2 = red_cli:new()
@@ -142,7 +142,7 @@ if os.getenv("PAUSE") == "1" then
     local tokens = num(rc:hget(BK, "tokens"))
     ok("pause-not-executed-bucket", tokens == nil,
        tostring(tokens))
-    local after_keys = rc:keys("kong:rl:lease:*") or {}
+    local after_keys = rc:keys("kong:rl:*:lease:*") or {}
     local new_lkey
     for _, k in ipairs(after_keys) do
         if not seen_before[k] then new_lkey = k end

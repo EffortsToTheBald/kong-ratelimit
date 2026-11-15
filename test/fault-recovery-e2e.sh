@@ -45,7 +45,7 @@ done
 ok "双路由配置下发（batch>1 ft=false × 2）"
 
 lease_records_for() {
-  RC --scan --pattern 'kong:rl:lease:*' </dev/null | while IFS= read -r k; do
+  RC --scan --pattern 'kong:rl:*:lease:*' </dev/null | while IFS= read -r k; do
     [ -n "$k" ] || continue
     pk=$(RC HGET "$k" pool_key </dev/null)
     case "$pk" in *"$1"*) echo "$k";; esac

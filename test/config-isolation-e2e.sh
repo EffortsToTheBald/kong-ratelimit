@@ -41,7 +41,7 @@ EOF
 }
 
 lease_records_for() {  # 输出 ns 的 lease key（按 pool_key 归属）
-  RC --scan --pattern 'kong:rl:lease:*' </dev/null | while IFS= read -r k; do
+  RC --scan --pattern 'kong:rl:*:lease:*' </dev/null | while IFS= read -r k; do
     [ -n "$k" ] || continue
     pk=$(RC HGET "$k" pool_key </dev/null)
     case "$pk" in *"$1"*) echo "$k";; esac

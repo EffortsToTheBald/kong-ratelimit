@@ -7,6 +7,7 @@
 --   2) EVAL 的脚本文本会被 Redis 按 SHA 缓存，反复调用不会重复解析
 -- ============================================================
 local redis = require "resty.redis"
+local keys_mod = require "kong.plugins.rate-limit-advanced.lib.keys"
 
 local _M = {}
 
@@ -704,15 +705,20 @@ function _M.grant_multi(conf, keys, rates, bursts, ttls_ms)
 end
 
 --- GRANT_LEASE 调用（Phase 4）：Lease 授予（桶扣减 + Lease 记录创建，单脚本原子）。
--- KEYS[1]=桶键  KEYS[2]=Lease Key（`<key_prefix>:lease:<lease_id>`，无大括号——
--- 与 Phase 3 裸跑矩阵的 Key 口径一致）。
+-- KEYS[1]=桶键  KEYS[2]=Lease Key（关口四任务 A：`build_lease_key(桶键, lease_id)`
+-- = 桶键后追加 ":lease:<lease_id>"，与桶键共用同一 hash tag ⇒ Cluster 同 slot；
+-- 旧格式 `<key_prefix>:lease:<lease_id>` 已废弃，脚本本身未改动——其 KEYS
+-- 语义只依赖调用方传入，KEYS 顺序核对见 docs/REMEDIATION.md）。
 -- 错误透传：LEASE_EXISTS / INVALID_ARGUMENT（脚本零写入）与超时/断开/畸形返回
 -- 一律原样返回给调用方（lease.lua 按 design D4 分类——不确定结果不重试不登记）。
 -- @return {granted, tokens, wait}（granted>=1 ⇒ 记录已建；granted=0 ⇒ 未建记录）
 --         或 nil, err
 function _M.grant_lease(conf, bucket_key, lease_id, pool_key, batch,
                         lease_ttl_ms, rate, capacity, bucket_ttl_ms)
-  local lkey = (conf.redis.key_prefix or "kong:rl") .. ":lease:" .. lease_id
+  local lkey, lkey_err = keys_mod.build_lease_key(bucket_key, lease_id)
+  if not lkey then
+    return nil, lkey_err
+  end
 
   local r, cerr = connect(conf)
   if not r then

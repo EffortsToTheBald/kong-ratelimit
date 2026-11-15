@@ -9,6 +9,7 @@ local bit = require "bit"
 
 local redis_mod = require "kong.plugins.rate-limit-advanced.lib.redis"
 local lease = require "kong.plugins.rate-limit-advanced.lib.lease"
+local keys_mod = require "kong.plugins.rate-limit-advanced.lib.keys"
 
 local _M = {}
 
@@ -102,9 +103,12 @@ local function dim_value(dim, conf)
 end
 
 --- 构建 Redis key。
--- 形如：kong:rl:{rl:p=1a2b3c4d:ip=10.0.0.7:path=/echo}
+-- 形如：kong:rl:{rl:p=1a2b3c4d:ip=10.0.0.7:path=/a%3Ab}
+-- （维度值中 ':' '{' '}' '%' 经 encode_value 转义；其余字符含 '/' 原样）
 -- 花括号是 Redis Cluster 的 hash tag，保证同一逻辑 key 落在同一 slot；
 -- p= 策略指纹（P0-1）：限流参数一变即得新 key/新桶，旧桶与旧本地库存随 TTL 自然淘汰。
+-- 维度值经 keys.encode_value 无歧义编码（':' '{' '}' '%' 转义；关口四任务 A）：
+-- 多维组合不碰撞、同输入 key 稳定、维度值不可能破坏 hash tag 结构。
 function _M.build_key(conf)
   -- D2/4.3：rules 模式运行时兜底校验（与 schema entity_check 双保险——
   -- 防绕过 Admin API 校验的配置注入：校验失败 → nil → handler 500 misconfigured）
@@ -130,7 +134,7 @@ function _M.build_key(conf)
       return nil, "limit_by contains 'header' but header_name is not set"
     end
 
-    parts[i] = dim .. "=" .. dim_value(dim, conf)
+    parts[i] = dim .. "=" .. keys_mod.encode_value(dim_value(dim, conf))
   end
 
   local tag = conf.namespace
@@ -239,7 +243,7 @@ function _M.build_group_keys(conf)
       if dim == "header" and (rule.header_name == nil or rule.header_name == "") then
         return nil, "rules[" .. i .. "] limit_by contains 'header' but header_name is not set"
       end
-      parts[j] = dim .. "=" .. dim_value(dim, rule)
+      parts[j] = dim .. "=" .. keys_mod.encode_value(dim_value(dim, rule))
     end
     local rate, burst = _M.rule_rate_and_burst(rule)
     local tag = conf.namespace

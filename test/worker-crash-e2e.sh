@@ -82,7 +82,7 @@ for i in 1 2 3 4; do
 done
 exec 3>&- 3<&-
 report "$(eq "${REM[1]} ${REM[2]} ${REM[3]} ${REM[4]}" "9 8 7 6")" "outstanding 演进 9→8→7→6（granted=10, consumed=4, outstanding=6）"
-L1=$(RC --scan --pattern 'kong:rl:lease:*' </dev/null | while IFS= read -r k; do
+L1=$(RC --scan --pattern 'kong:rl:*:lease:*' </dev/null | while IFS= read -r k; do
   [ -n "$k" ] || continue
   pk=$(RC HGET "$k" pool_key </dev/null)
   case "$pk" in *"$NS"*) echo "$k"; break;; esac
@@ -120,7 +120,7 @@ while IFS= read -r k; do
   [ -n "$k" ] || continue
   pk=$(RC HGET "$k" pool_key </dev/null)
   case "$pk" in *"$NS"*) records=$((records+1)); g=$(RC HGET "$k" granted </dev/null | tr -d '\r'); sum_granted=$((sum_granted+g));; esac
-done < <(RC --scan --pattern 'kong:rl:lease:*' </dev/null)
+done < <(RC --scan --pattern 'kong:rl:*:lease:*' </dev/null)
 report "$(eq "$sum_granted" 100)" "全局 Σgranted=$sum_granted == limit（10 + 9×10；不超发）"
 g1b=$(RC HGET "$L1" granted </dev/null | tr -d '\r')
 s1b=$(RC HGET "$L1" status </dev/null | tr -d '\r')

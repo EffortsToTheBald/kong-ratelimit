@@ -85,8 +85,14 @@ flowchart TD
 
 ```
 <kong:rl>:{<namespace>:p=<策略指纹>:<维度>=<值>...}     # 桶键（单规则）/ 多规则组内各规则桶
-<kong:rl>:lease:{<lease_id>}                            # Lease 元数据记录
+<桶键>:lease:<lease_id>                                 # Lease 元数据记录（与桶键同 hash tag ⇒ 同 slot）
 ```
+
+- **维度值编码**（关口四任务 A）：`<值>` 中的 `:` `{` `}` `%` 经
+  `lib/keys.lua encode_value` 转义为 `%3A` `%7B` `%7D` `%25`（其余字节原样），
+  多维组合不碰撞、同输入 key 稳定、维度值不可能破坏 hash tag 结构；
+  Lease 键 = 桶键后追加 `:lease:<lease_id>`，与桶键同 slot（消除 CROSSSLOT；
+  旧格式 `<kong:rl>:lease:<lease_id>` 已废弃，旧记录随 1h TTL 自然消失）。
 
 - **策略指纹**（FNV-1a 32 位）输入：`limit / window / burst（≤0 归一化为 limit）/ limit_by 顺序 /
   header_name（仅含 header 维度时参与）`；**batch 不参与**（运输参数，调 batch 不清空桶）

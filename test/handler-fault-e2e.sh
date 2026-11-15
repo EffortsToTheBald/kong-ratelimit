@@ -23,7 +23,7 @@ RC() { docker compose exec -T redis redis-cli "$@"; }
 # 按 lease_id 第二字段（host:worker:seq:hex）输出指定 ns 下全部 Lease 的 worker_id
 # ——Lease 记录总数无法区分"同一 Worker 多次 GRANT"，Worker 归属必须看 worker_id
 lease_worker_ids() {
-  RC --scan --pattern 'kong:rl:lease:*' </dev/null \
+  RC --scan --pattern 'kong:rl:*:lease:*' </dev/null \
    | while IFS= read -r k; do
        [ -n "$k" ] || continue
        pk=$(RC HGET "$k" pool_key </dev/null)

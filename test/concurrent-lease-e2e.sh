@@ -47,6 +47,25 @@ for n in 8031 8011 8021; do
 done
 ok "配置下发：limit=100 window=86400 batch=10 ns=$NS（3 节点）"
 
+# ---- 等待 reload 混合期结束（关口四教训）：
+# kong reload 后旧 Worker 短暂共存，其旧格式 Lease 记录与 EVALSHA 计数会让
+# 账目断言出现伪差值；等待各节点旧 Worker 全部退出（进程数连续两轮一致）再开始。
+wait_stable() { # wait_stable <container> —— worker 数连续两次采样一致且 >0
+    local prev=0 cur
+    for _ in $(seq 1 30); do
+        cur=$(docker compose exec -T "$1" sh -c "pgrep -f 'nginx: worker process' | wc -l" 2>/dev/null || echo 0)
+        cur=$(echo "$cur" | tr -d '[:space:]')
+        [ "$cur" -gt 0 ] && [ "$cur" = "$prev" ] && return 0
+        prev=$cur
+        sleep 1
+    done
+    return 1
+}
+for k in kong1 kong2 kong3; do
+  wait_stable "$k" || { bad "$k reload 混合期未收敛"; exit 1; }
+done
+ok "reload 混合期已收敛（3 节点旧 Worker 全部退出）"
+
 # ---- EVALSHA 计数快照（关口三方案 B：直连降级授权经 TOKEN_BUCKET EVALSHA，
 #      不产生 Lease 记录 ⇒ 账目断言须计入；以 Redis commandstats 计数实证） ----
 evalsha_before=$(RC INFO commandstats </dev/null | tr -d '\r' | sed -n 's/^cmdstat_evalsha:calls=//p' | cut -d, -f1)
@@ -110,7 +129,7 @@ while IFS= read -r k; do
   lid=$(RC HGET "$k" lease_id </dev/null | tr -d '\r')
   hostw=$(echo "$lid" | cut -d: -f1,2)
   case ",$workers_seen," in *",$hostw,"*) ;; *) workers_seen="$workers_seen,$hostw" ;; esac
-done < <(RC --scan --pattern 'kong:rl:lease:*' </dev/null)
+done < <(RC --scan --pattern 'kong:rl:*:lease:*' </dev/null)
 ndistinct=$(echo "$workers_seen" | tr ',' '\n' | grep -c . || true)
 echo "GRANT 记录: count=$records Σgranted=$sum_granted distinct(host,worker)=$ndistinct [$workers_seen]"
 
@@ -148,9 +167,15 @@ report "$(eq "$((sum_granted + direct))" "$allowed")" "授权消耗总账=$((sum
 report "$([ $((denied_a+denied_b+denied_c)) -gt 0 ] && echo true)" "超额请求返回 429=$((denied_a+denied_b+denied_c))（耗尽后 denied-GRANT granted=0 既有语义）"
 
 # ---- 断言 8：桶 tokens 终态 < 1 ----
-bkey=$(RC --scan --pattern 'kong:rl:{'"$NS"':p=*' </dev/null | head -1)
+# （SIGPIPE 教训：SCAN|head 会在 pipefail 下静默中断脚本 ⇒ 先完整收集再取首个；
+#   新 Lease 键与桶键共享前缀 ⇒ 须排除 ":lease:"，否则 tokens 取空致断言空洞通过）
+mapfile -t _bkts < <(RC --scan --pattern 'kong:rl:{'"$NS"':p=*' </dev/null)
+bkey=""
+for k in "${_bkts[@]}"; do
+  case "$k" in *":lease:"*) ;; *) bkey="$k"; break ;; esac
+done
 tok=$(RC HGET "$bkey" tokens </dev/null | tr -d '\r')
-report "$(awk -v t="$tok" 'BEGIN{print (t<1)?"true":"false"}')" "桶 tokens 终态=$tok < 1（配额全部经 GRANT 消化，无泄漏）"
+report "$([ -n "$tok" ] && awk -v t="$tok" 'BEGIN{print (t<1)?"true":"false"}')" "桶 tokens 终态=$tok < 1（配额全部经 GRANT 消化，无泄漏；bkey=$bkey）"
 
 printf '\n===== 汇总: PASS=%s FAIL=%s NOT_VERIFIED=%s =====\n' "$PASS" "$FAIL" "$NOTV"
 [ "$FAIL" = "0" ]

@@ -83,7 +83,7 @@ actual="${REM[1]} ${REM[2]} ${REM[3]} ${REM[4]} ${REM[5]} ${REM[6]} ${REM[7]} ${
 report "$(eq "$actual" "$expected")" "remaining 序列=$actual（期望 $expected：A 池 10→0 耗尽，req11 新 GRANT B 池 9）"
 
 # ---- Lease 记录核验（按 created_at 升序：A=先创建，B=耗尽后新 GRANT） ----
-recs=$(RC --scan --pattern 'kong:rl:lease:*' </dev/null | while IFS= read -r k; do
+recs=$(RC --scan --pattern 'kong:rl:*:lease:*' </dev/null | while IFS= read -r k; do
   [ -n "$k" ] || continue
   pk=$(RC HGET "$k" pool_key </dev/null)
   case "$pk" in *"$NS"*) echo "$k";; esac
@@ -117,7 +117,7 @@ for t in 1 2 3 4 5 6 7 8; do
   out=$(http_req 4 exh)
   exec 4>&- 4<&-
   st=${out%% *}; rm2=${out#* }
-  nrec_now=$(RC --scan --pattern 'kong:rl:lease:*' </dev/null | while IFS= read -r k; do
+  nrec_now=$(RC --scan --pattern 'kong:rl:*:lease:*' </dev/null | while IFS= read -r k; do
     [ -n "$k" ] || continue
     pk=$(RC HGET "$k" pool_key </dev/null)
     case "$pk" in *"$NS"*) echo x;; esac

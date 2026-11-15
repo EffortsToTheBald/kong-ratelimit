@@ -58,7 +58,7 @@ RC FLUSHDB >/dev/null
 
 # lease 记录按 pool_key 字段归属 namespace（lease key 本身不含 namespace）
 lease_ns_count() {
-  RC --scan --pattern 'kong:rl:lease:*' \
+  RC --scan --pattern 'kong:rl:*:lease:*' \
    | while IFS= read -r k; do [ -n "$k" ] && RC HGET "$k" pool_key </dev/null; done \
    | grep -c "$1" || true
 }
@@ -77,7 +77,7 @@ report "$(eq "$rem_trace" "$expect")" "remaining 序列=[$rem_trace]（应=$expe
 n1=$(lease_ns_count "$NS_G1")
 report "$(eq "$n1" 1)" "10 请求后 lease 记录数=$n1（应为 1：1 次 GRANT + 9 次本地 TAKE，同 worker 零新 GRANT）"
 # 仅取本次 namespace 的 lease 记录（按 pool_key 归属，防残留干扰）
-lkey=$(RC --scan --pattern 'kong:rl:lease:*' | while IFS= read -r k; do
+lkey=$(RC --scan --pattern 'kong:rl:*:lease:*' | while IFS= read -r k; do
     [ -n "$k" ] && RC HGET "$k" pool_key </dev/null | grep -q "$NS_G1" && echo "$k"
   done | head -1)
 [ -n "$lkey" ] || { bad "未找到 $NS_G1 的 lease 记录"; exit 1; }

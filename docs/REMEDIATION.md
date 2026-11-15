@@ -437,3 +437,33 @@ confirmed_granted = consumed + outstanding + discarded
 **对外行为影响**：消除误降级——已在途的既有 Pool 不再被重复计入容量 ⇒ 高基数下"最后一个池位"可正常使用；新 Pool 在途仍占位 ⇒ `_pool_count ≤ MAX_POOLS` 仍严格成立。冻结行为（不驱逐 ACTIVE Pool、不 429/不 503、方案 B）不变。
 
 ---
+
+## 关口四：Key 统一构造（任务 A，基于 ce78bd9）
+
+### 任务 A：Key 统一构造（维度碰撞 + CROSSSLOT，同次实现）
+
+**改了什么 / 为什么**：
+- 新增 `lib/keys.lua`：`encode_value(s)`——维度值仅转义 4 个歧义字节（`:`→`%3A`、`%`→`%25`、`{`→`%7B`、`}`→`%7D`；其余字节含非 ASCII 原样，Redis key 二进制安全；快路径无歧义字节时原样返回，热路径零额外开销）；`build_lease_key(bucket_key, lease_id)`——桶键后追加 `:lease:<lease_id>`，与桶键共用同一 hash tag ⇒ Cluster 同 slot（消除 CROSSSLOT 的 key 层根因）。lease_id 输入规范：非空且不得含 `{`/`}`/`%`（含则拒绝 → 既有故障分支 Fail-close，零写入；该校验属输入规范，同输入规范下的 lease_id 分段 `:` 允许原样）。
+- `lib/algorithm.lua`：`build_key`/`build_group_keys` 的维度值经 `encode_value`；桶键构造**不搬移**（沿用 `build_key`/`build_group_keys`，避免无关重构）；策略指纹**不变**（指纹输入不含维度值/编码）。
+- `lib/redis.lua`：`grant_lease()` 的 lkey 改由 `build_lease_key` 构造（调用点代码；内嵌脚本字符串零改动）。
+- **KEYS 顺序核对（GRANT vs RETURN）**：GRANT_LEASE = `KEYS[1]桶键 / KEYS[2]Lease 键`（`redis/grant_lease.lua:19-20,34-35`）；RETURN_LEASE = `KEYS[1]Lease 键 / KEYS[2]桶键`（`redis/return_lease.lua:11-12,24-25`）——**两条路径 KEYS 顺序相反**，构造规则统一为 `build_lease_key(桶键, lease_id)`，传参按各自脚本 KEYS 顺序。本关口不改任何 Lua 脚本（含 `redis/*.lua` 与 `lib/redis.lua` 内嵌脚本及其注释）；脚本头部注释中的旧 key 格式描述已过时，属脚本冻结范围待后续协议关口处理（记录于遗留）。
+- 测试同步（同次提交）：9 个 E2E 的 SCAN 模式 `'kong:rl:lease:*'` → `'kong:rl:*:lease:*'`（worker-crash、algorithm-lease-e2e、concurrent、config-isolation、fault-recovery、handler-fault、lease-exhaustion、lease-timeout-uncertain）；`lease-redis-matrix.sh` 96 处字面量 `kong:rl:lease:<id>` → `kong:rl:{p3g:m}:lease:<id>`；`lease-grant-smoke.lua` 的 keys 模式与 lkey 构造改为桶键派生；`config-isolation-unit.lua` 新增 8 项 key 断言（CRC16-XMODEM 已知向量 0x31C3 自校验、`:{}%` 转义、同输入稳定、多维不碰撞、hash tag 结构 `{}` 仅在骨架边界、Lease/桶键 slot 一致（等价算法）、lease_id 输入规范）；`concurrent-lease-e2e.sh` 的 tokens 终态采样排除 `:lease:` 键并补 SIGPIPE/混合期两条教训修复（见下）。
+- `docs/architecture.md` §5 键格式行同步（维度编码 + Lease 键同 tag + 旧格式废弃）。
+
+**兼容性（按审查要求展开）**：
+1. **滚动升级并存（不可简单表述为"一次性额外放行"）**：新旧版本 Worker 同时运行期间，两套 key 各自成账——同一逻辑维度实例同时占用**旧桶（存量水平）与新桶（满血初始配额）**，实际放行上限 = 两者之和 ⇒ **总放行可超单版本配额**（最坏 2×，随旧桶 TTL/旧记录 1h 消退而收敛）；新 Key 首次使用即重新获得初始满配额，且每个新维度实例（新 ip/header/path 值）都如此。运营含义：升级窗口内限流偏松，窗口 = max(旧桶 TTL=2×window, 旧 Lease 记录 1h)。
+2. 旧 key 不再复用；指纹不变（同策略新旧指纹段相同，仅值编码不同 ⇒ 旧桶不可被新代码命中）。
+3. 旧格式 Lease 记录由 1h TTL 自然消失；新 SCAN 模式不匹配旧格式（测试环境为全新 key 空间，无混合）。
+
+**测试命令与真实结果**（全部实测）：
+- 单元：`config-isolation-unit.sh` **24/0**（含 8 项新 key 断言）；`lease-unit.sh` 50/0；`algorithm-lease-unit.sh` 36/0；`evalsha-unit.sh` 8/0。
+- Redis 裸跑：`lease-redis-matrix.sh` **50/0**（新格式字面量全量更新；GRANT/RETURN 全矩阵经新键格式）。
+- 真 Redis 链路：`lease-grant-smoke.sh` 4+7/0（新格式记录取证）。
+- E2E（真实 OpenResty 多 Worker，新 key 格式在产）：concurrent-lease **19/0 ×3**（其中 Σgranted=92+8、93+7、97+3、98+2 均精确闭合 100；直连批 2~9 随时序浮动）；exhaustion 11/0；config-isolation 14/0；algorithm-e2e 15/0；fault-recovery 12–14/0（轮询浮动）；handler-fault 26/0；timeout-uncertain 22/0/0；selfheal 15/0；worker-crash 16/0；isolation 7/0。
+- 本轮测试脚本附带修复（同提交，非范围外）：① `concurrent-lease-e2e.sh` 前置增加"reload 混合期收敛等待"（教训：`kong reload` 后旧 Worker 短暂共存，旧格式记录不被新 SCAN 计入而 EVALSHA 计入 ⇒ 账目伪差值）；② 断言 8 的 `SCAN|head` SIGPIPE 教训修复（pipefail 下静默中断）+ tokens 采样排除 `:lease:` 键（新 Lease 键与桶键共享前缀，否则断言空洞通过，本轮实测 tokens=0.0011881189776839 有值）。
+
+**NOT VERIFIED（如实声明）**：真实 Redis Cluster 环境下的 GRANT_LEASE/RETURN_LEASE/EVALSHA/NOSCRIPT 行为未验证（本环境 standalone，`CLUSTER KEYSLOT` 返回 cluster support disabled）；slot 一致性由测试侧 CRC16-XMODEM 等价算法验证。**解决 CROSSSLOT 不等于完整支持 Redis Cluster**——Cluster 部署仍需独立的按节点脚本缓存、重定向等验证（维持既有 Deferred 记录）。
+
+**遗留问题**：① `redis/grant_lease.lua:20`、`redis/return_lease.lua:11` 及 `lib/redis.lua` 内嵌脚本头注释中的旧 key 格式描述未更新（脚本文件本关口冻结不动，待协议关口）；② N1（维度值 256 截断碰撞）不在本任务范围，维持记录；③ 全量 percent 编码（非 ASCII 字节原样）为本关决策，若未来要求 key 全 ASCII 可再评估（会再次全量换 key）。
+
+---
