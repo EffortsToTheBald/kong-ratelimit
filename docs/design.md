@@ -183,7 +183,7 @@ N 个网关节点的时钟漂移通常是几十到几百毫秒；若各节点用
 | 构成 | 单次上界 | 累计上界 | 严格性 |
 |---|---|---|---|
 | 瞬时滞留（已确认并登记、未消费的库存） | 每 Worker 每 key ≤ k | ≤ W_total × k | **推导上界**（前提见下） |
-| Pool 过期/淘汰 discarded（关口三） | 每 Worker 每 key 每 Lease ≤ k | 取决于 Lease 代际数 | 估算 |
+| Pool 过期（EXPIRED）discarded（关口三） | 每 Worker 每 key 每 Lease ≤ k | 取决于 Lease 代际数 | 估算 |
 | Worker 崩溃 lost | 每 Worker ≤ k | 取决于崩溃次数 | 估算 |
 | GRANT 结果不确定 uncertain（Redis 已扣、Worker 未登记） | 每次 ≤ k | **无封闭上界**（不重试、不登记是冻结语义，次数随故障率而定） | 估算 + NOT VERIFIED |
 
@@ -517,8 +517,9 @@ auto 取 limit/50 的默认值在 §4.3 估算口径下保守可接受。
    （`/user/123` → `/user/:id`），否则 Redis 内存会随 URL 数量增长。
 4. **可观测性接入**：打点到 Prometheus（`kong_http_...`），而不是只靠响应头。
 5. **配额回收**：节点下线时本地库存丢失（少发方向），高配额场景下浪费可观。【Current V1 状态】
-   本地 Pool 已有生命周期管理（关口三：max_age=2×window 过期、空闲 60s Timer 回收、
-   MAX_POOLS 淘汰，未消费库存计 discarded）；**自动 RETURN 归还 Redis 仍 Deferred**
+   本地 Pool 已有生命周期管理（关口三：max_age=2×window 过期（EXPIRED 未消费库存计
+   discarded）、空闲 60s Timer 回收、MAX_POOLS 空池 EVICTED 淘汰——零库存损失）；
+   **自动 RETURN 归还 Redis 仍 Deferred**
    （RETURN_LEASE 协议已冻结未接线）；跨崩溃的精确对账（lost 审计）Deferred。
 6. **时钟**：Redis 侧 refill 用 Redis TIME（脚本参数不含任何本地时间，关口一核实）；
    本地 `ngx.now()` 只用于 Lease 本地过期判定（created_at + max_age，过期只会丢弃库存、
