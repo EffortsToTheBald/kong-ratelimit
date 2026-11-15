@@ -543,3 +543,72 @@ confirmed_granted = consumed + outstanding + discarded
 **遗留问题**：① Cluster 内存/复制流量未验证（维持既有 Deferred 记录）；② 无新增待办；不 propose 任何优化（未经批准不做）。
 
 ---
+
+## 关口四最终验收（基于 14297da，2026-11-15，只读审计）
+
+**结论：验收通过（PASS）。无阻断问题。**
+
+### 1. 实施与审计记录完整性核对
+
+- **任务 A 记录**：主体（改了什么/为什么/兼容性含窗口拆分/测试命令与真实结果/NOT VERIFIED/遗留）+ 审查修正（修正 1 wait_stable 重写、修正 2 TTL 窗口拆分）+ 复审收尾修正（PID 快照有效性核验、重复 ok() 删除）——三段完整，均含实测证据与 PASS 计数口径。
+- **任务 B 记录**：字段/TTL/单键内存实测、写命令与 RTT 口径区分、RETURN_LEASE 代码核实、1万/10万/100万 内存量化（实测+推导+估算分层标注）、NOT VERIFIED 与误差来源——完整。
+
+### 2. 冻结决策遵守核对（git diff ce78bd9..14297da 全量核对）
+
+- **禁改文件零改动**：`redis/*.lua`、`schema.lua`、`openspec/`、`bench/`、`docs/reports/` 在本关口范围内 diff 文件数=0。
+- **内嵌脚本未动**：`lib/redis.lua` 本关口 diff 仅两处 hunk（`require keys_mod` + `_M.grant_lease` 调用侧 lkey 构造），GRANT_LEASE/RETURN_LEASE 脚本字符串字面量零改动（双源 `redis/grant_lease.lua`、`redis/return_lease.lua` 未触碰）。
+- **语义不变项核对**：batch=1 逐请求授权、rules 全或无、429+Retry-After、X-RateLimit-* 头、Fail-close 503、fault_tolerant 语义、GRANT 不确定不重试不登记、NOSCRIPT 重试恰一次——本关口 diff 未触及上述路径（改动仅限：`lib/keys.lua` 新增、`algorithm.lua` 维度值经 encode_value、`redis.lua` 调用侧 lkey、测试同步、文档）。
+- **未扩大范围**：RETURN 接入、N1、自动生命周期、Schema 字段——均未实施（任务 B 明确不 propose 优化）。
+
+### 3. 测试结果汇总（区分 PASS / FAIL / NOT RUN / NOT VERIFIED）
+
+**最终 HEAD（14297da）本轮全量复测——实测，全部 PASS、0 FAIL**（16 个测试入口）：
+
+| 类别 | 脚本 | 结果 |
+|---|---|---|
+| 单元 | config-isolation-unit（含 8 项 key 断言） | 24/0 |
+| 单元 | lease-unit | 50/0 |
+| 单元 | algorithm-lease-unit | 36/0 |
+| 单元 | evalsha-unit | 8/0 |
+| Redis 裸跑 | lease-redis-matrix | 50/0 |
+| 冒烟 | lease-grant-smoke | 4+7/0 |
+| E2E | concurrent-lease-e2e | 22/0 |
+| E2E | algorithm-lease-e2e | 15/0 |
+| E2E | lease-exhaustion-e2e | 11/0 |
+| E2E | config-isolation-e2e | 14/0 |
+| E2E | lease-timeout-uncertain-e2e | 22/0/0 |
+| E2E | fault-recovery-e2e | 14/0 |
+| E2E | handler-fault-e2e | 26/0 |
+| E2E | script-cache-selfheal-e2e | 15/0 |
+| E2E | worker-crash-e2e | 16/0 |
+| E2E | lease-isolation | 7/0 |
+
+合计 **PASS=341 / FAIL=0 / NOT RUN=0**。NOT VERIFIED（非本轮测试项，见 §4）。
+
+### 4. 未解决风险与 Deferred（哪些不影响 V1）
+
+**不影响 V1（standalone 部署、既有行为契约下）**：
+- Redis Cluster 完整支持（N3 键层 CROSSSLOT 已修，但按节点脚本缓存/重定向/Cluster 内存与复制流量未验证）——standalone 部署不受影响，Cluster 部署前须独立验证（Deferred）。
+- Worker RSS / 长稳 / 真实 OpenResty 并发验证（关口二冻结保留）——证据完整性缺口，非正确性阻断；账目断言已有 E2E 实测背书。
+- 脚本头注释旧 key 格式描述过时（`redis/grant_lease.lua:20`、`redis/return_lease.lua:11`）——文档性，行为无影响，待协议关口。
+- 任务 B 内存估算误差 ±10%——估算标注完整，非风险项。
+- Phase 5 生命周期整体 DEFERRED（项目既有决策，V1 范围外）。
+
+**升级期风险（一次性，不影响稳态）**：
+- 键迁移兼容窗口：滚动升级新旧桶并存 ⇒ 总放行可超单版本配额（2×window TTL 收敛）；新维度实例重新获得初始配额——已在任务 A 兼容性一节按审查要求拆分描述。
+
+**待后续关口决策（非本关口阻断）**：
+- N1（维度值 256 截断碰撞）：维持记录，未经批准不实施。
+- 全量 percent 编码决策：非 ASCII 字节原样为本关决策，若未来要求 key 全 ASCII 需再评估（会再次全量换 key）。
+
+### 5. Git 状态核对（实测）
+
+- 分支 `remediation/hardening`；HEAD=14297da5b60719bb63c07326b50eb0b34a734c25；与 `origin/remediation/hardening` 同步（rev-list 0/0）。
+- 关口四提交链（ce78bd9 → 14297da，4 commits）：`665fa8d`（任务 A 实现）→ `a43a20b`（审查修正 1+2）→ `a2ba601`（复审收尾修正）→ `14297da`（任务 B 审计）——每步独立、范围递进、无混提。
+- 工作区：已跟踪文件零修改；3 个未跟踪会话导出文件（`1113.json`/`1115.json`/`1115-2.json`）非仓库内容、未提交、非本关口产物。
+
+**对外行为影响**：无（纯验收审计；键格式变更行为影响已在任务 A 兼容性一节记录）。
+
+**遗留问题**：§4 清单即遗留全集；无新增阻断。
+
+---
