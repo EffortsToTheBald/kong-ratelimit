@@ -668,3 +668,31 @@ bench/、生产代码、Lua、Schema 零改动。
 维持。无新增阻断。
 
 ---
+
+## 关口五复审修正（基于 9d4e7ce→，2026-11-15，定点四项，不扩范围）
+
+**改了什么 / 为什么**（每份文档单独提交；生产代码/Lua/Schema/openspec/docs/reports/bench 零改动）：
+
+| 提交 | 文件 | 修正 |
+|---|---|---|
+| `5cfbb1d` | README.md | ① §9"旧 Pool 生命周期回收尚未实现"→ **已实现**（关口二/三：MAX_POOLS、max_age=2×window、60s Timer；自动 RETURN/Worker 接管/库存补偿维持 Deferred）；② §4 补 limit=100、batch=10、3 节点×2 Worker 量化示例：**60 令牌 = 瞬时滞留推导上界，60/100=60% = 库存敞口比例（推导上界）**，明确标注**不是实际利用率、不是窗口利用率下限**，实际滞留远小于上界，并给出 Phase 7 实测敞口样本（7848/3.1%）对照 |
+| `035447c` | docs/design.md | ② §4.9 EXPIRED 与 EVICTED 区分：**只有 EXPIRED 的未消费库存计入 discarded**；EVICTED 是 **Pool 回收事件（不是 Lease 状态）**，仅淘汰无 ACTIVE Lease 的空池，**零库存损失、不产生 discarded**；③ 新增"不变量的三层区分"：生产代码控制路径（单在途标志 + 非 yield 片段）维护不变量 → `_counters` 账目随状态翻转同步维护 → **`invariants()` 是测试主动调用的校验函数，不是生产运行时断言**（生产路径不调用）；§4.3 前提措辞同步 |
+| `02470aa` | docs/design.md | ② 补充：§4.3 少发表行"Pool 过期（EXPIRED）discarded"、§11 配额回收条目措辞同步 |
+| `893d432` | docs/architecture.md | ② 术语约定行区分（EXPIRED=唯一产生 discarded 的状态；EVICTED=Pool 回收事件、零库存损失、不是 Lease 状态）；§7 生命周期图注与状态机说明同步；③ 不变量分层说明同步；Deferred 表措辞同步 |
+
+**核实依据（代码核实，实测）**：
+- `lease.lua:491 invariants()` 定义；全仓 grep 调用点仅在 test/*.lua 与探针脚本（lease-unit、
+  algorithm-lease-unit、lease-grant-smoke、lease-memory-baseline），`kong/` 生产代码零调用。
+- `lease.lua` Pool 淘汰仅删除 active 空的池（`evict_idle_pools`/`timer_sweep_once`/
+  容量压力淘汰，`_counters.evicted` 计 Pool 数）；`expire_lease_at` 是
+  `discarded_tokens` 唯一来源（`lease.lua:15,108-113`）⇒ 只有 EXPIRED 产生 discarded、
+  EVICTED 零库存损失，与代码一致。
+
+**测试命令与真实结果**：纯文档修正，无生产代码改动，未新增/重跑测试；测试状态沿用关口四
+验收（16 入口 PASS=341/FAIL=0）。范围验证：`git diff` 各提交均仅涉对应文档文件。
+
+**对外行为影响**：无（文档描述修正；EXPIRED/EVICTED 区分与代码实际行为本就一致，属文档对齐）。
+
+**遗留问题**：无新增；既有遗留维持（N1、mermaid 渲染 NOT VERIFIED、长稳少发分布 NOT VERIFIED）。
+
+---
