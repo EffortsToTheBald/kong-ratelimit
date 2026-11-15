@@ -3,7 +3,9 @@
 > 配套：`docs/design.md`（设计文档与误差分层推导）、`docs/REMEDIATION.md`（整改关口冻结记录）、
 > `docs/reports/PHASE7_PERFORMANCE_REPORT.md`（性能）、历史报告见 `docs/reports/` 与 `docs/PHASE*_*.md`。
 > 术语约定：**Lease** = Worker 本地预授权库存；**GRANT_LEASE / GRANT_MULTI** = Redis Lua 脚本；
-> **CLOSED** = 本地耗尽态；**EXPIRED / EVICTED** = 过期摘除 / 压力淘汰（未消费库存计 discarded）；
+> **CLOSED** = 本地耗尽态；**EXPIRED** = 过期摘除（**唯一产生 discarded 的状态**：未消费库存计入
+> discarded，不归还 Redis）；**EVICTED** = Pool 回收事件（整池删除，仅限无 ACTIVE Lease 的空池，
+> 零库存损失，**不是 Lease 状态**）；
 > **outstanding** = Worker 本地尚未消费的库存；**discarded** = 过期/淘汰丢弃的未消费库存（不归还 Redis）；
 > **lost** = 已授权但无法继续使用的库存（Worker 崩溃等）；**uncertain** = Redis 可能已扣但 Worker 未登记（不重试不登记）。
 
@@ -186,13 +188,19 @@ Redis GRANT_LEASE
             60s 低频 Timer 兜底（每轮处理数有上限、跳过在途 GRANT、回调异常隔离）
 ```
 
-- **状态机**：本地 ACTIVE→CLOSED / EXPIRED / EVICTED；无 CLOSING 归还态
+- **状态机**：本地 Lease 状态 ACTIVE→CLOSED / EXPIRED（EXPIRED 摘除时未消费库存计入
+  discarded，一次计数，不归还 Redis——**只有 EXPIRED 产生 discarded**）；
+  **EVICTED 是 Pool 回收事件，不是 Lease 状态**：MAX_POOLS 压力下只淘汰无 ACTIVE Lease 的
+  空池（CLOSED remaining=0、EXPIRED 已计数 ⇒ 零库存损失）；无 CLOSING 归还态
 - **V1 不自动 RETURN**（RETURN_LEASE Lua 已实现、协议冻结，请求路径不调用）；无 idle scanner、
   无 max_lifetime（本地 max_age=2×window 已实现，属 Pool 回收维度）、无 Worker 接管、无库存补偿
 - **Redis Lease 元数据 TTL（`LEASE_TTL_MS=3600000`，内部常量，非用户配置）只约束 Redis 侧记录的
   过期，不代表库存自动归还**
-- 守恒不变量：`remaining + consumed = granted`（lease-unit 50 断言守护，含无 yield 探针）；
-  每 Pool active 上界与全局恒等式由 `invariants()` 断言守护
+- 守恒不变量：`remaining + consumed = granted`（lease-unit 50 断言守护，含无 yield 探针）
+- **不变量分层**：生产代码控制路径（单在途标志 + 非 yield 的 register/TAKE/状态翻转片段）
+  维护不变量；`_counters` 账目随状态翻转同步维护（discarded 只计一次）；
+  **`invariants()` 是测试主动调用的校验函数（lease-unit / algorithm-lease-unit / smoke /
+  探针脚本），不是生产运行时断言——生产路径不调用它**
 
 ## 8. 库存账目（关口二冻结恒等式）
 
@@ -245,7 +253,7 @@ batch 变化 ⇒ 同 Pool；真栈配置变更后新配置首请求不复用旧�
 | 类别 | 状态 |
 |---|---|
 | 自动 RETURN（RETURN_LEASE 接线）、idle scanner、Worker 接管、库存补偿 | **Deferred（未实现）** |
-| 本地 Pool 生命周期回收（MAX_POOLS=10000/Worker、max_age=2×window 过期、EVICTED 淘汰、60s Timer） | **已实现（关口二/三冻结，含 discarded 单次计数与 invariants() 断言）** |
+| 本地 Pool 生命周期回收（MAX_POOLS=10000/Worker、max_age=2×window 过期、空池 EVICTED 淘汰、60s Timer） | **已实现（关口二/三冻结；discarded 单次计数；invariants() 为测试校验函数）** |
 | Redis Cluster（脚本缓存按节点、多键同 slot——键层同 slot 已由关口四任务 A 实现）与 HA/主从切换验证 | **键层已修；Cluster 行为未验证** |
 | Prometheus 指标导出 / Tracing（`_counters` 仅为内部基础） | **未实现** |
 | 长稳（>24h）与内存曲线 / Worker RSS | **未执行** |
