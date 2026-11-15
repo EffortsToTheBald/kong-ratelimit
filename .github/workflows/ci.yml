@@ -84,9 +84,12 @@ jobs:
 
       - name: bench/quota.sh (quota correctness, 3-node shared pool)
         run: |
+          # k6 版本选择依据：quota.js 使用 ES2020 可选链（?.），k6 <0.52 的 babel
+          # 不支持（grafana/k6#2168）；v0.53+ 默认模式原生支持（官方 release notes）。
+          # 固定 v0.57.0（release 资产已验证）。
           curl -sL -o /tmp/k6.tar.gz \
-            https://github.com/grafana/k6/releases/download/v0.50.0/k6-v0.50.0-linux-amd64.tar.gz
+            https://github.com/grafana/k6/releases/download/v0.57.0/k6-v0.57.0-linux-amd64.tar.gz
           tar -C /tmp -xzf /tmp/k6.tar.gz
-          sudo install /tmp/k6-v0.50.0-linux-amd64/k6 /usr/local/bin/k6
+          sudo install /tmp/k6-v0.57.0-linux-amd64/k6 /usr/local/bin/k6
           k6 version
           bash bench/quota.sh -l 100 -b 1 -p 150
