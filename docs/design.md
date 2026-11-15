@@ -1,7 +1,10 @@
 # 分布式集群限流插件 —— 设计文档
 
-> 状态：骨架 + 已完成部分。**标 `⟨TODO⟩` 的地方是需要你跑完实验后填真实数字的。**
+> 状态：**Current V1（关口五文档对齐版，基于 remediation/hardening）**。
 > 本文档的目标不是"证明我做完了"，而是"证明我知道自己在哪一步做了取舍"。
+> 状态标记约定：**【Historical】** = 早期设计取舍（结论仍有效、实现载体可能已变）；
+> **【Current V1】** = 当前代码实际实现；**【Deferred】** = 明确未实现项。
+> 量化数字的口径：**实测 / 推导 / 估算 / NOT VERIFIED** 逐项标注，不混用。
 
 ---
 
@@ -24,67 +27,72 @@
 
 ### 1.3 验收口径
 
-1. `batch=1` 时，N 个副本的总放行数 **严格 等于** 配额（可复现、可断言）
-2. `batch>1` 时，总放行数 **不超过** 配额（误差方向单一）
-3. 超限返回 `429` + `Retry-After`，正常请求返回 `X-RateLimit-*`
-4. 配置可动态修改，不重启
-5. `batch` 增大时，p99 与 Redis 负载单调下降，配额少发率单调上升（用实验证明）
+1. `batch=1` 时，N 个副本的总放行数 **严格 等于** 配额（可复现、可断言）【Current V1：实测，bench/quota.sh】
+2. `batch>1` 时，总放行数 **不超过** Redis 已确认扣减的授权量（见 §4.2 前提与 §4.3 误差口径）【Current V1】
+3. 超限返回 `429` + `Retry-After`，正常请求返回 `X-RateLimit-*`【Current V1：实测】
+4. 配置可动态修改，不重启【Current V1：实测】
+5. `batch` 增大时，p99 与 Redis 负载单调下降，配额少发率单调上升（用实验证明）【Historical 目标；
+   实测结论见 §8.3：Redis 负载下降与少发敞口已实证，p99 单调性受环境噪声支配未证实（NOT VERIFIED）】
 
 ---
 
-## 2. 方案总览
+## 2. 方案总览【Current V1】
 
 ```
-                         ┌──────────────┐
-   客户端轮询 ───────────▶│  Kong #1     │──┐
-                         │  ┌────────┐  │  │   batch 领取（每 batch 个请求 1 次）
-                         │  │本地库存 │  │  │
-                         │  └────────┘  │  │
-                         └──────────────┘  │        ┌─────────────┐
-                         ┌──────────────┐  ├───────▶│   Redis     │
-                         │  Kong #2     │  │  EVAL  │ ┌─────────┐ │
-                         │  ┌────────┐  │  │  原子  │ │全局令牌桶│ │
-                         │  │本地库存 │  │  │        │ └─────────┘ │
-                         │  └────────┘  │  │        └─────────────┘
-                         └──────────────┘  │
-                         ┌──────────────┐  │
-                         │  Kong #3     │──┘
-                         │  ┌────────┐  │
-                         │  │本地库存 │  │───────────▶ 上游服务
-                         │  └────────┘  │   （本地库存充足时，请求
-                         └──────────────┘     不产生任何 Redis I/O）
+                          ┌────────────────────────────┐
+   客户端轮询 ───────────▶│  Kong #1（DB-less）         │──┐
+                          │  Worker A  Worker B         │  │
+                          │  [Lease池A] [Lease池B]      │  │  ← Worker 私有，互不可见
+                          └────────────────────────────┘  │
+                          ┌────────────────────────────┐  │       ┌─────────────┐
+                          │  Kong #2                    │  ├──────▶│   Redis 7   │
+                          │  [Lease池]  [Lease池]       │  │EVALSHA│ ┌─────────┐ │
+                          └────────────────────────────┘  ├───────│ │全局令牌桶│ │
+                          ┌────────────────────────────┐  │  原子 │ └─────────┘ │
+                          │  Kong #3                    │──┘       │Lease 元数据 │
+                          │  [Lease池]  [Lease池]       │────────▶ └─────────────┘
+                          └────────────────────────────┘                │
+                                   │  本地库存充足 ⇒ 零 Redis I/O        ▼
+                                   └──────────────────────────────▶ 上游服务
+                              Redis 故障 ⇒ Fail-close 503（默认）/ 显式降级放行
 ```
 
-**一句话**：全局配额是"总仓"，本地库存是"零钱"。花零钱不出门，零钱花完才去总仓取一次。
+**一句话**：全局配额是"总仓"（Redis，唯一权威），每个 Worker 的 Lease 是自己的"零钱"。
+花零钱不出门；零钱花完才去总仓取一批。**Worker 之间不共享零钱**，共享的只有 Redis 总仓。
 
 ```mermaid
 sequenceDiagram
     participant C as Client
     participant K as Kong(access)
-    participant L as 本地库存(shared dict)
+    participant L as Worker 私有 Lease
     participant R as Redis
 
     C->>K: GET /echo
-    K->>K: 构建 key（维度组合）
-    K->>L: take(key)  原子 -1
-    alt 库存 > 0
+    K->>K: 构建 key（维度值编码 + 策略指纹）
+    K->>L: TAKE(key)  原子 -1（无 yield）
+    alt Lease 有库存
         L-->>K: 命中
         K-->>C: 放行 + X-RateLimit-*
-    else 库存耗尽
-        K->>R: EVAL 领取 batch 个令牌（原子）
-        alt granted > 0
-            R-->>K: granted, remaining, wait
-            K->>L: fill(key, granted-1, ttl)
+    else NEED_GRANT
+        K->>R: EVALSHA GRANT_LEASE（原子扣桶 + 建 Lease 记录）
+        alt granted ≥ 1
+            R-->>K: granted, tokens, wait
+            K->>L: register + TAKE 消费 1（同段非 yield 片段）
             K-->>C: 放行
-        else granted == 0
-            R-->>K: 0, remaining, wait
+        else granted = 0
+            R-->>K: 0, tokens, wait（不建记录）
             K-->>C: 429 + Retry-After
+        else 超时/断连/畸形（不确定）
+            R-->>K: 故障透传（不重试、不登记）
+            K-->>C: 503 Fail-close（默认）或显式降级放行
         end
     end
 ```
 
-**关键不变量**：`本地库存 + 全局桶剩余 = 初始供给`。令牌只从全局桶流向本地库存，不可逆，
-所以任何时刻的累计发放量都不会超过全局供给。
+**关键不变量【Current V1】**：放行消费的每一个令牌都来自某一次已确认的 Redis 扣减
+（Lease 预授权或 batch=1 直连授权）。在 Redis 授权状态连续有效（无主从切换回滚、无数据
+重置）且统计口径一致的前提下，**累计放行量 ≤ Redis 累计扣减的授权量**（推导，见 §4.2）；
+超发风险只存在于故障回滚窗口（§4.6），不是无条件恒等式。
 
 **多规则模式（α 强一致，Phase 3）没有这条链路**：`rules` 非空时不使用本地库存、无快路径，
 每请求一次 Redis 多键原子 Lua（`grant_multi`）：
@@ -108,7 +116,8 @@ sequenceDiagram
 ```
 
 "全或无"的检查与扣减在同一脚本内完成（Redis 单线程 ⇒ 无中间态可见），
-因此**不存在单规则 batch>1 模式下的任何少发误差**——代价是每请求 1 RTT 且无本地库存。
+因此**多规则路径不存在少发误差**——代价是每请求 1 RTT 且无本地库存。
+（对照含义：少发误差仅存在于单规则 batch>1 的 Lease 预授权路径。）
 
 ---
 
@@ -149,60 +158,79 @@ if tokens >= want then tokens = tokens - want end -- 发放
 N 个网关节点的时钟漂移通常是几十到几百毫秒；若各节点用自己的时钟算补充量，
 一个时钟快 1 秒的节点会凭空多领走 `rate` 个令牌。用 Redis 单一时钟源消除这个变量。
 
-### 4.2 批量领取为什么不会超发
+### 4.2 为什么（在给定前提下）不会超发【Current V1，推导】
 
-设全局桶初始容量 `B`，速率 `R`，副本数 `N`，每次领取 `batch = k`。
+**变量定义（全文统一）**：`N` = Kong 副本数；`W` = 每副本 Worker 数；`W_total = N × W` =
+集群 Worker 总数；`k` = batch（每次 GRANT 申请的令牌数）；`B` = 桶容量（`burst>0 ? burst : limit`）；
+`R` = 补充速率（limit/window）。
 
-- 每次放行都要消耗 1 个令牌，令牌只能来自某一次"已从全局桶扣减"的领取。
-- 领取是原子的，累计领取量 `G ≤ 供给`。
-- 因此 `累计放行量 ≤ G ≤ 供给`。**超发不可能发生。**
+**统计对象与作用域**：以下结论均针对**单个逻辑 key**（同一 namespace + 指纹 + 维度组合
+的桶）及其授权库存；跨 key 的全局总量是各 key 独立结论的求和。
 
-### 4.3 少发（stranded tokens）的上界
+- 每次放行都要消耗 1 个令牌，令牌只能来自某一次"已从全局桶扣减"的授权
+  （batch=1 直连或 batch>1 的 GRANT_LEASE，Redis 单脚本原子）。
+- 授权是原子的，累计授权量 `G ≤ 供给`；本地消费 ≤ 已登记授权 ⇒ 累计放行 ≤ G ≤ 供给。
+- **前提（必须显式声明）**：Redis 授权状态连续有效——无主从切换回滚、无数据重置、
+  统计口径一致。该前提成立时"不放行未经 Redis 扣减的令牌"是构造性保证。
+- **前提不成立时的例外**：主从异步复制回滚窗口内可能短时超发（§4.6）；
+  指纹变化导致新旧桶并存时，同一逻辑维度在两套桶上各有配额，实际放行上限为两者之和
+  （升级窗口内可能超过单版本配额，收敛时间 = 旧桶 TTL 2×window，见 §6）。
 
-令牌领到本地后若没被用掉（流量下降、key 过期、节点宕机），这部分配额就浪费了。
+### 4.3 少发（stranded tokens）的量化【Current V1，推导 + 估算分层】
 
-每个节点最多滞留 `k` 个令牌（库存上限就是一次领取量），故：
+少发的构成（均不归还 Redis，方向单一）：
 
-```
-每窗口少发量 ≤ N · k
-配额利用率 ≥ 1 - (N · k) / limit
-```
-
-代入 `N=3`：
-
-| limit | k | 最多少发 | 利用率下限 |
+| 构成 | 单次上界 | 累计上界 | 严格性 |
 |---|---|---|---|
-| 1000 | 20 | 60 | 94% |
-| 1000 | 50 | 150 | 85% |
-| 100 | 20 | 60 | **40%** |
-| 100 | 2 | 6 | 94% |
+| 瞬时滞留（已确认并登记、未消费的库存） | 每 Worker 每 key ≤ k | ≤ W_total × k | **推导上界**（前提见下） |
+| Pool 过期/淘汰 discarded（关口三） | 每 Worker 每 key 每 Lease ≤ k | 取决于 Lease 代际数 | 估算 |
+| Worker 崩溃 lost | 每 Worker ≤ k | 取决于崩溃次数 | 估算 |
+| GRANT 结果不确定 uncertain（Redis 已扣、Worker 未登记） | 每次 ≤ k | **无封闭上界**（不重试、不登记是冻结语义，次数随故障率而定） | 估算 + NOT VERIFIED |
 
-**这张表就是参数自动取值的依据**：误差是相对量，`k` 必须随 `limit` 缩放，不能取固定值。
+**瞬时滞留 ≤ W_total × k 是推导上界，其前提为**：①每 Worker 每 Pool 任意时刻至多 1 个
+active Lease（关口三不变量：单 Pool 单在途 GRANT + 非_yield register/TAKE 片段，
+`invariants()` 断言守护）；②每个 Lease `granted ≤ k`；③无 RETURN（V1 不接线）。
+前提成立时该界成立；前提由代码不变量与断言维护，而非协议保证。
 
-### 4.4 `batch` 的自动取值
+**"每窗口累计少发 ≤ W_total × k" 不是严格上界**：discarded/lost/uncertain 的单次规模有界
+（≤k），但每窗口事件次数取决于流量形态与故障率，累计少发无封闭公式。工程估算口径如下
+（**仅计瞬时滞留项**，按 W_total = 3×2 = 6；不含 uncertain/崩溃累计，长稳分布 NOT VERIFIED）：
+
+| limit | k | 瞬时滞留上界（估算） | 利用率下限（估算） |
+|---|---|---|---|
+| 1000 | 20 | 120 | 88% |
+| 1000 | 50 | 300 | 70% |
+| 100 | 2 | 12 | 88% |
+| 10000 | 50 | 300 | 97% |
+
+这张表是参数取值的依据之一：误差是相对量，`k` 必须随 `limit` 缩放。**注意它与早期
+"N 个节点共享一份库存"模型下的 N·k 不同**：V1 的 Lease 是 Worker 私有的，
+滞留上界随 Worker 总数 W_total 缩放，不随副本数 N 单独缩放。
+
+### 4.4 `batch` 的自动取值【Current V1：`lib/algorithm.lua resolve_batch`】
 
 ```lua
 k_auto = clamp(floor(limit / 50), 1, 50)
 ```
 
-- `limit=100` → `k=2`，利用率 ≥ 94%，Redis 负载 ÷2
-- `limit=1000` → `k=20`，利用率 ≥ 94%，Redis 负载 ÷20
-- `limit=10000` → `k=50`（封顶），利用率 ≥ 98.5%，Redis 负载 ÷50
+- `limit=100` → `k=2`；`limit=1000` → `k=20`；`limit=10000` → `k=50`（封顶）。
+- 选 50 作分母等价于"容忍**单 Worker** 1/50 = 2% 的瞬时滞留"；按 §4.3，
+  集群最坏瞬时滞留 = W_total × k = W_total/50（如 6 Worker ⇒ 12%）——
+  这是**估算上界**（不含 uncertain/崩溃累计），利用率数字见 §4.3 表。
+- 封顶 50 是为了避免单次领取过大导致突发放大（§4.5）和 Redis 单次脚本处理时间变长。
 
-选 50 作为分母，等价于"容忍 1/50 = 2% 的单节点滞留"；封顶 50 是为了避免单次领取过大
-导致突发放大（见 4.5）和 Redis 单次脚本处理时间变长。
+### 4.5 突发放大【Current V1，推导】
 
-### 4.5 突发放大
-
-本地库存是"已领取待消费"的令牌，节点可以在库存范围内瞬时释放，所以集群的最坏瞬时突发是：
+本地库存是"已领取待消费"的令牌，**Worker 可以在自己的库存范围内瞬时释放**（本地消费
+突发），所以集群对单个 key 的最坏瞬时突发是：
 
 ```
-burst_max = B + N · k
+burst_max = B + W_total · k
 ```
 
-`B=1000, N=3, k=20` → 1060，放大 6%。
-若 `k` 取到 `limit`（等于完全本地化），突发会放大到 `B + N·B = 4B`，**这是不可接受的**，
-所以 `k` 必须显著小于 `limit`。这条约束和 4.3 一起，把 `k` 的取值范围夹在了中间。
+`B=1000, W_total=6, k=20` → 1120，放大 12%（**推导上界**，前提同 §4.3）。
+若 `k` 取到 `limit`（等于完全本地化），突发会放大到 `B + W_total·B`，**不可接受**，
+所以 `k` 必须显著小于 `limit`。这条约束和 §4.3 一起，把 `k` 的取值范围夹在了中间。
 
 ### 4.6 Redis 故障与主从切换
 
@@ -237,7 +265,7 @@ Redis 故障时默认 503 还是 degraded 放行，由 `fault_tolerant` 显式�
 
 **为什么必须收敛到 Redis 服务端单脚本**（本设计最重要的取舍）：
 
-- 本地 shared dict 没有多键原子原语（只有单键 `incr`），"先检查 A、B 再扣"存在
+- Worker 本地内存表没有多键原子原语（只有单键操作），"先检查 A、B 再扣"存在
   TOCTOU 竞态：检查通过 ≠ 扣得到，两个并发请求可能都基于同一份过期快照放行。
   扣-验-滚（失败回滚）只能得到最终一致 + 崩溃窗口泄漏（少发方向），不是强一致。
 - Redis 单线程 + 单 Lua 脚本 ⇒ 脚本内的"全检-全扣/全不扣"不可分割，
@@ -265,6 +293,29 @@ kong:rl:{<ns>:g=<组指纹>:r<i>:<dim>=<val>:…}
 **代价声明**：多规则模式每请求 1 RTT（无快路径、无 batch 摊销）；改任一规则 = 整组配额重置。
 验证：`bench/rules.sh`（核心断言"R1 空 + R2 有 ⇒ 429 且两桶 tokens 均不变"）。
 
+### 4.9 Lease 生命周期与本地 Pool 模型【Current V1，关口二/三冻结】
+
+**Pool**：每 Worker 每逻辑 key 一个 Pool（`lease.lua` Worker 私有 `_pools`）；
+首次 GRANT 时创建并快照 `max_age = 2×window`（毫秒，仅首次生效）。
+`MAX_POOLS = 10000/Worker`（冻结值）：达上限时**不驱逐 ACTIVE Pool**、不 429/不 503，
+该请求退化为 batch=1 直连授权（不登记本地库存，不进 Lease 账目）；
+淘汰顺序 = 先淘汰无 ACTIVE Lease 的空池；TAKE 热路径 O(1)（每 Pool active Lease 数 ≤ 1）。
+
+**Lease 状态（本地）**：`ACTIVE → CLOSED`（耗尽，从可消费集合摘除，保留诊断不可复活）
+`/ EXPIRED`（`created_at + max_age/1000 < ngx.now()`，摘除）/ `EVICTED`（Pool 压力下
+整池淘汰，仅限无 ACTIVE Lease 的池）。过期/淘汰的未消费库存计入 **discarded**
+（一次计数，不归还 Redis，少发方向）。
+
+**清理**：TAKE/GRANT 路径惰性判定 + `init_worker` 低频 Timer（60s，每轮处理数有上限）
+兜底回收；Timer 回收跳过在途 GRANT（`_inflight` 保护，关口三）；回调异常隔离、
+Worker 退出兜底。**并发 GRANT（方案 B，冻结）**：单 Pool 同时只允许一笔在途 GRANT，
+期间的并发请求退化为 batch=1 直连 ⇒ 每 Pool active Lease 数上界 = 1，TAKE 最坏扫描 O(1)。
+
+**账目恒等式**：`confirmed_granted = consumed + outstanding + discarded`
+（confirmed_granted 只含 Worker 已收到并登记的 GRANT；GRANT 超时/响应丢失单列为
+uncertain，**不计入**该恒等式）；Worker 崩溃后 outstanding 归类 lost。
+不变量由 `lease.lua invariants()` 断言守护（每 Pool active 上界 + 恒等式）。
+
 ---
 
 ## 5. 请求路径与性能预算
@@ -278,14 +329,19 @@ kong:rl:{<ns>:g=<组指纹>:r<i>:<dim>=<val>:…}
 
 | 路径 | 操作 | 预期开销 |
 |---|---|---|
-| fast path（库存充足） | shared dict `incr` + 拼响应头 | ~10–20 μs，无网络 I/O |
-| slow path（库存耗尽） | Redis EVAL + keepalive 复用 | 由 RTT 决定，本机 Redis ~0.2–0.5ms |
-| 拒绝路径 | 构造 429 + 头 | 与 fast path 同量级 |
+| fast path（Lease 有库存） | Worker 本地 TAKE（无 yield 原子片段）+ 拼响应头 | ~10–20 μs，无网络 I/O【估算】 |
+| slow path（NEED_GRANT） | Redis EVALSHA GRANT_LEASE + keepalive 复用 | 由 RTT 决定，本机 Redis ~0.2–0.5ms【估算】 |
+| 直连降级（MAX_POOLS 满/单在途 GRANT 占用） | batch=1 直连授权（不登记本地库存） | 与 batch=1 slow path 同量级【推导】 |
+| 拒绝路径 | 构造 429 + 头 | 与 fast path 同量级【估算】 |
 
 slow path 的触发概率 ≈ `1/k`，所以**平均开销 ≈ (1-1/k) × fast + (1/k) × slow**。
 这是 `batch` 参数的全部经济学。
 
-⟨TODO：填入实测 p50/p95/p99，见第 8 节⟩
+**实测（Phase 7，RPS=1000 干净轮均值，Worker=2，引用 [PHASE7_PERFORMANCE_REPORT.md](reports/PHASE7_PERFORMANCE_REPORT.md)，勿视为重测）**：
+batch=10 vs batch=1 —— p50 0.50 vs 0.66ms、p95 1.16 vs 1.41ms（改善，实测）；
+p99 87.1 vs 82.8ms（未见改善，尾部受共享宿主机环境噪声支配，**归因 NOT VERIFIED**）；
+授权命令 2002 vs 20001（约 9.99:1）；Redis 总 QPS 869 vs 4773（−81.8%）；
+Kong CPU −23%、Redis CPU −73%（详见 §8.3）。
 
 ---
 
@@ -327,7 +383,11 @@ plugins:
 - 修改 `limit_by`：key 的组成变了，等价于换了一个桶，旧桶按 TTL 自然过期。
 - 只改 `batch`：指纹不含 batch（运输参数，不构成桶身份），桶与现有库存**保留**。
 
-⟨TODO：贴一段 `POST /config` 改 limit 前后的 curl 对比，证明 10s 内生效⟩
+**DB-less 逐节点下发的并存风险【Current V1】**：配置经 Admin API 逐节点 POST 时，下发完成的
+节点立即以新指纹工作，未下发的节点仍以旧指纹工作——**同一逻辑维度在两套桶上各自记账，
+实际放行上限 = 新旧两桶之和**（直到旧桶随 2×window TTL 消亡）。规避建议：三节点在同一
+低峰窗口内尽快连续下发；下发后核对三节点配置一致（对照 Admin API /config 与限流行为）；
+避免长时间处于"部分节点已更新"状态。
 
 ---
 
@@ -343,22 +403,25 @@ Retry-After: 3                  # 仅 429，秒；≤ window，与 Reset−now �
 X-RateLimit-Status: degraded    # 仅 Redis 故障显式容错放行时
 ```
 
-**`Remaining` 是本节点视角的**：快/慢路径口径一致（慢路径 `granted−1` 恰好等于回填后的本地库存）。
-对外承诺"剩余量"会误导客户端，所以文档里明确写它是 `local_remaining`。
-⟨TODO：如果想给全局视角，可以在 slow path 时顺便带回 Redis 的剩余值，但会引入抖动⟩
+**`Remaining` 是本节点视角的**：快/慢路径口径一致（慢路径 `granted−1` 恰好等于登记后的
+本地库存）。对外承诺"剩余量"会误导客户端，所以文档里明确写它是 `local_remaining`。
+（全局视角需要额外一次 RTT 且本身有抖动，V1 不提供——取舍见 §9。）
 
 **`Reset` 是"下一个令牌可用时刻"**，不是窗口重置——令牌桶没有窗口概念：
 Redis 路径精确（服务端返回等待时长），本地路径近似（有库存 ⇒ 现在；刚取走最后一个 ⇒ 一个补充周期 `window/limit`）。
 `Retry-After` 封顶为 `window` 秒（一个窗口内必补 ≥1 个令牌），且 429 时 `Reset−now ≈ Retry-After`。
 429 是确定性拒绝，每次都打 notice 日志（key/limit/batch），可与 Redis 故障区分。
 
-**故障矩阵**
+**故障矩阵**【Current V1】
 
 | 故障 | 检测 | 行为 |
 |---|---|---|
 | Redis 超时/不可达 | `resty.redis` 1s 超时 / 连接失败 | 默认 fail-closed（503）+ error 日志；`fault_tolerant=true` 时放行 + degraded 头 |
-| shared dict 未配置 | `ngx.shared.kong_rl == nil` | 降级为 worker 内存表（精度下降，功能不中断） |
-| 配置缺 `header_name` | access 时校验 | 500 + 明确错误信息（而不是静默放行） |
+| GRANT 结果不确定（超时/断连/畸形返回） | 请求级透传 | 不重试、不登记本地库存（冻结语义）；少发方向，单次 ≤ k |
+| 本地 Pool 压力（MAX_POOLS 满且无可淘汰池 / 单在途 GRANT 占用） | GRANT 前降级判定 | 该请求退化为 batch=1 直连授权（不登记本地库存；不 429/不 503，攻击性高基数 key 无法据此拒绝正常用户）【Current V1，关口二/三冻结】 |
+| 本地 Pool 过期（max_age = 2×window）/ 空闲回收（60s Timer） | Timer + 惰性判定 | 过期 Lease 未消费库存计入 discarded（不归还 Redis）；Active Pool 不被回收 |
+| 配置缺 `header_name` | 下发时 schema entity_checks 拒绝（400） | fail fast；坏配置不进入运行时 |
+| Redis Lease 元数据 TTL 到期（1h） | Redis 侧整键删除 | **仅元数据消失**；无令牌恢复、无库存归还（V1 无 RETURN） |
 
 ---
 
@@ -366,34 +429,32 @@ Redis 路径精确（服务端返回等待时长），本地路径近似（有�
 
 完整的实验协议见 `docs/bench.md`。核心是**控制变量**：只动 `batch`，其他全固定。
 
-### 8.1 实验矩阵
+### 8.1 实验矩阵【Historical 计划 → 实际执行以 Phase 7 为准】
 
 | 编号 | batch | 目的 |
 |---|---|---|
 | M0 | 不装插件 | 基线（网关裸开销） |
 | M1 | 1 | 严格一致的上界成本 |
-| M2 | 5 | 折中 |
-| M3 | 20 | 推荐值 |
-| M4 | auto | 验证公式 |
+| M2 | 10 | Lease 预授权收益（实际执行的 batch>1 档） |
+| M3 | 多规则 | 强一致对照 |
+
+（早期计划的 M2=5/M3=20/M4=auto 为【Historical】；Phase 7 实际执行 M0 / batch=1 / batch=10 /
+多规则，auto 公式由单测验证，未单独压测。）
 
 ### 8.2 结果
 
-⟨TODO：跑完 `bench/matrix.sh` 后，把 `bench/results.md` 的表贴到这里⟩
+正式结果见 **[docs/reports/PHASE7_PERFORMANCE_REPORT.md](reports/PHASE7_PERFORMANCE_REPORT.md)**
+（同口径 k6 constant-arrival-rate，原始数据 `bench/raw/phase7/`，本文不重测不复制表）。
+Phase 1 Legacy 数据（docs/results.md）仅作历史对照，不代表当前实现。
 
-```
-| batch | p50 | p95 | p99 | 吞吐 | 通过/总请求 | Redis ops/s |
-|-------|-----|-----|-----|------|------------|-------------|
-| M0    |     |     |     |      |            | 0           |
-| M1    |     |     |     |      |            |             |
-| M2    |     |     |     |      |            |             |
-| M3    |     |     |     |      |            |             |
-| M4    |     |     |     |      |            |             |
-```
+### 8.3 结论
 
-### 8.3 结论（用一句话说清）
-
-⟨TODO，例如：batch=20 时 p99 相比基线 +0.2ms，Redis 负载降至 1/20，配额的少发率实测 2.1%
-（理论上界 6%），所以 auto 取 limit/50 是保守但安全的默认值。⟩
+batch=10 相比 batch=1（RPS=1000，Worker=2，实测）：授权命令 20001→2002（约 9.99:1），
+Redis 总 QPS 4773→869（−81.8%），Redis CPU −73%，Kong CPU −23%；
+p50/p95 改善（0.66/1.41 → 0.50/1.16ms，实测）；**p99 未见改善（82.8 vs 87.1ms），
+尾部由共享宿主机环境噪声支配，因果归因 NOT VERIFIED**。代价：库存留存敞口
+（255800 授权中 7848 未消费/未确认，3.1%，实测聚合口径）与 batch 粒度时序精度。
+auto 取 limit/50 的默认值在 §4.3 估算口径下保守可接受。
 
 ---
 
@@ -404,7 +465,7 @@ Redis 路径精确（服务端返回等待时长），本地路径近似（有�
 | 算法 | 令牌桶 | 滑动窗口日志的精确性 | O(1) 内存 + 无边界突刺，精度足够 |
 | 配额位置 | Redis 单主 | Redis Cluster / Raft | 复杂度与收益不匹配，限流可容忍短时失效 |
 | 一致性 | 单主原子 + 明确误差上界 | 宣称强一致 | 强一致需要 Raft，且换不来业务收益 |
-| 延迟优化 | 本地库存 + 批量领取 | 每请求精确扣减 | Redis 负载 ÷k，代价是可控的少发 |
+| 延迟优化 | Worker 私有 Lease 预授权 + 批量领取 | 每请求精确扣减 | Redis 负载 ÷k，代价是可控的少发（库存滞留/损失敞口，§4.3） |
 | 剩余量语义 | 本节点视角（快慢路径一致） | 全局精确 | 全局值需要额外一次 RTT，且本身有抖动 |
 | Reset 口径 | 下一令牌可用时刻（Unix 秒） | 窗口重置 / 桶回满时间 | 令牌桶无窗口概念；回满在 burst 大时数值巨大且无 retry 价值 |
 | Retry-After | 封顶 window 秒 | 无上界 | 一个窗口必补 ≥1 令牌，更长的等待建议无意义 |
@@ -412,7 +473,7 @@ Redis 路径精确（服务端返回等待时长），本地路径近似（有�
 | 畸形 Redis 返回 | 防御校验 → 故障分支 | 视为 429 / 静默兜底 | 数据异常不应触发确定性拒绝，也不应静默放行 |
 | header_name 缺失 | 下发即 400（entity_checks） | 运行时 500 | fail fast；坏配置不应进入运行时 |
 | 配置生效 | 声明式整体下发 | 细粒度热更新 | Kong DB-less 的原生方式，够用 |
-| 多维 key | 直接拼字符串 | 归一化 / 脱敏 | 归一化规则是业务语义，属于上层 |
+| 多维 key | 维度值转义编码（`:`/`{`/`}`/`%` → %XX）+ 256 截断 | 全量 percent 编码 / 归一化 / 脱敏 | 无歧义编码消除拼接碰撞与 hash tag 破坏（关口四）；归一化是业务语义属于上层；256 截断的跨维度碰撞（N1）维持记录未修 |
 
 ---
 
@@ -426,7 +487,7 @@ Redis 路径精确（服务端返回等待时长），本地路径近似（有�
 | 多副本精度 | 依赖 Redis `INCR`，精确但每请求 RTT | 精确（k=1）或有界误差（k>1），可调 |
 | 突发控制 | 由窗口大小隐式决定 | `burst` 显式可配 |
 | 故障降级 | 无显式声明 | 默认 fail-closed（503）；`fault_tolerant=true` 显式降级 + 响应头标记 |
-| 误差说明 | 未给出 | 文档给出上界公式与实验验证 |
+| 误差说明 | 未给出 | 文档给出误差分层口径（推导上界 + 估算 + 实测敞口样本，§4.3/§8.3） |
 
 **不是"重复造轮子"**：官方实现解决的是"有没有"，本方案解决的是"每请求一次 Redis 的
 延迟代价能不能摊薄，以及摊薄之后精度还剩多少"。后者的答案必须用公式+实验给出。
@@ -444,14 +505,21 @@ Redis 路径精确（服务端返回等待时长），本地路径近似（有�
 3. **基数治理**：`limit_by=path` 的 key 基数是 URL 空间，必须做路径归一化
    （`/user/123` → `/user/:id`），否则 Redis 内存会随 URL 数量增长。
 4. **可观测性接入**：打点到 Prometheus（`kong_http_...`），而不是只靠响应头。
-5. **配额回收**：节点下线时本地库存丢失，高配额场景下浪费可观，需要 TTL + 对账。
-6. **时钟**：已用 Redis TIME，但 `X-RateLimit-Reset` 仍用本机时间，多节点会略有差异（可接受）。
+5. **配额回收**：节点下线时本地库存丢失（少发方向），高配额场景下浪费可观。【Current V1 状态】
+   本地 Pool 已有生命周期管理（关口三：max_age=2×window 过期、空闲 60s Timer 回收、
+   MAX_POOLS 淘汰，未消费库存计 discarded）；**自动 RETURN 归还 Redis 仍 Deferred**
+   （RETURN_LEASE 协议已冻结未接线）；跨崩溃的精确对账（lost 审计）Deferred。
+6. **时钟**：Redis 侧 refill 用 Redis TIME（脚本参数不含任何本地时间，关口一核实）；
+   本地 `ngx.now()` 只用于 Lease 本地过期判定（created_at + max_age，过期只会丢弃库存、
+   不会创造令牌 ⇒ 不构成超发源，推导）、`X-RateLimit-Reset` 与日志。多节点 Reset 头略有差异（可接受）。
 7. **压测**：本机 Docker 网络下的数字不等于生产；需要至少一次跨机器（真实 RTT）的验证。
 8. **安全**：`limit_by=header` 时客户端可以伪造 header 绕过限制，需要签名或改用可信来源。
 
 ---
 
-## 12. 附：key 设计
+## 12. 附：key 设计与 Lease 元数据模型【Current V1，关口四任务 A 对齐】
+
+**桶键**（单规则）/ **组内规则桶键**（多规则）：
 
 ```
 kong:rl:{<namespace>:p=<policy-fingerprint>:<dim1>=<v1>:<dim2>=<v2>}
@@ -463,7 +531,10 @@ kong:rl:{<namespace>:p=<policy-fingerprint>:<dim1>=<v1>:<dim2>=<v2>}
   header_name(仅 header 维度)）：限流参数一变即为新桶，旧桶与旧本地库存不再被新策略继承
   （修复前实测：改 limit 后放行 116 > 100，多出的 16 个全部来自旧配置的桶与库存）。
   指纹不含 `batch`——batch 是运输参数，不构成桶的身份。
-- 维度值做长度截断（256 字符），防止超长 header 撑爆 key。
+- **维度值编码（关口四任务 A）**：`:` `{` `}` `%` 经 `lib/keys.lua encode_value` 转义为
+  `%3A` `%7B` `%7D` `%25`（其余字节原样，Redis key 二进制安全）⇒ 多维组合不碰撞、
+  同输入 key 稳定、维度值不可能破坏 hash tag 结构。header 维度值仍有 256 字符截断
+  （**跨维度截断碰撞 N1 维持记录，未修**）。
 - 示例（实测 `redis-cli KEYS` 输出）：
 
 ```
@@ -471,3 +542,26 @@ kong:rl:{rl:p=8039753e:ip=172.20.0.1}   # limit=1000 / window=3600 / limit_by=ip
 kong:rl:{rl:p=50780f62:ip=172.20.0.1}   # limit=100  / window=3600 / limit_by=ip
                                         # 同一维度值、不同策略 → 两个独立桶
 ```
+
+**Lease 元数据键与记录模型**（task A 起与桶键同 hash tag ⇒ Cluster 同 slot）：
+
+```
+<桶键>:lease:<lease_id>                  # 与桶键共用 hash tag ⇒ 同 slot（旧格式已废弃）
+```
+
+- 记录为 Redis Hash，GRANT_LEASE 原子创建，5 字段：`lease_id` / `pool_key` / `granted`
+  （数值字符串）/ `status`（`OPEN`）/ `created_at`（Redis TIME 浮点字符串）；RETURN 后追加
+  `return_requested`（RETURNED 状态）。
+- **TTL**：`LEASE_TTL_MS = 3600000`（1h，内部常量，非用户配置），GRANT 时 `PEXPIRE` 设置；
+  **TTL 到期整键删除 = 仅元数据消失**，无令牌恢复、无库存归还（V1 无 RETURN）；
+  RETURNED 记录保留至原 TTL（不重设）= 幂等保护窗口。
+- **元数据成本（实测口径，关口四任务 B）**：单键自内存 ≈264–280B；批量含 keyspace 均摊
+  ≈308–320B/条（48B 键实测）；100 万条 used_memory 306MB（实测），真实键长估算 330–350MB（±10%）。
+
+**Redis Cluster 支持边界**：
+
+- **已具备（键层，关口四任务 A）**：桶键与 Lease 键共享 hash tag ⇒ 两键同 slot，
+  GRANT_LEASE 的双键脚本不再 CROSSSLOT；维度值编码保证高基数维度值不破坏 hash tag。
+- **未验证 / Deferred**：脚本缓存的按节点管理（SCRIPT LOAD 仅到单节点）、CLUSTER 重定向
+  语义、MOVED 处理、Cluster 下内存与复制流量——**V1 验证环境为 standalone，Cluster 部署
+  前须独立验证（NOT VERIFIED）**；README 与 architecture.md 同口径。
