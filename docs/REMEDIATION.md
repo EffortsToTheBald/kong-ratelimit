@@ -424,4 +424,16 @@ confirmed_granted = consumed + outstanding + discarded
 - `config-isolation-e2e.sh` 存在**与本修复无关的既有偶发**（"B 桶键 ≠ A 桶键"在配置传播时序下偶现同指纹；历史报告 PHASE8_B 已记录同类偶发）。本轮 5 轮：3×14/0、2×13/1（偶发轮），复跑即恢复全绿；未改动该脚本。
 - 直连批的 Redis 侧计数仅为本 E2E 的 commandstats 推导（delta − records − denied）；常规运行期无该对账口径（维持 V1 无对账接口的表述）。
 
+### 关口三复审修复：容量计算去重（在途 GRANT 仅对新 Pool Key 占位）
+
+**改了什么 / 为什么**：复审发现 `ensure_capacity()` 用 `_pool_count + inflight_count()` 判容量，但已存在于 `_pools` 的 Pool 的在途 GRANT 被重复计入（register 会复用原池，不新建）⇒ 不必要的容量降级。修复（`lib/lease.lua`）：`inflight_count()` 只统计 `_pools[key] == nil` 的在途 key（register 将新建池的才占位）。两处回收的 inflight 跳过保护保持不变；`invariants()` 的 `pool_count ≤ MAX_POOLS` 不变量保持不变。
+
+**测试命令与真实结果**（全部实测）：
+- `bash test/algorithm-lease-unit.sh` → **PASS 36 / FAIL 0**。N 用例按修复语义更新：A 在**已有 Pool** 上 GRANT yield 期间，B 应使用剩余最后一个池位正常 GRANT（`calls.grant==0`、无降级日志、B 池创建、count=2=MAX），A 恢复后 register 复用原 Pool（同 table 引用），总数 ≤ MAX、恒等式成立（复审要求 3 的确定性测试）。新增 O 用例：两个**新 Pool Key** 并发 GRANT 占用两个池位，第三个新 Key 正确降级直连（`calls.grant==1`、warn=1），两笔在途登记后 `pool_count == 2 ≤ MAX`（验证要求 4）。
+- `bash test/lease-unit.sh` → PASS 50 / FAIL 0；内存探针 PASS（含容量不变量）；并发探针 burst N=100：`leases=1`、库存 9（不变量保持）。
+- 全量回归 14 入口：matrix 50/0、concurrent-lease-e2e **18/0**、exhaustion 11/0、algorithm-e2e 15/0、fault-recovery 13/0、handler-fault 26/0、timeout-uncertain 22/0、selfheal 15/0、worker-crash 16/0、isolation 7/0、smoke 7/0、evalsha 8/0、config-isolation-unit 15/0。
+- `config-isolation-e2e`：回归中发现偶发率升高，定位为**既有测试非确定性缺陷**——B_BKT 采样用无序 `SCAN | head -1`，A/B 两桶键共存时可能采到 A 的键（同轮 "B pool_key ≠ A pool_key" PASS 证明 B 记录正确）。最小修复（显式排除 A_BKT 后取样，断言意图不变），修复后 **4 连 14/0**。非生产代码问题、与容量修复无关。
+
+**对外行为影响**：消除误降级——已在途的既有 Pool 不再被重复计入容量 ⇒ 高基数下"最后一个池位"可正常使用；新 Pool 在途仍占位 ⇒ `_pool_count ≤ MAX_POOLS` 仍严格成立。冻结行为（不驱逐 ACTIVE Pool、不 429/不 503、方案 B）不变。
+
 ---

@@ -93,7 +93,9 @@ report "$(eq "$(RC HGET "$alk" status)" "$A_ST")" "A status 保持 $A_ST（V1 �
 A_TOK_AFTER=$(RC HGET "$A_BKT" tokens)
 diff=$(python3 -c "print(abs(float('$A_TOK_AFTER')-float('$A_TOK_BEFORE'))<1.0 and 'yes' or 'no')")
 report "$(eq "$diff" "yes")" "A 桶 tokens $A_TOK_BEFORE → $A_TOK_AFTER（±1 容差=refill/exec 间隔；配置变更不修改旧桶令牌状态）"
-B_BKT=$(RC --scan --pattern "kong:rl:*${NS}*" </dev/null | grep -v lease | grep "$NS.*p=" | head -1)
+# （修正：SCAN 顺序不确定，两把桶键都存在时 head -1 可能采到 A 的键 ⇒ 偶发误报；
+#   断言意图是"B 的桶键与 A 不同"，故显式排除 A_BKT 后取样）
+B_BKT=$(RC --scan --pattern "kong:rl:*${NS}*" </dev/null | grep -v lease | grep "$NS.*p=" | grep -v "^${A_BKT}$" | head -1)
 report "$(eq "$([ "$B_BKT" != "$A_BKT" ] && echo true)" "true")" "B 桶键 ≠ A 桶键（$A_BKT vs $B_BKT）"
 
 printf '\n===== 汇总: PASS=%s FAIL=%s =====\n' "$PASS" "$FAIL"

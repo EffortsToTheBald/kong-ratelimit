@@ -324,9 +324,10 @@ end
 
 -- ------------------------------------------------------------
 -- Pool 容量（MAX_POOLS，冻结：10000/Worker）。
--- 在途 GRANT 占用池位（关口三审查修复）：跨 Pool 并发 GRANT 各自通过
--- ensure_capacity 后才 register，若不预留，登记完成时 _pool_count 可超上限
--- ⇒ count + inflight 数 ≥ MAX 即视为达容量。
+-- 在途 GRANT 占用池位（关口三审查修复 + 复审修正）：仅当其 Pool Key
+-- **尚不存在于 _pools**（register 将新建池）时才占位；已存在 Pool 的
+-- 在途 GRANT 复用原池（register 拒绝 busy、回收跳过 inflight ⇒ 原池
+-- 存活到 register），不占新位——否则重复计数导致不必要的容量降级。
 -- ensure_capacity：未达上限 ⇒ true；达上限 ⇒ 先淘汰无 ACTIVE Lease 且非
 -- 在途的 Pool（≤64 个，零库存损失），仍满 ⇒ false（调用方降级 batch=1 直连）。
 -- ------------------------------------------------------------
@@ -336,8 +337,8 @@ end
 
 local function inflight_count()
   local n = 0
-  for _, v in pairs(_M._inflight) do
-    if v == true then
+  for key, v in pairs(_M._inflight) do
+    if v == true and _M._pools[key] == nil then
       n = n + 1
     end
   end

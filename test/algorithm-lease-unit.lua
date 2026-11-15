@@ -409,17 +409,18 @@ do -- N：确定性并发（关口三审查修复验证）——A 的 GRANT yiel
     for _ = 1, 5 do lease.take(keyC) end
     ok("N-pool-c-created", lease.pool_count() == 2, "count=" .. lease.pool_count())
 
-    -- B 触发容量回收：count(2)+inflight(1) ≥ MAX(2) ⇒ 淘汰 C（跳过在途 A）⇒ 仍满 ⇒ 降级直连
+    -- B 触发容量判定：count(2)+新Key在途(0，A 复用原池不占位) = 2 ≥ MAX(2)
+    -- ⇒ 淘汰空池 C（跳过在途 A）⇒ count(1)+0 < 2 ⇒ B 使用最后池位正常 GRANT（不复审前的错误降级）
     local confB = base_conf(); confB.limit = 200
     local keyB = algorithm.build_key(confB)
     calls.grant, calls.warn = 0, 0
     local dB = algorithm.check(confB, keyB)
-    ok("N-b-degrade-and-evict-skip-inflight",
-       dB ~= nil and dB.allowed == true and dB.remaining == 0
-       and calls.grant == 1 and transport_calls_N == 2
+    ok("N-b-uses-last-slot-not-degraded",
+       dB ~= nil and dB.allowed == true and dB.remaining == 9
+       and calls.grant == 0 and calls.warn == 0 and transport_calls_N == 3
        and lease._pools[keyC] == nil and lease._pools[keyA] == poolA_ref
-       and lease.pool_count() == 1 and lease.stats().evicted == 1
-       and calls.warn == 1,
+       and lease._pools[keyB] ~= nil
+       and lease.pool_count() == 2 and lease.stats().evicted == 1,
        "grant=" .. calls.grant .. " transport=" .. transport_calls_N
        .. " count=" .. lease.pool_count()
        .. " evicted=" .. lease.stats().evicted)
@@ -432,13 +433,61 @@ do -- N：确定性并发（关口三审查修复验证）——A 的 GRANT yiel
     ok("N-register-reuses-pool",
        okr and dA2 ~= nil and dA2.allowed == true and dA2.remaining == 9
        and lease._pools[keyA] == poolA_ref
-       and lease.pool_count() == 1
+       and lease.pool_count() == 2
        and lease.pool_count() <= lease.MAX_POOLS,
        "dA2=" .. tostring(dA2 and dA2.allowed)
        .. " count=" .. lease.pool_count())
     ok("N-invariants-with-bound", lease.invariants(),
        tostring(lease.invariants()))
     ok("N-ledger-identity",
+       st.granted == st.consumed + st.local_remaining + st.discarded_tokens,
+       "g=" .. st.granted .. " c=" .. st.consumed
+       .. " o=" .. st.local_remaining .. " d=" .. st.discarded_tokens)
+    lease.MAX_POOLS = saved
+end
+
+do -- O：在途占位仅对新 Pool Key 生效（复审修正）——两个新 Key 并发 GRANT 占用
+    -- 两个池位，第三个新 Key 正确降级直连；最终 Pool 数 ≤ MAX
+    lease.reset()
+    local saved = lease.MAX_POOLS
+    lease.MAX_POOLS = 2
+    transport_ret = { granted = 10, tokens = 90, wait = 0 }
+    lease._transport = function(...)
+        coroutine.yield("grant_inflight")
+        return transport_ret, transport_err
+    end
+    local confA = base_conf()
+    local keyA = algorithm.build_key(confA)
+    local confB = base_conf(); confB.limit = 200
+    local keyB = algorithm.build_key(confB)
+    local confC = base_conf(); confC.limit = 300
+    local keyC = algorithm.build_key(confC)
+
+    local coA = coroutine.create(function() return algorithm.check(confA, keyA) end)
+    local coB = coroutine.create(function() return algorithm.check(confB, keyB) end)
+    coroutine.resume(coA)   -- 挂起：新 Key A 占位 1
+    coroutine.resume(coB)   -- ensure: 0+1 < 2 ⇒ 放行 GRANT，挂起：占位 2
+    calls.grant, calls.warn = 0, 0
+    local dC = algorithm.check(confC, keyC)   -- ensure: 0+2 ≥ 2 ⇒ 降级直连
+    ok("O-third-key-degraded",
+       dC ~= nil and dC.allowed == true and dC.remaining == 0
+       and calls.grant == 1 and calls.warn == 1
+       and coroutine.status(coA) == "suspended"
+       and coroutine.status(coB) == "suspended"
+       and lease.pool_count() == 0,
+       "grant=" .. calls.grant .. " count=" .. lease.pool_count())
+    -- 两笔在途 GRANT 各自登记新池 ⇒ 最终 Pool 数 = MAX（不超上限）
+    local rA = coroutine.resume(coA)
+    local rB = coroutine.resume(coB)
+    lease._transport = nil
+    local st = lease.stats()
+    ok("O-final-count-bounded",
+       rA and rB and lease.pool_count() == 2
+       and lease.pool_count() <= lease.MAX_POOLS
+       and lease._pools[keyA] ~= nil and lease._pools[keyB] ~= nil,
+       "count=" .. lease.pool_count())
+    ok("O-invariants-with-bound", lease.invariants())
+    ok("O-ledger-identity",
        st.granted == st.consumed + st.local_remaining + st.discarded_tokens,
        "g=" .. st.granted .. " c=" .. st.consumed
        .. " o=" .. st.local_remaining .. " d=" .. st.discarded_tokens)
