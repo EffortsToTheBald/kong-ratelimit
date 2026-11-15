@@ -118,6 +118,13 @@ rate-limit-advanced（access 阶段）
 它不提供与 `batch=1` 相同的逐请求时序精度。Worker 崩溃时未消费的预授权库存可能损失
 （实测样本：granted 10 = consumed 4 + lost 6）。权衡详见 Phase 7 报告 §15。
 
+**量化示例（推导口径，勿当作实测）**：limit=100、batch=10、3 节点 × 2 Worker（W_total=6）时，
+瞬时滞留推导上界 = 6 × 10 = **60 个令牌**；60 / limit(100) = **60% 是库存敞口比例（推导上界）**
+——即最坏情况下可能滞留的授权量占配额的比例。它**不是实际利用率，也不是窗口利用率下限**：
+实际滞留远小于上界（Worker 会在本地持续消费，滞留只在流量骤降/Worker 崩溃/GRANT 不确定时
+接近上界），且不含累计事件（崩溃/uncertain/discarded 的次数项）。利用率的实测敞口样本见
+Phase 7 报告（255800 授权中 7848 未消费/未确认，3.1%，实测聚合口径）。
+
 ## 5. 快速启动
 
 环境要求：Ubuntu 22.04/24.04（或同类）、Docker Engine + compose v2；压测另需 k6。
@@ -260,7 +267,8 @@ Phase 1 Legacy 数据（docs/results.md）仅作历史对照，不代表当前�
 - Worker 崩溃可能导致未消费的 Lease 库存损失（`granted = consumed + lost`；不接管、不补偿）
 - **GRANT 超时存在结果不确定性**（Redis 可能已执行而响应丢失）：不重试、不登记本地库存，可能造成库存损失
 - Redis Lease 元数据有固定 TTL（1h）——**这不等于库存自动归还**
-- 配置变化经策略指纹切换新 Pool；**旧 Pool 生命周期回收尚未实现（Deferred）**，旧库存自然耗尽/TTL 消亡
+- 配置变化经策略指纹切换新 Pool；**旧 Pool 生命周期回收已实现**（关口二/三：MAX_POOLS=10000/Worker、
+  max_age=2×window 过期、空闲 60s Timer 回收，未消费库存计 discarded 不归还）；旧库存自然耗尽/TTL 消亡
 - Redis 单实例（compose 验证环境）；**Cluster / 主从切换 / K8s / 生产 HA 未验证**
 - 长时间稳定性压测未完成；`limit_by=path` 高基数风险（无路径归一化）
 - `LEASE_TTL_MS` 为内部常量，不是用户可配置参数
