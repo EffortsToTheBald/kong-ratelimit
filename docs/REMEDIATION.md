@@ -717,3 +717,55 @@ discarded_tokens 唯一来源 expire_lease_at；淘汰仅删空池）。
 **遗留问题**：无新增；既有遗留维持。
 
 ---
+
+## 关口六：次要工程问题（基于 9d02bcb，2026-11-15，可选任务逐项处理）
+
+**执行原则**：先核实（代码 / Kong 3.6 API / 测试入口）再决定；收益不足或无法确认的项目保留现状并记录原因；每项独立提交。
+
+### 任务 1：consumer 匿名维度 —— 保留 `anon`（不改），补文档 + 守护测试
+
+- **核实**：`kong.client.get_forwarded_ip()` 在 Kong 3.6 存在（本插件 ip 维度已使用，`lib/algorithm.lua:75`），IP 取法可行；但**可信性取决于部署侧 `trusted_ips` 配置**，反代场景默认不可信，无法保证。
+- **决定：保留 `anon` 原行为**。理由：①分 IP 会把 consumer 配额变成 consumer×ip 双维配额，与 consumer 维度语义不一致；②不可信 IP 会产生攻击者可控的 key 基数（MAX_POOLS 降级可兜底但不理想）；③需按 IP 区分匿名流量应显式 `limit_by` 加 `ip`（现有能力）；④维度值变化 ⇒ 既有匿名桶不可命中（配额重置）。
+- **交付**（`b59f6e8`）：`docs/CONFIGURATION.md` 新增 §3.1"维度语义：consumer 的匿名回落"（匿名共享配额 + 不改原因）；新增守护测试 `algorithm-lease-unit` A2（断言未认证 ⇒ `:consumer=anon}`），实测 **37/0**。
+
+### 任务 2：redis.password —— 支持 vault 引用（referenceable）+ E2E
+
+- **核实**：本插件 schema 已有 `redis.password`（纯 string），`lib/redis.lua` 已支持 AUTH（connect 双路径）；Kong 3.6 OSS 官方 `kong.tools.redis.schema` 中 password 即 `encrypted=true, referenceable=true, len_min=0`（容器内实查），OSS 支持 secrets 管理（env vault `{vault://env/<resource>}` 实测可解析）。
+- **交付**（`50fc594`）：schema 对齐官方（`encrypted=true, referenceable=true, len_min=0`；DB-less 无落库，encrypted 不影响本仓库运行方式）；新增 `test/redis-password-e2e.sh`：A. vault 引用 `{vault://env/kong-log-level}` 端到端解析 + AUTH 放行 200；B. 明文密码放行 200；C. 密码错误 ⇒ 既有 Fail-close 503。实测 ×2 **5/0**。测试含环境注意事项：schema 属插件代码，**POST /config 只重建 iterator、不重建 Lua VM** ⇒ 测试前置 `docker compose restart kong1` 加载新 schema（已写入脚本并注释）。
+- **回归**：`config-isolation-e2e` 14/0、`algorithm-lease-unit` 37/0（schema 变更零破坏）。
+
+### 任务 3：脚本双源一致性自动检查
+
+- **核实**：四个脚本双源（redis/*.lua ↔ lib/redis.lua 内嵌字面量）当前**代码一致**（差异仅为注释：文件版含用法说明、内嵌版含审查编号）；无既有自动检查。
+- **交付**（`5b4359d`）：`test/script-consistency-check.sh`——提取内嵌字面量、剥离注释与空行后逐行 diff；不改变运行时加载方式（纯只读检查）。实测 4/0；负向验证：改动代码行可检出（FAIL + diff 输出）。
+
+### 任务 4：仓库整理
+
+- **核实与处置**（`db89f3d`）：
+  - `7arg`：多规则 grant 命令的调试残留日志，无引用 ⇒ **删除**。
+  - `latency-summary.json`：单次 k6 输出（11-12），无任何报告引用、非 Phase 7 正式数据（Phase 7 原始数据 97 文件在 bench/raw/phase7/）⇒ **删除**。
+  - `rule.md`：项目最初 SDD 文档（Historical）⇒ **移至 docs/archive/rule.md**；冻结 openspec 归档中的 prose 引用属历史记录不改，非冻结文档无引用需要修正。
+  - `refresh.sh`：开发辅助（restart + FLUSHDB）⇒ **移至 scripts/refresh.sh**（保留功能，无引用需修正）。
+  - `reports/` 与 `docs/reports/`：**不合并**——reports/ 为 Phase 1–3 证据，路径被冻结 openspec 归档 change 引用（"产出 reports/phase-1-correctness.md"），移动会破坏冻结 Spec；docs/reports/ 为 Phase 6.3–8.2 报告。已在 docs/README.md 索引中说明。
+  - Phase 0 review 两份：**非重复**——`docs/review-phase-0.md`（2026-11-11，Phase 0 审计，被 openspec 归档引用）与 `docs/PHASE0_REVIEW.md`（2026-11-12，Phase 4 实施规范下的现状审查）内容不同 ⇒ **两份均保留**，docs/README.md 已注明。
+  - 未动：`rl.json`、`Kong 3-Take home assignment.pdf`（未跟踪，非本清单）、Phase 7 原始数据、全部正式测试与冻结 Spec。
+  - **新增 `docs/README.md`** 文档索引（当前使用/设计/阶段报告/归档分类，含不合并理由）。
+
+### 任务 5：CI（.github/workflows/ci.yml）
+
+- **核实**：真实测试入口 = 4 个 resty 单测 + 矩阵/smoke + 11 个 E2E + quota.sh（需 k6）；compose 镜像已固定（kong:3.6 / redis:7-alpine / hashicorp/http-echo:1.0）。
+- **交付**（`f48ba10`）：覆盖 ① Lua 语法检查（luajit -bl，10 个 lua 文件全部实测通过）；② 脚本一致性检查；③ 单元测试 4 项；④ Redis 集成（matrix + smoke）；⑤ Kong E2E 全套 11 项（串行、失败聚合、不跳过核心测试）；⑥ bench/quota.sh（安装固定版本 k6 v0.50.0，官方 GitHub release，非镜像站）。
+- **不放入 CI 的测试及原因**（workflow 注释中写明）：bench/matrix.sh / k6 latency 压测（长时、共享 Runner 噪声使 p99 归因失效，Phase 7 口径要求专环境）、长稳（>24h）、跨机器 RTT。不跑完整性能矩阵（约束 5）。
+
+### 本关验证汇总（实测）
+
+- 新增/变更测试：algorithm-lease-unit 37/0（+A2）、redis-password-e2e 5/0 ×2、script-consistency-check 4/0（含负向验证）、语法检查 10/10。
+- 回归抽查：lease-unit 50/0、config-isolation-unit 24/0、concurrent-lease-e2e 22/0、lease-grant-smoke 7/0、config-isolation-e2e 14/0。
+- 范围验证：生产代码仅 schema.lua（任务 2 授权范围）；核心限流语义、Lua 脚本、openspec/、docs/reports/、bench/raw/ 零改动（git diff 核对）。
+- CI 工作流 YAML 语法通过；语法检查步骤已在本机同环境实测（CI 完整运行待 push 后首次触发，属 NOT VERIFIED until first run）。
+
+### 未完成项（如实）
+
+- 无"未做"清单项——5 项全部处理。遗留：① CI 首次真实运行未验证（待 push 触发）；② env vault 引用的轮换（TTL update 机制）未验证（超出本关范围）；③ `refresh.sh` 保留于 scripts/（FLUSHDB 为破坏性操作，仅限开发环境——已在脚本所在位置由 TESTING 文档口径约束）。
+
+---
