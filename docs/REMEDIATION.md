@@ -495,3 +495,51 @@ confirmed_granted = consumed + outstanding + discarded
 **遗留问题**：无新增；既有遗留维持（脚本头注释旧 key 格式描述、N1、真实 Cluster 验证 Deferred）。
 
 ---
+
+## 关口四：任务 B——Lease 元数据成本审计（基于 a2ba601，2026-11-15，只读）
+
+**改了什么**：无生产代码/脚本/Schema 改动。仅新增本节（独立文档提交）。测试环境写入（合成记录）已全部 UNLINK 清理，DBSIZE 恢复 137、used_memory 恢复 1.71M。
+
+### 审计结论 1：Lease Hash 字段与单条记录（实测）
+
+- **字段（5 个，HLEN 实测=5）**：`lease_id`（host:worker:seq:hex，26~27B）、`pool_key`（桶键原文，43B）、`granted`（数值字符串）、`status`（`OPEN`）、`created_at`（服务端 Redis TIME 浮点字符串，16B）。RETURN 后追加 `return_requested`（6 字段）。全部为 hash 字符串字段（`redis.lua:274-280`，双源 `redis/grant_lease.lua:131-137` 同源同构）。
+- **TTL（实测）**：PTTL=3,592,908ms（≈59.9min）⇒ 1h 生效。`LEASE_TTL_MS=3600000` 为固定常量（`algorithm.lua:21`，非 Schema 字段，无配置覆盖），脚本内 `PEXPIRE lkey` 设置（`redis.lua:280`）。
+- **过期行为（冻结口径重申）**：TTL 到期整键删除——**仅元数据消失**；无令牌恢复、无库存归还（V1 无 RETURN；不把元数据过期描述为库存归还）。RETURNED 记录保留至**原 TTL**（不重设，`redis.lua:398`）＝幂等保护窗口 ≤1h。
+- **单键内存（实测）**：真实记录（键 74B）MEMORY USAGE=280B；等长合成键（75B）SAMPLES 0=280B；短键（48B）@1M 规模=264B ⇒ 键长 +27B payload ≈ +16B 内存。
+
+### 审计结论 2：GRANT_LEASE 写命令与往返（口径区分，不混为一谈）
+
+| 口径 | granted≥1（建记录） | granted=0（不足） |
+|---|---|---|
+| 脚本内写命令 | **4 条**（桶 HSET+PEXPIRE，记录 HSET+PEXPIRE） | 2 条（仅桶；不建记录） |
+| 其中记录本身 | 2 条（HSET 5 字段 + PEXPIRE） | 0 |
+| 网络往返 | **1 次**（EVALSHA；keepalive 连接复用；脚本缓存后无 LOAD） | 1 次 |
+
+- 每 Worker 每脚本首用 +1 次 SCRIPT LOAD 往返；运行中 NOSCRIPT ⇒ +1 LOAD +1 EVALSHA 重试恰一次（冻结语义不变，`redis.lua:444-463`）。佐证：concurrent-lease-e2e 关口四 commandstats 口径实测（400 请求 / EVALSHA 增量 318，含 denied-GRANT 与直连批）。
+
+### 审计结论 3：RETURN_LEASE（代码核实；V1 无生产调用点）
+
+- `lib/redis.lua` 无 `_M.return_lease` 包装函数；脚本仅注册（`redis.lua:422`），生产代码零调用——与关口一线索 e 结论一致；唯一执行入口是测试（`lease-redis-matrix.sh` 裸 --eval）。
+- **写命令**：幂等提交点 `HSET lkey status=RETURNED + return_requested`（1 条）→ requested>0 时 + 桶 HSET+PEXPIRE（共 3 条）；TTL **不重设**。
+- **幂等（以脚本实际逻辑为准）**：`ALREADY_RETURNED`（status=RETURNED 且 return_requested==requested，零写）；`RETURN_CONFLICT`（同 status 不同 requested，零写）；`POOL_MISMATCH`/`LEASE_NOT_FOUND` 等校验失败均零写。
+
+### 审计结论 4：内存成本量化（1万 / 10万 / 100万）
+
+**测试环境**：docker compose redis（Redis 7.4.12，standalone，无持久化、无 maxmemory/noeviction），宿主机 15GB；合成记录与真实记录同构（5 字段等长值、PEXPIRE 3600000）；`redis-cli --pipe` 灌入（1M 条 10.2s，errors=0）。
+
+| 规模 | used_memory 增量（实测） | 平均 B/条（实测，48B 键） | 总内存（含键长修正，估算） |
+|---|---|---|---|
+| 1 万 | 3,162,736B（3.16MB） | 316 | ≈3.3–3.5MB |
+| 10 万 | +27,755,024B ⇒ 累计≈30.9MB | 308（边际） | ≈32–34MB |
+| 100 万 | +288,280,064B；used_memory_human=**306.08MB** | 320（边际） | ≈**330–350MB** |
+
+- **口径说明**：批量平均（308~320B/条）= 单键自内存 + keyspace dict 与 expire 表均摊开销；单键自内存（实测 264B@48B 键 / 280B@74B 键）不含 keyspace 开销——四个口径（写命令数 / 往返次数 / 单键内存 / 总内存）互不相代。
+- **估算依据（推导）**：实测基线（48B 键）+ 键长修正 +16~30B（真实键 70~80B：namespace 可变、lease_id seq 位数浮动）。
+- **误差来源**：①键长与 lease_id 长度随部署/时序浮动（主项，±10%）；②dict rehash 瞬态；③fragmentation（1M 规模实测 1.03，小规模噪声大 2.45）；④分配器/Redis 版本差异。
+- **NOT VERIFIED**：Redis Cluster 下 per-record 结构相同但每节点 dict/expiry 独立的开销、主从复制流量、TTL 惰性/定期删除的长稳开销——均未验证。
+
+**对外行为影响**：无（纯审计；不接入自动 RETURN，不改 Lease 生命周期、TTL、键与脚本）。
+
+**遗留问题**：① Cluster 内存/复制流量未验证（维持既有 Deferred 记录）；② 无新增待办；不 propose 任何优化（未经批准不做）。
+
+---
