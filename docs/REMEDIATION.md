@@ -184,7 +184,7 @@ confirmed_granted = consumed + outstanding + discarded
 
 **达上限且无可淘汰 Pool 时的降级路径（冻结版，不驱逐 ACTIVE Pool，不 429、不 503）**：该请求退化为**不登记本地库存的直接授权**——复用现行 batch=1 路径 `redis_mod.grant(conf, key, 1, ttl_ms, rate, burst)`（`lib/algorithm.lua:450`，want=1），granted≥1 ⇒ 放行（remaining 按该路径既有口径 = granted-1 = 0）；granted=0 ⇒ 既有 429 语义（这来自**桶空**，不是攻击者制造的 Pool 压力）；Redis 失败 ⇒ 既有 fail-close/fail-open 分支。请求语义与 batch=1 完全一致，攻击者无法靠高基数 key 把正常用户打到 429/503——Pool 压力只影响"该请求是否享受本地库存加速"，不影响授权结果。该路径不进 Lease 账目（无 Lease 登记），在日志中打 `pool_cap_degraded` 标记便于审计。
 
-**TAKE 热路径约束**：TAKE 内只做既有遍历 + `pool.last_used = now` **一次字段赋值**；不建链表、不做 O(n) 维护、不检查过期（过期判定只在 §4 清理点做，最坏延迟 = 清理间隔，效果仅是库存存活略久——只见突发分布变化，不创造令牌，见 §3）。
+**TAKE 热路径约束**：TAKE 内只做既有遍历 + `pool.last_used = now` **一次字段赋值**；不建链表、不做 O(n) 维护。**过期判定（冻结修订）**：TAKE 对扫描到的候选 Lease 做一次 O(1) 过期比较（`created_at + pool.max_age < now`，见 §10）——遇到过期候选即摘除并继续，遇到首个未过期可消费 Lease 即消费；稳态下头部候选未过期 ⇒ 热路径无额外成本。不检查过期的旧表述废止（它会让持续被访问的 Pool 中过期 Lease 永久存活并被消费——Timer 只清空闲 Pool、GRANT 惰性清扫只在 NEED_GRANT 时触发，二者都覆盖不了热 Pool）。
 
 **淘汰执行点与上限**：仅在 (1) GRANT 路径发现 `_pools` 计数 ≥ MAX_POOLS 时触发一次、(2) init_worker timer 里触发；每次处理 ≤ 64 个 Pool，不全量扫描。
 
@@ -209,7 +209,7 @@ confirmed_granted = consumed + outstanding + discarded
 
 ### 4. 清理
 
-- **TAKE/GRANT 惰性清理**：GRANT 前（非 yield 片段内）对**当前 pool** 做一次有上限的过期清扫：摘除 EXPIRED Lease、discarded 计数；单次最多处理 32 个 Lease，超出留给下次（GRANT 是冷路径，允许分批）。TAKE 不做清理（热路径约束）。
+- **TAKE/GRANT 惰性清理**：GRANT 前（非 yield 片段内）对**当前 pool** 做一次有上限的过期清扫：摘除 EXPIRED Lease、discarded 计数；单次最多处理 32 个 Lease，超出留给下次（GRANT 是冷路径，允许分批）。TAKE 不做全量清理，但**在扫描候选时顺带摘除过期 Lease**（O(1) 比较 + 摘除即扫过，见 §10）——热 Pool 的过期回收由 TAKE 路径承担，Timer 只兜底空闲 Pool。
 - **init_worker 兜底 timer（冻结：60s）**：`ngx.timer.every(60, sweep)`（低频；间隔 60s，推导：2×window 典型 = 60~7200s，60s 粒度对丢弃时机影响可忽略）。每次 tick：
   - `ngx.worker.exiting()` 为真 ⇒ 立即 return（Worker 退出）。
   - 回调整体 `pcall` 包裹，单池异常 ⇒ 记 err 日志并跳过该池，不影响其他池。
@@ -301,6 +301,34 @@ confirmed_granted = consumed + outstanding + discarded
 | 单在途 GRANT + 直连降级（方案 B） | **维持推荐，理由强化**：steady 实测（NOT VERIFIED）表明到达间隔 > RTT 时在途本就有界（max_inflight=5、leases=10），B 只在突发窗口生效；burst 实测（NOT VERIFIED）量化了无约束的代价（inflight=100、库存 900=90×batch） | 探针 2 实测 + concurrent-lease-e2e 实测对照 |
 
 账目最终口径（不变，探针实测一致）：`confirmed_granted = consumed + outstanding + discarded`；GRANT 超时/响应丢失 → `uncertain_lost` 单列，不入上式，不重试不登记（现行 `lib/lease.lua:236-243` 语义冻结不变）。
+
+### 10. 活跃 Pool 中过期 Lease 的 TAKE 边界（澄清并冻结，不改生产代码）
+
+**问题**：Timer 只清空闲 Pool、GRANT 惰性清扫只在 NEED_GRANT 时触发；持续有请求命中的 Pool（`last_used` 不断刷新）两者都覆盖不到——其中已超 max_age 的 Lease 会一直留在 active 集合被 TAKE 消费。危害定性：这些令牌仍是旧纪元 Redis 已扣的，**不构成累计超发**（§3 结论不变），但会使"本地库存不跨桶纪元"（max_age 的设计目的）在慢速热 Pool 上失效，属时间分布上的突发放大延长——必须修复。
+
+**裁决 1：活跃 Pool 的过期 Lease 如何保证不再被 TAKE 消费**
+
+- TAKE 扫描候选时做**逐候选 O(1) 过期比较**：`created_at + pool.max_age < ngx.now()`（`max_age` 为 Pool 上的配置快照，§2/§3 冻结值 2×window）。
+- 候选过期 ⇒ 调用统一摘除函数 `expire_lease(pool, lease)`（§1 EXPIRED 语义）：`state="EXPIRED"`、`discarded_tokens += remaining`、从 active 数组移除，三步在**同一非 yield 片段**内完成；随后 TAKE 继续扫描下一候选。
+- 首个未过期且 remaining>0 的候选照常消费；全部候选过期/无库存 ⇒ `NEED_GRANT` ⇒ 既有 GRANT 路径（其惰性清扫与该逻辑自然衔接）。
+- 时钟语义（沿 §3）：本地回拨 ⇒ 过期判定推迟（库存存活略久，突发放大延长，方向保守）；时钟前跳 ⇒ 提前丢弃新鲜库存（少放行，保守）。两向都不创造令牌。
+
+**裁决 2：为何不引入 TAKE 热路径 O(n) 扫描**
+
+- 过期比较本身 O(1)（一次数值比较，`ngx.now()` 非 yield 点）。
+- 扫描在**首个未过期候选**处终止：稳态下 active 头部即未过期 ⇒ 每次 TAKE 恰好一次比较，热路径成本不变。
+- 最坏情况 = 扫描点前连续 K 个过期候选 ⇒ K 次比较 + K 次摘除。**摊还 O(1)**：每个 Lease 至多被摘除一次（摘除后即离开 active 集合，永不再被扫到），生命周期内总摘除次数 ≤ 总登记数，故总额外成本被全量 TAKE 摊平。
+- `table.remove` 的移位成本：active 数组长度本身有界（方案 B 冻结后每 pool 每 epoch ≈ 1 个 Lease + 少量滞留；且现行代码耗尽摘除已用同一原语，`lib/lease.lua:157`），不新增量级。
+
+**裁决 3：discarded 只计一次、恒等式不破坏**
+
+- **单一摘除函数** `expire_lease` 是唯一入口：TAKE 路径、GRANT 惰性清扫、Timer 兜底三处全部调用它，计数逻辑只存在一份（`discarded_tokens += l.remaining` 与 `state` 置 EXPIRED、从 active 移除在同一原子片段内）。
+- 防重复的机制保证：(a) Lease 对象在 active 集合中至多出现一次（既有结构不变量，`lib/lease.lua:295-340` 已断言）；(b) `state` 在计数**之前**翻转，摘除后对象离开 active ⇒ 第二个到达者（无论哪条路径）再也看不到它；(c) 三处调用点全部是非 yield 片段，协程调度保证片段间不交错（现行原子性论证复用），不存在"两条路径同时摘除同一对象"的窗口。
+- 恒等式维持 `confirmed_granted = consumed + outstanding + discarded`：摘除瞬间完成 `granted = consumed + remaining` → `granted = consumed + discarded` 的转移，remaining 转出后立即离开 outstanding（active 求和口径），无双重计入。
+- 验证要求（关口三测试面）：lease-unit 增加"同一 Lease 被并发路径与 Timer 相继处理只计一次 discarded"的断言；`invariants()` 增加 `discarded_tokens + Σactive.remaining + consumed == Σgranted` 的全局守恒校验。
+
+### 遗留问题
+
 
 
 
