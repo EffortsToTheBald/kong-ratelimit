@@ -769,3 +769,35 @@ discarded_tokens 唯一来源 expire_lease_at；淘汰仅删空池）。
 - 无"未做"清单项——5 项全部处理。遗留：① CI 首次真实运行未验证（待 push 触发）；② env vault 引用的轮换（TTL update 机制）未验证（超出本关范围）；③ `refresh.sh` 保留于 scripts/（FLUSHDB 为破坏性操作，仅限开发环境——已在脚本所在位置由 TESTING 文档口径约束）。
 
 ---
+
+## 关口六 CI 首次运行修复（2026-11-15）
+
+**首次失败原因（run 43708831517 / 43710394785，实测日志）**：
+1. `test/script-consistency-check.sh` 将临时文件写死在 `/tmp/opencode/`——干净 GitHub Runner
+   不存在该目录，mktemp 直接失败，一致性检查无法启动。
+2. 修复后第二轮（43710394785）仅 `bench/quota.sh` 失败：k6/quota.js 使用 ES2020 可选链（`?.`），
+   CI 固定的 k6 v0.50.0 的 bundled Babel 不支持该语法（grafana/k6#2168；
+   v0.52 起 esbuild 支持、v0.53 起默认模式原生支持——官方 release notes）。
+
+**修复提交**：
+- `f4f3abc`：consistency check 临时文件管理改为 `mktemp -d` 创建独立临时目录 + `trap EXIT` 清理，
+  不依赖任何预先存在的目录；本地负向验证保留（改动代码行仍可检出 FAIL）。
+- `9214eda`：CI 的 k6 固定版本 v0.50.0 → **v0.57.0**（ES6+ 默认模式原生支持 `?.`；
+  release 资产存在性已验证；不修改 k6/quota.js，不降低断言）。
+
+**最终运行结果（run 43711556576，✓ test 2m8s，全部步骤实际执行，实测日志）**：
+- Lua 语法检查：10 个 lua 文件全部 syntax ok（luajit -bl）。
+- 一致性检查：4/0（mktemp -d 路径在干净 Runner 正常）。
+- 单测 4 项：lease-unit 50/0、algorithm-lease-unit 37/0、config-isolation-unit 24/0、evalsha-unit 8/0。
+- Redis 集成：matrix 50/0、smoke 4+7/0。
+- E2E 11 项全 PASS（失败聚合逐项输出）：algorithm 15、exhaustion 11、config-isolation 14、
+  timeout-uncertain 22、fault-recovery 12、handler-fault 26、selfheal 15、worker-crash 16、
+  isolation 7、concurrent 22/0/0、redis-password 5。
+- bench/quota.sh：allowed=100 / limited=350 / other=0 / total=450，
+  **PASS：严格等于配额 100（全局一致）**，每节点 150 次断言通过。
+- 无跳过测试、无断言降级；两个失败均为环境问题（临时目录 / k6 版本），修复不涉及测试逻辑。
+
+**遗留**：无新增（CI 处于绿色状态；ubuntu-latest 迁移 Ubuntu 26 与 Node 20 弃用注解为 runner 平台
+提示，非本仓库问题，维持观察即可）。
+
+---
