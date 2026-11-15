@@ -612,3 +612,59 @@ confirmed_granted = consumed + outstanding + discarded
 **遗留问题**：§4 清单即遗留全集；无新增阻断。
 
 ---
+
+## 关口五：文档与算法模型对齐（基于 80865dc，2026-11-15，仅文档）
+
+**改了什么 / 为什么**：以最终代码实现为准，对齐四份文档；每份单独提交，openspec/、docs/reports/、
+bench/、生产代码、Lua、Schema 零改动。
+
+| 提交 | 文件 | 对齐要点 |
+|---|---|---|
+| `e265f16` | docs/design.md | 清除全部 ⟨TODO⟩；删除 shared dict 库存描述（§2 总览图/时序图、§5 fast path、§4.8、§7 故障矩阵行）；§4.9 新增 Lease 生命周期与本地 Pool 模型（MAX_POOLS=10000/Worker、max_age=2×window、EXPIRED/EVICTED/discarded、60s Timer、方案 B 单在途、invariants() 恒等式）；§12 更新 key 结构（维度值编码 + Lease 键同 hash tag）+ Lease 元数据模型（5 字段、TTL 1h、不等于库存归还）+ Cluster 支持边界（键层已修/行为未验证）；§7 故障矩阵补 Pool 压力降级与元数据 TTL 行；§8 实验矩阵标 Historical 并指向 Phase 7 实测；§9 取舍表更新（Lease 预授权/维度值编码）；§11 生产差距更新（本地 Pool 回收已实现、RETURN 仍 Deferred、时钟结论）；【Historical】/【Current V1】/【Deferred】标记约定 |
+| `352fe1b` | README.md | 精度语义改为前提化表述（放行 ≤ 已确认扣减的推导；少发多来源如实列出；超发仅故障回滚窗口）；补三类风险（指纹并存/主从回滚/本地消费突发，含 burst_max 推导上界）；§6 补 DB-less 逐节点下发并存风险与规避建议；§8 性能口径补齐（81.8%、Kong CPU −23%、Redis CPU −73% 全部仅引 Phase 7）；修正陈旧断言数（lease-unit 25→50、algorithm-lease-unit 17→36、concurrent-lease-e2e 17→22，关口四验收实测值）；对比表"只少发不超发"改为前提化表述 |
+| `f6bf343` | docs/architecture.md | §1 重画架构图（3 节点 × 2 Worker、每 Worker 独立 Lease 池、三条请求路径、Redis 故障 Fail-close，明确不跨 Worker 共享库存）；核心不变量改为前提化表述；§2 补两条降级直连路径（pool_cap/inflight）；§3 决策流程图补降级判定分支；§7 生命周期图更新（EXPIRED/EVICTED/discarded、Timer、方案 B、O(1) 上界）；§8 账目改为冻结恒等式 confirmed_granted = consumed + outstanding + discarded（uncertain 单列）；§12 补 81.8%；§13 Deferred 表更新（本地 Pool 回收已实现、Cluster 键层已修） |
+| `9d4e7ce` | docs/design.md | 取舍表一致性措辞同步（推导上界/估算/NOT VERIFIED 分层） |
+
+### 误差模型重推导（核心交付）
+
+变量统一：N=副本数、W=每副本 Worker 数、W_total=N×W、k=batch、B=桶容量（burst>0?burst:limit）。
+统计对象=单逻辑 key 的授权库存；作用域与前提逐项声明：
+
+- **瞬时滞留 ≤ W_total × k：推导上界**（前提：①每 Worker 每 Pool 任意时刻 ≤1 个 active Lease——
+  关口三不变量、invariants() 断言守护；②granted ≤ k；③V1 无 RETURN）。**不是 N×W×k 的旧公式**：
+  旧模型按"每节点一份库存"，V1 Lease 为 Worker 私有，界随 W_total 缩放。
+- **每窗口累计少发无封闭严格上界**：discarded（单次 ≤k，代际数取决于流量形态）、Worker 崩溃 lost
+  （单次 ≤k）、GRANT uncertain（**无封闭上界**：不重试不登记是冻结语义，事件数随故障率）——
+  全部标注"估算"，长稳分布 NOT VERIFIED。
+- 利用率表按 W_total=6 重算（1000/k=20 → 88%；100/k=2 → 88%；10000/k=50 → 97%），标注估算口径。
+- 突发放大 burst_max = B + W_total·k（推导上界）；`resolve_batch` clamp(limit/50,1,50) 与代码一致，
+  "2%" 语义明确为**单 Worker** 滞留。
+
+### 一致性检查（与实际代码、冻结设计）
+
+- resolve_batch 公式、MAX_POOLS、max_age=2×window、LEASE_TTL_MS=3600000、discarded 单次计数、
+  方案 B 直连降级、键编码（%3A/%7B/%7D/%25）、256 截断（N1 维持记录）、Phase 7 性能数字
+  （9.99:1 / 81.8% / −23% / −73% / p99 NOT VERIFIED / 7848=3.1%）——逐一与代码/报告核对一致。
+- README 两处 "shared dict" 均为"不依赖"否定表述（准确）；design.md/architecture.md 无 shared-dict
+  库存残留；三文档间交叉引用（§ 编号、报告路径）核对。
+
+### 测试命令与真实结果
+
+- 本关为文档对齐，无生产代码改动，未新增/重跑测试；测试状态沿用关口四最终验收
+  （16 入口 PASS=341 / FAIL=0 / NOT RUN=0，14297da 实测；本关基线 80865dc 与其零代码差异）。
+- 范围验证（实测）：`git diff 80865dc..HEAD --stat` 仅 4 个文档文件；
+  `git diff 80865dc..HEAD -- redis/ .../schema.lua openspec/ bench/ docs/reports/` 文件数=0。
+- 静态检查（实测）：`grep TODO docs/design.md`=0；mermaid 图标签配对人工核对通过；
+  **mermaid 渲染效果未验证**（环境无渲染工具，标注 NOT VERIFIED）。
+
+### 对外行为影响
+
+无（纯文档；行为契约表述从无条件"不超发"改为前提化精度声明，属于描述对齐，非行为变更）。
+
+### 遗留风险
+
+① N1（256 截断跨维度碰撞）维持记录未修；② mermaid 渲染未验证（人工核对）；③ W_total×k 上界
+的前提依赖 invariants() 断言守护而非协议保证（已在文中如实标注）；④ 长稳少发分布 NOT VERIFIED
+维持。无新增阻断。
+
+---
