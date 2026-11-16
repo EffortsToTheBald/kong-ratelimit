@@ -16,9 +16,9 @@ name: ci
 
 on:
   push:
-    branches: [master, remediation/hardening]
+    branches: [dev]
   pull_request:
-    branches: [master]
+    branches: [dev]
 
 jobs:
   test:
